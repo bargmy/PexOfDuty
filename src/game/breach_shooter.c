@@ -53,7 +53,7 @@ static void breach_play_shot_sound(int rapid) {
 static void breach_start_reload(double now) {
     if (g_breach_reload_end >= 0 || g_breach_ammo >= BREACH_MAG_SIZE) return;
     g_breach_reload_start = now;
-    g_breach_reload_end = now + (g_breach_ammo ? 2.25 : 3.0);
+    g_breach_reload_end = now + (g_breach_ammo ? 1.125 : 1.5);
     g_breach_inspecting = 0;
 }
 
