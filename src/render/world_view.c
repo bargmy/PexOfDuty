@@ -1,0 +1,11062 @@
+/* Split from original monolithic main.c. Included by src/main.c unity build. */
+
+static void draw_item3d_from_atlas(int tile);
+static void draw_item3d_from_texture(Texture *atlas, int tile);
+static void setup_world_projection(void);
+static void apply_view_bobbing(float partial);
+static void apply_hurt_camera_effect(float partial);
+static void apply_portal_camera_effect(float partial);
+static void update_portal_texture_animation(void);
+static void update_liquid_texture_animation(void);
+static PexRendererBackend *flat_direct_backend(void);
+static void flat_direct_update_terrain_region(int x, int y, int width, int height, const unsigned char *rgba);
+static void draw_portal_overlay(void);
+static int flat_section_needs_mesh_rebuild(int sy, int cz, int cx);
+
+typedef struct PexSkyJavaRandom {
+    uint64_t seed;
+} PexSkyJavaRandom;
+
+typedef struct PexStarQuad {
+    float v[4][3];
+} PexStarQuad;
+
+static PexStarQuad g_sky_stars[1500];
+static int g_sky_star_count = 0;
+static int g_sky_stars_ready = 0;
+
+static void pex_sky_java_random_set_seed(PexSkyJavaRandom *rng, int64_t seed) {
+    rng->seed = ((uint64_t)seed ^ 0x5DEECE66DULL) & ((1ULL << 48) - 1ULL);
+}
+
+static int pex_sky_java_random_next(PexSkyJavaRandom *rng, int bits) {
+    rng->seed = (rng->seed * 0x5DEECE66DULL + 0xBULL) & ((1ULL << 48) - 1ULL);
+    return (int)(rng->seed >> (48 - bits));
+}
+
+static float pex_sky_java_random_next_float(PexSkyJavaRandom *rng) {
+    return (float)pex_sky_java_random_next(rng, 24) / 16777216.0f;
+}
+
+static double pex_sky_java_random_next_double(PexSkyJavaRandom *rng) {
+    uint64_t hi = (uint64_t)pex_sky_java_random_next(rng, 26);
+    uint64_t lo = (uint64_t)pex_sky_java_random_next(rng, 27);
+    return (double)((hi << 27) + lo) / (double)(1ULL << 53);
+}
+
+static float world_sun_angle(float partial) {
+    int t = (int)(g_world_time % 24000LL);
+    if (t < 0) t += 24000;
+    float a = ((float)t + partial) / 24000.0f - 0.25f;
+    if (a < 0.0f) a += 1.0f;
+    if (a > 1.0f) a -= 1.0f;
+    float raw = a;
+    a = 1.0f - (float)((cos((double)a * M_PI) + 1.0) / 2.0);
+    a = raw + (a - raw) / 3.0f;
+    return a;
+}
+
+static int world_moon_phase(void) {
+    long long day = g_world_time / 24000LL;
+    int phase = (int)(day % 8LL);
+    if (phase < 0) phase += 8;
+    return phase;
+}
+
+static float sky_star_brightness(float partial) {
+    float a = world_sun_angle(partial);
+    float f = 1.0f - (cosf(a * (float)M_PI * 2.0f) * 2.0f + 12.0f / 16.0f);
+    if (f < 0.0f) f = 0.0f;
+    if (f > 1.0f) f = 1.0f;
+    return f * f * 0.5f;
+}
+
+static float sky_day_factor(float partial, float add) {
+    float a = world_sun_angle(partial);
+    float f = cosf(a * (float)M_PI * 2.0f) * 2.0f + add;
+    if (f < 0.0f) f = 0.0f;
+    if (f > 1.0f) f = 1.0f;
+    return f;
+}
+
+static void sky_color_at_time(float partial, float *r, float *g, float *b) {
+    float f = sky_day_factor(partial, 0.5f);
+    /* World.getSkyColor(Entity,float) with plains sky-color fallback:
+       BiomeGenBase.plains.getSkyColorByTemp(0.8F) -> 0x79A7FF.
+       Rain, thunder, anaglyph, and lightningFlash are absent in this C project. */
+    *r = (121.0f / 255.0f) * f;
+    *g = (167.0f / 255.0f) * f;
+    *b = (255.0f / 255.0f) * f;
+}
+
+static void cloud_color_at_time(float partial, float *r, float *g, float *b) {
+    float f = sky_day_factor(partial, 0.5f);
+    /* World.drawClouds(float), with World.cloudColour = 0xFFFFFF and no
+       rain/thunder: RGB is not fixed white at night. */
+    *r = f * 0.90f + 0.10f;
+    *g = f * 0.90f + 0.10f;
+    *b = f * 0.85f + 0.15f;
+}
+
+static void world_provider_fog_color(float partial, float *r, float *g, float *b) {
+    float f = sky_day_factor(partial, 0.5f);
+    /* WorldProvider.getFogColor(celestialAngle,float). */
+    *r = (192.0f / 255.0f) * (f * 0.94f + 0.06f);
+    *g = (216.0f / 255.0f) * (f * 0.94f + 0.06f);
+    *b = 1.0f * (f * 0.91f + 0.09f);
+}
+
+static void world_fog_color(float partial, float *r, float *g, float *b) {
+    if (g_current_dimension == -1) {
+        *r = 0.20f; *g = 0.02f; *b = 0.02f;
+        return;
+    }
+    if (g_current_dimension == 1) {
+        *r = 0.08f; *g = 0.06f; *b = 0.10f;
+        return;
+    }
+    float fr, fg, fb;
+    world_provider_fog_color(partial, &fr, &fg, &fb);
+
+    /* EntityRenderer.updateFogColor() blends provider fog toward sky depending
+       on render-distance enum.  This C port stores render distance in chunks,
+       not the Java enum, so use Java's Far equivalent (0) rather than keeping a
+       constant daytime blue. */
+    float sr, sg, sb;
+    sky_color_at_time(partial, &sr, &sg, &sb);
+    float blend = 1.0f - powf(1.0f / 4.0f, 0.25f);
+    *r = fr + (sr - fr) * blend;
+    *g = fg + (sg - fg) * blend;
+    *b = fb + (sb - fb) * blend;
+}
+
+static void apply_world_fog_color(float partial) {
+    float r, g, b;
+    world_fog_color(partial, &r, &g, &b);
+    float fog_col[4] = { r, g, b, 1.0f };
+    glFogfv(GL_FOG_COLOR, fog_col);
+    glClearColor(r, g, b, 0.0f);
+}
+
+static void sky_generate_stars_once(void) {
+    if (g_sky_stars_ready) return;
+    g_sky_stars_ready = 1;
+    g_sky_star_count = 0;
+    PexSkyJavaRandom rng;
+    pex_sky_java_random_set_seed(&rng, 10842LL);
+
+    for (int i = 0; i < 1500; ++i) {
+        double x = (double)(pex_sky_java_random_next_float(&rng) * 2.0f - 1.0f);
+        double y = (double)(pex_sky_java_random_next_float(&rng) * 2.0f - 1.0f);
+        double z = (double)(pex_sky_java_random_next_float(&rng) * 2.0f - 1.0f);
+        double s = (double)(0.25f + pex_sky_java_random_next_float(&rng) * 0.25f);
+        double d = x * x + y * y + z * z;
+        if (d >= 1.0 || d <= 0.01) continue;
+        d = 1.0 / sqrt(d);
+        x *= d; y *= d; z *= d;
+        double bx = x * 100.0;
+        double by = y * 100.0;
+        double bz = z * 100.0;
+        double yaw = atan2(x, z);
+        double sy = sin(yaw);
+        double cy = cos(yaw);
+        double pitch = atan2(sqrt(x * x + z * z), y);
+        double sp = sin(pitch);
+        double cp = cos(pitch);
+        double roll = pex_sky_java_random_next_double(&rng) * M_PI * 2.0;
+        double sr = sin(roll);
+        double cr = cos(roll);
+        if (g_sky_star_count >= (int)(sizeof(g_sky_stars) / sizeof(g_sky_stars[0]))) break;
+        PexStarQuad *q = &g_sky_stars[g_sky_star_count++];
+        for (int v = 0; v < 4; ++v) {
+            double qx = 0.0;
+            double qy = (double)((v & 2) - 1) * s;
+            double qz = (double)(((v + 1) & 2) - 1) * s;
+            double rx = qy * cr - qz * sr;
+            double rz = qz * cr + qy * sr;
+            double px = rx * sp + qx * cp;
+            double py = qx * sp - rx * cp;
+            double vx = py * sy - rz * cy;
+            double vz = rz * sy + py * cy;
+            q->v[v][0] = (float)(bx + vx);
+            q->v[v][1] = (float)(by + px);
+            q->v[v][2] = (float)(bz + vz);
+        }
+    }
+}
+
+static void draw_sky_plane(float y) {
+    const int step = 64;
+    const int extent = 256 + step * 2;
+    for (int x = -extent; x <= extent; x += step) {
+        for (int z = -extent; z <= extent; z += step) {
+            glBegin(GL_QUADS);
+            glVertex3f((float)x, (float)y, (float)z);
+            glVertex3f((float)(x + step), (float)y, (float)z);
+            glVertex3f((float)(x + step), (float)y, (float)(z + step));
+            glVertex3f((float)x, (float)y, (float)(z + step));
+            glEnd();
+        }
+    }
+}
+
+static void draw_lower_sky_plane(float y) {
+    const int step = 64;
+    const int extent = 256 + step * 2;
+    glBegin(GL_QUADS);
+    for (int x = -extent; x <= extent; x += step) {
+        for (int z = -extent; z <= extent; z += step) {
+            /* RenderGlobal::<init>() builds glSkyList2 with the opposite
+               winding from glSkyList.  Keep that here so cull state inherited
+               from the world renderer cannot make the lower sky disappear. */
+            glVertex3f((float)(x + step), (float)y, (float)z);
+            glVertex3f((float)x, (float)y, (float)z);
+            glVertex3f((float)x, (float)y, (float)(z + step));
+            glVertex3f((float)(x + step), (float)y, (float)(z + step));
+        }
+    }
+    glEnd();
+}
+
+static void sky_textured_quad(Texture *tex, float size, float y, float u0, float v0, float u1, float v1, int fallback_color) {
+    if (tex && tex->id) {
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, tex->id);
+        glColor4f(1, 1, 1, 1);
+    } else {
+        glDisable(GL_TEXTURE_2D);
+        set_color_int(fallback_color);
+    }
+    glBegin(GL_QUADS);
+    glTexCoord2f(u0, v0); glVertex3f(-size, y, -size);
+    glTexCoord2f(u1, v0); glVertex3f( size, y, -size);
+    glTexCoord2f(u1, v1); glVertex3f( size, y,  size);
+    glTexCoord2f(u0, v1); glVertex3f(-size, y,  size);
+    glEnd();
+    glColor4f(1,1,1,1);
+    glEnable(GL_TEXTURE_2D);
+}
+
+static int sky_sunrise_sunset_colors(float partial, float out[4]) {
+    float a = world_sun_angle(partial);
+    float width = 0.4f;
+    float c = cosf(a * (float)M_PI * 2.0f);
+    if (c < -width || c > width) return 0;
+    float t = c / width * 0.5f + 0.5f;
+    float alpha = 1.0f - (1.0f - sinf(t * (float)M_PI)) * 0.99f;
+    alpha *= alpha;
+    out[0] = t * 0.3f + 0.7f;
+    out[1] = t * t * 0.7f + 0.2f;
+    out[2] = 0.2f;
+    out[3] = alpha;
+    return 1;
+}
+
+static void draw_sunrise_sunset_fan(float partial) {
+    float col[4];
+    if (!sky_sunrise_sunset_colors(partial, col)) return;
+    glDisable(GL_TEXTURE_2D);
+    glPushMatrix();
+    glRotatef(90.0f, 1.0f, 0.0f, 0.0f);
+    glRotatef(sinf(world_sun_angle(partial) * (float)M_PI * 2.0f) < 0.0f ? 180.0f : 0.0f, 0.0f, 0.0f, 1.0f);
+    glRotatef(90.0f, 0.0f, 0.0f, 1.0f);
+    glBegin(GL_TRIANGLE_FAN);
+    glColor4f(col[0], col[1], col[2], col[3]);
+    glVertex3f(0.0f, 100.0f, 0.0f);
+    glColor4f(col[0], col[1], col[2], 0.0f);
+    for (int i = 0; i <= 16; ++i) {
+        float a = (float)i * (float)M_PI * 2.0f / 16.0f;
+        float sx = sinf(a);
+        float cz = cosf(a);
+        glVertex3f(sx * 120.0f, cz * 120.0f, -cz * 40.0f * col[3]);
+    }
+    glEnd();
+    glPopMatrix();
+}
+
+static float world_sea_level(void) {
+    /* Java World.getSeaLevel() is FLAT -> 0, otherwise 63.  This project still
+       renders the old local Beta-style terrain preview whose documented sea
+       level is 32, so the RenderGlobal below-sea void/horizon test must use the
+       active terrain system's sea level until the terrain generator itself is
+       upgraded to Release 1.2.5. */
+    return (g_world_type == 0) ? 0.0f : 32.0f;
+}
+
+static float render_eye_y(float partial) {
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    return pr->prev_y + (pr->y - pr->prev_y) * partial;
+}
+
+static void draw_black_horizon_box(float eye_minus_sea) {
+    const float s = 1.0f;
+    float y0 = -((float)(eye_minus_sea + 65.0f));
+    float y1 = -s;
+
+    glPushMatrix();
+    glTranslatef(0.0f, 12.0f, 0.0f);
+    draw_lower_sky_plane(-16.0f);
+    glPopMatrix();
+
+    glBegin(GL_QUADS);
+    glVertex3f(-s, y0,  s);
+    glVertex3f( s, y0,  s);
+    glVertex3f( s, y1,  s);
+    glVertex3f(-s, y1,  s);
+
+    glVertex3f(-s, y1, -s);
+    glVertex3f( s, y1, -s);
+    glVertex3f( s, y0, -s);
+    glVertex3f(-s, y0, -s);
+
+    glVertex3f( s, y1, -s);
+    glVertex3f( s, y1,  s);
+    glVertex3f( s, y0,  s);
+    glVertex3f( s, y0, -s);
+
+    glVertex3f(-s, y0, -s);
+    glVertex3f(-s, y0,  s);
+    glVertex3f(-s, y1,  s);
+    glVertex3f(-s, y1, -s);
+
+    glVertex3f(-s, y1, -s);
+    glVertex3f(-s, y1,  s);
+    glVertex3f( s, y1,  s);
+    glVertex3f( s, y1, -s);
+    glEnd();
+}
+
+static void apply_sky_camera_rotation(float partial) {
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    float dyaw = pr->yaw - pr->prev_yaw;
+    while (dyaw < -180.0f) dyaw += 360.0f;
+    while (dyaw >= 180.0f) dyaw -= 360.0f;
+    float yaw = pr->prev_yaw + dyaw * partial;
+    float pitch = pr->prev_pitch + (pr->pitch - pr->prev_pitch) * partial;
+    if (g_third_person_view == 2) {
+        yaw += 180.0f;
+        pitch = -pitch;
+    }
+    /* Java sky is drawn after setupCameraTransform(), so it inherits the same
+       hurt and bob matrix.  The sky itself must not translate with player XYZ. */
+    apply_hurt_camera_effect(partial);
+    apply_view_bobbing(partial);
+    glRotatef(pitch, 1.0f, 0.0f, 0.0f);
+    glRotatef(yaw + 180.0f, 0.0f, 1.0f, 0.0f);
+}
+
+static void draw_sky_only(void) {
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+    if (pex_shaders_active()) pex_shaders_bind_sky_basic();
+#endif
+    if (g_current_dimension == -1) {
+        setup_world_projection();
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_TEXTURE_2D);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        glColor4f(0.10f, 0.01f, 0.01f, 1.0f);
+        draw_sky_plane(16.0f);
+        glColor4f(0.06f, 0.0f, 0.0f, 1.0f);
+        draw_lower_sky_plane(-16.0f);
+        glEnable(GL_TEXTURE_2D);
+        glDepthMask(GL_TRUE);
+        return;
+    }
+    if (g_current_dimension == 1) {
+        setup_world_projection();
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_TEXTURE_2D);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        apply_sky_camera_rotation(g_frame_partial);
+        glColor4f(0.032f, 0.032f, 0.032f, 1.0f);
+        draw_sky_plane(16.0f);
+        glColor4f(0.015f, 0.015f, 0.015f, 1.0f);
+        draw_lower_sky_plane(-16.0f);
+        if (g_opts.sf_stars) {
+            sky_generate_stars_once();
+            glDisable(GL_FOG);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glColor4f(0.5f, 0.5f, 0.8f, 0.7f);
+            glBegin(GL_QUADS);
+            for (int i = 0; i < g_sky_star_count; ++i) {
+                for (int v = 0; v < 4; ++v) {
+                    glVertex3f(g_sky_stars[i].v[v][0], g_sky_stars[i].v[v][1], g_sky_stars[i].v[v][2]);
+                }
+            }
+            glEnd();
+            glDisable(GL_BLEND);
+        }
+        glEnable(GL_TEXTURE_2D);
+        glDepthMask(GL_TRUE);
+        return;
+    }
+
+    setup_world_projection();
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_FOG);
+    apply_world_fog_color(g_frame_partial);
+    glDisable(GL_ALPHA_TEST);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    apply_sky_camera_rotation(g_frame_partial);
+
+    /* Java 1.2.5 RenderGlobal.renderSky(float): top glSkyList plane,
+       sunrise/sunset fan, additive sun/moon-phases/stars, black below-sea
+       horizon when needed, then translated glSkyList2 lower plane. */
+    float sr, sg, sb;
+    sky_color_at_time(g_frame_partial, &sr, &sg, &sb);
+
+    glDisable(GL_TEXTURE_2D);
+    if (g_opts.sf_sky) {
+        glColor4f(sr, sg, sb, 1.0f);
+        draw_sky_plane(16.0f);
+    }
+    glDisable(GL_FOG);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    if (g_opts.sf_sky) draw_sunrise_sunset_fan(g_frame_partial);
+
+    glEnable(GL_TEXTURE_2D);
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+    if (pex_shaders_active()) pex_shaders_bind_sky_textured();
+#endif
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glPushMatrix();
+    {
+        float rain_alpha = 1.0f;
+        glColor4f(1.0f, 1.0f, 1.0f, rain_alpha);
+        glTranslatef(0.0f, 0.0f, 0.0f);
+        glRotatef(-90.0f, 0.0f, 1.0f, 0.0f);
+        glRotatef(world_sun_angle(g_frame_partial) * 360.0f, 1.0f, 0.0f, 0.0f);
+
+        if (g_opts.sf_sun_moon) {
+        if (tex_sun.id) {
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, tex_sun.id);
+            glColor4f(1.0f, 1.0f, 1.0f, rain_alpha);
+        } else {
+            glDisable(GL_TEXTURE_2D);
+            set_color_int(0xFFFFFFFF);
+        }
+        {
+            float s = 30.0f;
+            glBegin(GL_QUADS);
+            glTexCoord2f(0.0f, 0.0f); glVertex3f(-s, 100.0f, -s);
+            glTexCoord2f(1.0f, 0.0f); glVertex3f( s, 100.0f, -s);
+            glTexCoord2f(1.0f, 1.0f); glVertex3f( s, 100.0f,  s);
+            glTexCoord2f(0.0f, 1.0f); glVertex3f(-s, 100.0f,  s);
+            glEnd();
+        }
+
+        {
+            int phase = world_moon_phase();
+            int mu = phase % 4;
+            int mv = (phase / 4) % 2;
+            float u0 = (float)mu / 4.0f;
+            float v0 = (float)mv / 2.0f;
+            float u1 = (float)(mu + 1) / 4.0f;
+            float v1 = (float)(mv + 1) / 2.0f;
+            if (tex_moon_phases.id) {
+                glEnable(GL_TEXTURE_2D);
+                glBindTexture(GL_TEXTURE_2D, tex_moon_phases.id);
+                glColor4f(1.0f, 1.0f, 1.0f, rain_alpha);
+            } else if (tex_moon.id) {
+                /* Fallback only for packs/platform assets missing the Release
+                   1.2.5 moon phase sheet.  Java 1.2.5 uses moon_phases.png. */
+                glEnable(GL_TEXTURE_2D);
+                glBindTexture(GL_TEXTURE_2D, tex_moon.id);
+                glColor4f(1.0f, 1.0f, 1.0f, rain_alpha);
+                u0 = 1.0f; v0 = 0.0f; u1 = 0.0f; v1 = 1.0f;
+            } else {
+                glDisable(GL_TEXTURE_2D);
+                set_color_int(0xFFFFFFFF);
+                u0 = 1.0f; v0 = 0.0f; u1 = 0.0f; v1 = 1.0f;
+            }
+            {
+                float s = 20.0f;
+                glBegin(GL_QUADS);
+                glTexCoord2f(u1, v1); glVertex3f(-s, -100.0f,  s);
+                glTexCoord2f(u0, v1); glVertex3f( s, -100.0f,  s);
+                glTexCoord2f(u0, v0); glVertex3f( s, -100.0f, -s);
+                glTexCoord2f(u1, v0); glVertex3f(-s, -100.0f, -s);
+                glEnd();
+            }
+        }
+        }
+
+        glDisable(GL_TEXTURE_2D);
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+        if (pex_shaders_active()) pex_shaders_bind_sky_basic();
+#endif
+        {
+            float star = sky_star_brightness(g_frame_partial) * rain_alpha;
+            if (g_opts.sf_stars && star > 0.0f) {
+                sky_generate_stars_once();
+                glColor4f(star, star, star, star);
+                glBegin(GL_QUADS);
+                for (int i = 0; i < g_sky_star_count; ++i) {
+                    for (int v = 0; v < 4; ++v) {
+                        glVertex3f(g_sky_stars[i].v[v][0], g_sky_stars[i].v[v][1], g_sky_stars[i].v[v][2]);
+                    }
+                }
+                glEnd();
+            }
+        }
+    }
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+    glDisable(GL_BLEND);
+    glEnable(GL_ALPHA_TEST);
+    glEnable(GL_FOG);
+    glPopMatrix();
+
+    glDisable(GL_TEXTURE_2D);
+    {
+        float eye_minus_sea = render_eye_y(g_frame_partial) - world_sea_level();
+        if (eye_minus_sea < 0.0f) {
+            glColor4f(0.0f, 0.0f, 0.0f, 1.0f);
+            draw_black_horizon_box(eye_minus_sea);
+        }
+
+        if (g_opts.sf_sky) {
+            if (1) { /* WorldProviderSurface::isSkyColored() equivalent. */
+                glColor4f(sr * 0.2f + 0.04f, sg * 0.2f + 0.04f, sb * 0.6f + 0.1f, 1.0f);
+            } else {
+                glColor4f(sr, sg, sb, 1.0f);
+            }
+            glPushMatrix();
+            glTranslatef(0.0f, -(eye_minus_sea - 16.0f), 0.0f);
+            draw_lower_sky_plane(-16.0f);
+            glPopMatrix();
+        }
+    }
+    glEnable(GL_TEXTURE_2D);
+    glDepthMask(GL_TRUE);
+}
+
+static int mcpe_chat_color_rgb(char code) {
+    if (code >= 'A' && code <= 'Z') code = (char)(code - 'A' + 'a');
+    switch (code) {
+        case '0': return 0x000000; case '1': return 0x0000AA;
+        case '2': return 0x00AA00; case '3': return 0x00AAAA;
+        case '4': return 0xAA0000; case '5': return 0xAA00AA;
+        case '6': return 0xFFAA00; case '7': return 0xAAAAAA;
+        case '8': return 0x555555; case '9': return 0x5555FF;
+        case 'a': return 0x55FF55; case 'b': return 0x55FFFF;
+        case 'c': return 0xFF5555; case 'd': return 0xFF55FF;
+        case 'e': return 0xFFFF55; case 'f': return 0xFFFFFF;
+        case 'r': return 0xFFFFFF;
+        default: return -1;
+    }
+}
+
+static void draw_text_mcpe_colored(const char *text, int x, int y, int argb) {
+    if (!text) return;
+    int alpha = argb & 0xFF000000;
+    int rgb = argb & 0x00FFFFFF;
+    int cur_x = x;
+    char seg[512];
+    int seg_n = 0;
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p) {
+        const unsigned char *start = p;
+        unsigned int cp = font_utf8_next(&p);
+        size_t bytes = (size_t)(p - start);
+
+        /* Chat color handling must be UTF-8 aware.  The old byte scanner also
+           accepted a raw 0xA7 byte as a section sign.  That corrupts Persian /
+           Arabic because many valid UTF-8 characters contain 0xA7 as a
+           continuation byte, for example U+0627 ALEF is D8 A7.  Only a decoded
+           U+00A7 is a formatting introducer. */
+        if (cp == 0x00A7u && *p) {
+            const unsigned char *code_start = p;
+            unsigned int code_cp = font_utf8_next(&p);
+            if (code_cp <= 0x7Fu) {
+                if (seg_n > 0) {
+                    seg[seg_n] = 0;
+                    draw_text_chat_plain(seg, cur_x, y, alpha | rgb);
+                    cur_x += text_width_chat_plain(seg);
+                    seg_n = 0;
+                }
+                {
+                    int c = mcpe_chat_color_rgb((char)code_cp);
+                    if (c >= 0) rgb = c;
+                }
+                continue;
+            }
+            /* Malformed/non-ASCII formatting code: keep both chars as text. */
+            p = code_start;
+        }
+
+        if (bytes == 0) break;
+        if (seg_n + (int)bytes < (int)sizeof(seg)) {
+            memcpy(seg + seg_n, start, bytes);
+            seg_n += (int)bytes;
+        }
+    }
+    if (seg_n > 0) {
+        seg[seg_n] = 0;
+        draw_text_chat_plain(seg, cur_x, y, alpha | rgb);
+    }
+}
+
+static void draw_chat_lines(int force_visible) {
+    glEnable(GL_BLEND);
+    for (int i = 0; i < g_chat_count && i < (force_visible ? 20 : 10); i++) {
+        int alpha = 255;
+        if (!force_visible) {
+            double fade = (double)g_chat_lines[i].age / 200.0;
+            fade = 1.0 - fade;
+            fade *= 10.0;
+            if (fade < 0.0) fade = 0.0;
+            if (fade > 1.0) fade = 1.0;
+            fade *= fade;
+            alpha = (int)(255.0 * fade);
+        }
+        if (alpha <= 0) continue;
+        int y = g_gui_h - 48 - pex_xinput_hud_bottom_offset() - i * 9;
+        draw_rect(2, y - 1, 322, y + 8, (alpha / 2) << 24);
+        draw_text_mcpe_colored(g_chat_lines[i].text, 2, y, (alpha << 24) | 0xFFFFFF);
+    }
+}
+
+
+static int generated_render_radius(void) {
+    int chunks = g_opts.render_distance;
+    if (chunks < 2) chunks = 2;
+    /* The active world window must contain player +/- render radius plus a small
+       safety ring for chunk/section edge rebuilds.  Values above this cap would
+       only show outside the generated in-memory terrain window. */
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    int max_chunks = (FLAT_RENDER_CHUNKS / 2) - 3;
+#else
+    int max_chunks = (FLAT_RENDER_CHUNKS / 2) - 2;
+#endif
+    if (max_chunks < 2) max_chunks = 2;
+    if (chunks > max_chunks) chunks = max_chunks;
+    return chunks;
+}
+
+static float current_render_distance_blocks(void) {
+    return (float)(generated_render_radius() * 16);
+}
+
+static void apply_source_like_fog(void) {
+    float end = current_render_distance_blocks();
+    float start = end * 0.25f;
+    float fog_col[4];
+    world_fog_color(g_frame_partial, &fog_col[0], &fog_col[1], &fog_col[2]);
+    fog_col[3] = 1.0f;
+
+    int fog_mode = GL_LINEAR;
+    float fog_density = 0.0f;
+
+    /* Java EntityRenderer.setupFog(float) switches to exponential medium fog
+       when the camera is in water/lava; otherwise it uses the time-dependent
+       fog color from EntityRenderer.updateFogColor(), not a fixed day blue. */
+    if (flat_player_head_in_water()) {
+        fog_col[0] = 0.02f; fog_col[1] = 0.02f; fog_col[2] = 0.20f;
+        fog_mode = GL_EXP;
+        fog_density = 0.10f;
+    } else if (flat_player_head_in_lava()) {
+        fog_col[0] = 0.60f; fog_col[1] = 0.10f; fog_col[2] = 0.00f;
+        fog_mode = GL_EXP;
+        fog_density = 2.00f;
+    } else if (g_current_dimension == -1) {
+        fog_col[0] = 0.20f; fog_col[1] = 0.02f; fog_col[2] = 0.02f;
+        fog_mode = GL_EXP;
+        fog_density = 0.035f;
+    } else if (g_current_dimension == 1) {
+        fog_col[0] = 0.08f; fog_col[1] = 0.06f; fog_col[2] = 0.10f;
+        fog_mode = GL_EXP2;
+        fog_density = 0.015f;
+    }
+
+    glEnable(GL_FOG);
+    glFogi(GL_FOG_MODE, fog_mode);
+    glFogfv(GL_FOG_COLOR, fog_col);
+    glClearColor(fog_col[0], fog_col[1], fog_col[2], 0.0f);
+    if (fog_mode == GL_EXP || fog_mode == GL_EXP2) glFogf(GL_FOG_DENSITY, fog_density);
+    else { glFogf(GL_FOG_START, start); glFogf(GL_FOG_END, end); }
+}
+
+
+static void cloud_color(float *r, float *g, float *b) {
+    cloud_color_at_time(g_frame_partial, r, g, b);
+}
+
+static void cloud_tex_vertex(float x, float y, float z, float u, float v) {
+    glTexCoord2f(u, v);
+    glVertex3f(x, y, z);
+}
+
+static int cloud_texture_has_cutout_alpha(void) {
+    static const unsigned char *cached_rgba = NULL;
+    static int cached_w = 0, cached_h = 0, cached_result = 0, cached_ready = 0;
+    if (!tex_clouds.rgba || tex_clouds.w <= 0 || tex_clouds.h <= 0) return 0;
+    if (cached_ready && cached_rgba == tex_clouds.rgba && cached_w == tex_clouds.w && cached_h == tex_clouds.h) {
+        return cached_result;
+    }
+    int n = tex_clouds.w * tex_clouds.h;
+    cached_result = 0;
+    for (int i = 0; i < n; ++i) {
+        unsigned char a = tex_clouds.rgba[i * 4 + 3];
+        if (a < 250) { cached_result = 1; break; }
+    }
+    cached_rgba = tex_clouds.rgba;
+    cached_w = tex_clouds.w;
+    cached_h = tex_clouds.h;
+    cached_ready = 1;
+    return cached_result;
+}
+
+static void draw_source_fast_clouds(float partial) {
+    if (!tex_clouds.id) return;
+    float cr, cg, cb;
+    cloud_color(&cr, &cg, &cb);
+
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    float px = pr->prev_x + (pr->x - pr->prev_x) * partial;
+    float pz = pr->prev_z + (pr->z - pr->prev_z) * partial;
+
+    /* RenderGlobal.func_4141_b: fast clouds are one huge tiled plane.  The
+       coordinates are placed in world space here, which becomes the same
+       camera-relative plane after apply_player_camera() translates by -player. */
+    const int step = 32;
+    const int loops = 256 / step;
+    const float uv_scale = 0.5f / 1024.0f;
+    double scroll_x = (double)px + (double)(((float)pr->ingame_ticks + partial) * 0.03f);
+    double scroll_z = (double)pz;
+    int wrap_x = (int)floor(scroll_x / 2048.0);
+    int wrap_z = (int)floor(scroll_z / 2048.0);
+    scroll_x -= (double)(wrap_x * 2048);
+    scroll_z -= (double)(wrap_z * 2048);
+    float u_scroll = (float)(scroll_x * (double)uv_scale);
+    float v_scroll = (float)(scroll_z * (double)uv_scale);
+    const float y = 120.33f;
+
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_FOG);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_clouds.id);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glColor4f(cr, cg, cb, 0.8f);
+
+    glBegin(GL_QUADS);
+    for (int x = -step * loops; x < step * loops; x += step) {
+        for (int z = -step * loops; z < step * loops; z += step) {
+            float x0 = px + (float)x;
+            float x1 = px + (float)(x + step);
+            float z0 = pz + (float)z;
+            float z1 = pz + (float)(z + step);
+            cloud_tex_vertex(x0, y, z1, (float)x * uv_scale + u_scroll, (float)(z + step) * uv_scale + v_scroll);
+            cloud_tex_vertex(x1, y, z1, (float)(x + step) * uv_scale + u_scroll, (float)(z + step) * uv_scale + v_scroll);
+            cloud_tex_vertex(x1, y, z0, (float)(x + step) * uv_scale + u_scroll, (float)z * uv_scale + v_scroll);
+            cloud_tex_vertex(x0, y, z0, (float)x * uv_scale + u_scroll, (float)z * uv_scale + v_scroll);
+        }
+    }
+    glEnd();
+
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glColor4f(1,1,1,1);
+}
+
+static void draw_source_fancy_clouds(float partial) {
+    if (!tex_clouds.id) return;
+    /* Java RenderGlobal.renderCloudsFancy is plain fixed-function OpenGL.
+       The old C guard forced real OpenGL through the flat cloud path while D3D
+       used the 3D slab path, which made clouds visibly 2D only on OpenGL. */
+    if (!cloud_texture_has_cutout_alpha()) { draw_source_fast_clouds(partial); return; }
+    float cr, cg, cb;
+    cloud_color(&cr, &cg, &cb);
+
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    float px = pr->prev_x + (pr->x - pr->prev_x) * partial;
+    float py = pr->prev_y + (pr->y - pr->prev_y) * partial;
+    float pz = pr->prev_z + (pr->z - pr->prev_z) * partial;
+
+    /* RenderGlobal.func_6510_c: 12x scaled 3D cloud slabs, 8x8 cloud cells,
+       4 block thickness.  Kept source-shaped, but still emitted through the C
+       GL shim so PC and PSP share one path. */
+    const float scale = 12.0f;
+    const float thickness = 4.0f;
+    const int cell = 8;
+    const int radius_cells = 4;
+    const float eps = 1.0f / 1024.0f;
+    const float uv_scale = 1.0f / 256.0f;
+    double sx = ((double)px + (double)(((float)pr->ingame_ticks + partial) * 0.03f)) / (double)scale;
+    double sz = ((double)pz) / (double)scale + 0.33;
+    int wrap_x = (int)floor(sx / 2048.0);
+    int wrap_z = (int)floor(sz / 2048.0);
+    sx -= (double)(wrap_x * 2048);
+    sz -= (double)(wrap_z * 2048);
+    int fsx = (int)floor(sx);
+    int fsz = (int)floor(sz);
+    float u_base = (float)fsx * uv_scale;
+    float v_base = (float)fsz * uv_scale;
+    float frac_x = (float)(sx - (double)fsx);
+    float frac_z = (float)(sz - (double)fsz);
+    float y0 = 108.33f;
+    float y1 = y0 + thickness;
+
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_FOG);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_clouds.id);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    /* Java does a true depth prepass by disabling color writes only.  Depth
+       writes must stay enabled, otherwise all internal 3D cloud slab faces blend
+       through each other and look like separated translucent cubes.  Alpha test
+       is also needed so transparent pixels in clouds.png do not write depth. */
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.1f);
+    glDepthMask(GL_TRUE);
+
+    for (int pass = 0; pass < 2; ++pass) {
+        glColorMask(pass != 0, pass != 0, pass != 0, pass != 0);
+        float alpha = 0.8f;
+
+        /* Keep Java's two-pass fancy-cloud shape, but do not emit one immediate
+           batch per 8x8 cloud cell.  On the D3D11 compatibility backend each
+           glEnd() finalizes and submits a draw batch; the old code made roughly
+           128 tiny cloud draw batches per frame here.  That is why Loggy showed
+           World clouds at ~3 ms while the actual terrain draw was cheap.
+           One batch per depth/color pass keeps the same vertices/colors while
+           cutting the D3D11 cloud submit overhead to two batches per frame. */
+        glBegin(GL_QUADS);
+        for (int cz = -radius_cells + 1; cz <= radius_cells; ++cz) {
+            for (int cx = -radius_cells + 1; cx <= radius_cells; ++cx) {
+                float gx0 = (float)(cx * cell) - frac_x;
+                float gz0 = (float)(cz * cell) - frac_z;
+                float gx1 = gx0 + (float)cell;
+                float gz1 = gz0 + (float)cell;
+                float x0 = px + gx0 * scale;
+                float x1 = px + gx1 * scale;
+                float z0 = pz + gz0 * scale;
+                float z1 = pz + gz1 * scale;
+                float u0 = ((float)(cx * cell) + 0.0f) * uv_scale + u_base;
+                float u1 = ((float)(cx * cell + cell)) * uv_scale + u_base;
+                float v0 = ((float)(cz * cell) + 0.0f) * uv_scale + v_base;
+                float v1 = ((float)(cz * cell + cell)) * uv_scale + v_base;
+
+                /* Java draws the bottom face when the camera is below/inside the
+                   slab, and the top face when the camera is above/inside it.  The
+                   earlier port had these swapped, which made fancy clouds look like
+                   inside-out sheets from the ground. */
+                if (py < y1 + 1.0f) {
+                    glColor4f(cr * 0.7f, cg * 0.7f, cb * 0.7f, alpha);
+                    cloud_tex_vertex(x0, y0, z1, u0, v1);
+                    cloud_tex_vertex(x1, y0, z1, u1, v1);
+                    cloud_tex_vertex(x1, y0, z0, u1, v0);
+                    cloud_tex_vertex(x0, y0, z0, u0, v0);
+                }
+                if (py > y0 - thickness - 1.0f) {
+                    glColor4f(cr, cg, cb, alpha);
+                    cloud_tex_vertex(x0, y1 - eps, z1, u0, v1);
+                    cloud_tex_vertex(x1, y1 - eps, z1, u1, v1);
+                    cloud_tex_vertex(x1, y1 - eps, z0, u1, v0);
+                    cloud_tex_vertex(x0, y1 - eps, z0, u0, v0);
+                }
+                glColor4f(cr * 0.9f, cg * 0.9f, cb * 0.9f, alpha);
+                if (cx > -1) for (int i = 0; i < cell; ++i) {
+                    float xa = px + ((float)(cx * cell + i) - frac_x) * scale;
+                    float uu = ((float)(cx * cell + i) + 0.5f) * uv_scale + u_base;
+                    cloud_tex_vertex(xa, y0, z1, uu, v1); cloud_tex_vertex(xa, y1, z1, uu, v1); cloud_tex_vertex(xa, y1, z0, uu, v0); cloud_tex_vertex(xa, y0, z0, uu, v0);
+                }
+                if (cx <= 1) for (int i = 0; i < cell; ++i) {
+                    float xa = px + ((float)(cx * cell + i + 1) - frac_x - eps) * scale;
+                    float uu = ((float)(cx * cell + i) + 0.5f) * uv_scale + u_base;
+                    cloud_tex_vertex(xa, y0, z0, uu, v0); cloud_tex_vertex(xa, y1, z0, uu, v0); cloud_tex_vertex(xa, y1, z1, uu, v1); cloud_tex_vertex(xa, y0, z1, uu, v1);
+                }
+                glColor4f(cr * 0.8f, cg * 0.8f, cb * 0.8f, alpha);
+                if (cz > -1) for (int i = 0; i < cell; ++i) {
+                    float za = pz + ((float)(cz * cell + i) - frac_z) * scale;
+                    float vv = ((float)(cz * cell + i) + 0.5f) * uv_scale + v_base;
+                    cloud_tex_vertex(x0, y1, za, u0, vv); cloud_tex_vertex(x1, y1, za, u1, vv); cloud_tex_vertex(x1, y0, za, u1, vv); cloud_tex_vertex(x0, y0, za, u0, vv);
+                }
+                if (cz <= 1) for (int i = 0; i < cell; ++i) {
+                    float za = pz + ((float)(cz * cell + i + 1) - frac_z - eps) * scale;
+                    float vv = ((float)(cz * cell + i) + 0.5f) * uv_scale + v_base;
+                    cloud_tex_vertex(x0, y0, za, u0, vv); cloud_tex_vertex(x1, y0, za, u1, vv); cloud_tex_vertex(x1, y1, za, u1, vv); cloud_tex_vertex(x0, y1, za, u0, vv);
+                }
+            }
+        }
+        glEnd();
+    }
+
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_BLEND);
+    glColor4f(1,1,1,1);
+}
+
+static void draw_source_clouds(void) {
+    int mode = stivufine_cloud_mode();
+    if (mode == SF_OFF) return;
+    if (mode == SF_FANCY) draw_source_fancy_clouds(g_frame_partial);
+    else draw_source_fast_clouds(g_frame_partial);
+}
+
+
+static void setup_world_projection(void) {
+    int viewport_w = g_render_w;
+    int viewport_h = g_render_h;
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    /* When render scaling is active, the world projection must use the FBO
+       dimensions. Using the native drawable viewport here would map NDC into
+       only a corner of the smaller target and defeat both scaling and aspect
+       preservation. The GUI switches back to the native drawable afterward. */
+    int scaled_w = pex_android_tv_world_target_width();
+    int scaled_h = pex_android_tv_world_target_height();
+    if (scaled_w > 0 && scaled_h > 0) { viewport_w = scaled_w; viewport_h = scaled_h; }
+#endif
+    if (viewport_w < 1) viewport_w = 1;
+    if (viewport_h < 1) viewport_h = 1;
+    glViewport(0, 0, viewport_w, viewport_h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    float aspect = (float)viewport_w / (float)viewport_h;
+    {
+        float far_plane = current_render_distance_blocks() + 64.0f;
+        if (far_plane < 1024.0f) far_plane = 1024.0f; /* clouds are independent from terrain distance */
+        double fov = (double)g_opts.fov * (double)player_fov_multiplier_125();
+#if defined(PEX_PLATFORM_LINUX_SDL2) || (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP))
+        if (breach_active()) fov *= (1.0-0.23*(double)g_breach_aim);
+#endif
+        if (flat_player_head_in_water()) fov = fov * 60.0 / 70.0;
+        if (fov < 30.0) fov = 30.0;
+        if (fov > 170.0) fov = 170.0;
+        gluPerspective(fov, (double)aspect, 0.05, (double)far_plane);
+    }
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+}
+
+static void apply_view_bobbing(float partial) {
+    if (!g_opts.view_bobbing) return;
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    float walk_delta = pr->distance_walked - pr->prev_distance_walked;
+    float walk = -(pr->distance_walked + walk_delta * partial);
+    float cam_yaw = pr->prev_camera_yaw + (pr->camera_yaw - pr->prev_camera_yaw) * partial;
+    float cam_pitch = pr->prev_camera_pitch + (pr->camera_pitch - pr->prev_camera_pitch) * partial;
+
+    /* Java 1.2.5 EntityRenderer.setupViewBobbing(float): applied before
+       orientCamera(), so it affects both first person and F5 third person. */
+    glTranslatef(sinf(walk * (float)M_PI) * cam_yaw * 0.5f,
+                 -fabsf(cosf(walk * (float)M_PI) * cam_yaw),
+                 0.0f);
+    glRotatef(sinf(walk * (float)M_PI) * cam_yaw * 3.0f, 0.0f, 0.0f, 1.0f);
+    glRotatef(fabsf(cosf(walk * (float)M_PI - 0.2f) * cam_yaw) * 5.0f, 1.0f, 0.0f, 0.0f);
+    glRotatef(cam_pitch, 1.0f, 0.0f, 0.0f);
+}
+
+
+static void apply_hurt_camera_effect(float partial) {
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    if (pr->dead) {
+        float f = (float)pr->death_time + partial;
+        glRotatef(40.0f - 8000.0f / (f + 200.0f), 0.0f, 0.0f, 1.0f);
+        return;
+    }
+    if (pr->hurt_time <= 0 || pr->max_hurt_time <= 0) return;
+    float f = (float)pr->hurt_time - partial;
+    if (f <= 0.0f) return;
+    f /= (float)pr->max_hurt_time;
+    f = sinf(f * f * f * f * (float)M_PI);
+    glRotatef(-pr->attacked_at_yaw, 0.0f, 1.0f, 0.0f);
+    glRotatef(-f * 14.0f, 0.0f, 0.0f, 1.0f);
+    glRotatef(pr->attacked_at_yaw, 0.0f, 1.0f, 0.0f);
+}
+
+static int third_person_camera_blocker(int bx, int by, int bz) {
+    int id = flat_get_block(bx, by, bz);
+    if (id == 0 || block_is_liquid(id)) return 0;
+    if (id == BLOCK_SNOW_LAYER || id == BLOCK_TORCH || id == BLOCK_FIRE ||
+        id == BLOCK_REDSTONE_WIRE || id == BLOCK_REEDS ||
+        id == BLOCK_YELLOW_FLOWER || id == BLOCK_RED_ROSE ||
+        id == BLOCK_BROWN_MUSHROOM || id == BLOCK_RED_MUSHROOM) return 0;
+    return 1;
+}
+
+static int third_person_trace_blocks(float ax, float ay, float az,
+                                     float bx, float by, float bz,
+                                     float *out_dist) {
+    float dx = bx - ax;
+    float dy = by - ay;
+    float dz = bz - az;
+    float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (len <= 0.0001f) return 0;
+    int steps = (int)(len / 0.05f) + 1;
+    for (int i = 1; i <= steps; ++i) {
+        float t = (float)i / (float)steps;
+        float x = ax + dx * t;
+        float y = ay + dy * t;
+        float z = az + dz * t;
+        if (third_person_camera_blocker((int)floorf(x), (int)floorf(y), (int)floorf(z))) {
+            if (out_dist) *out_dist = len * t;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static float third_person_camera_distance(float x, float y, float z,
+                                          float yaw, float pitch,
+                                          float wanted_dist) {
+    float yaw_rad = yaw * (float)M_PI / 180.0f;
+    float pitch_rad = pitch * (float)M_PI / 180.0f;
+    float back_x = sinf(yaw_rad) * cosf(pitch_rad);
+    float back_y = sinf(pitch_rad);
+    float back_z = -cosf(yaw_rad) * cosf(pitch_rad);
+    float dist = wanted_dist;
+
+    for (int i = 0; i < 8; ++i) {
+        float ox = (float)(((i & 1) * 2) - 1) * 0.1f;
+        float oy = (float)((((i >> 1) & 1) * 2) - 1) * 0.1f;
+        float oz = (float)((((i >> 2) & 1) * 2) - 1) * 0.1f;
+        float hit_dist = wanted_dist;
+        if (third_person_trace_blocks(x + ox, y + oy, z + oz,
+                                      x + back_x * wanted_dist + ox,
+                                      y + back_y * wanted_dist + oy,
+                                      z + back_z * wanted_dist + oz,
+                                      &hit_dist) && hit_dist < dist) {
+            dist = hit_dist;
+        }
+    }
+
+    if (dist < 0.15f) dist = 0.15f;
+    return dist;
+}
+
+static void apply_player_camera(float partial) {
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    float x = pr->prev_x + (pr->x - pr->prev_x) * partial;
+    float y = pr->prev_y + (pr->y - pr->prev_y) * partial;
+    float z = pr->prev_z + (pr->z - pr->prev_z) * partial;
+    float yaw = lerp_angle(pr->prev_yaw, pr->yaw, partial);
+    float pitch = pr->prev_pitch + (pr->pitch - pr->prev_pitch) * partial;
+
+    /* Sneaking lowers the player camera/eye a bit, like the earlier patch. */
+    if (g_screen == SCREEN_INGAME && key_down_vk(g_opts.keys[5])) y -= 0.18f;
+
+    apply_hurt_camera_effect(partial);
+    apply_view_bobbing(partial);
+    apply_portal_camera_effect(partial);
+
+    if (g_third_person_view) {
+        /* Java 1.2.5 EntityRenderer.orientCamera semantics:
+           0 = first person, 1 = camera behind player, 2 = camera in front
+           facing back at the player.  Both third-person modes use a 4 block
+           camera boom shortened by 8 small collision rays. */
+        int front_view = (g_third_person_view == 2);
+        float yaw_rad = yaw * (float)M_PI / 180.0f;
+        float pitch_rad = pitch * (float)M_PI / 180.0f;
+        float dist = 4.0f;
+
+        float look_x = -sinf(yaw_rad) * cosf(pitch_rad);
+        float look_y = -sinf(pitch_rad);
+        float look_z =  cosf(yaw_rad) * cosf(pitch_rad);
+        float boom_pitch = front_view ? (pitch + 180.0f) : pitch;
+        dist = third_person_camera_distance(x, y, z, yaw, boom_pitch, dist);
+
+        float cam_x = front_view ? (x + look_x * dist) : (x - look_x * dist);
+        float cam_y = front_view ? (y + look_y * dist) : (y - look_y * dist);
+        float cam_z = front_view ? (z + look_z * dist) : (z - look_z * dist);
+        float view_yaw = front_view ? (yaw + 180.0f) : yaw;
+        float view_pitch = front_view ? -pitch : pitch;
+
+        glRotatef(view_pitch, 1.0f, 0.0f, 0.0f);
+        glRotatef(view_yaw + 180.0f, 0.0f, 1.0f, 0.0f);
+        glTranslatef(-cam_x, -cam_y, -cam_z);
+    } else {
+        glTranslatef(0.0f, 0.0f, -0.1f); /* first-person camera nudge from kq.java */
+        glRotatef(pitch, 1.0f, 0.0f, 0.0f);
+        glRotatef(yaw + 180.0f, 0.0f, 1.0f, 0.0f);
+        glTranslatef(-x, -y, -z);
+    }
+}
+
+static void stivufine_terrain_tile_pixel_rect(int tile, int *x, int *y, int *w, int *h) {
+    int base_w = stivufine_terrain_base_w > 0 ? stivufine_terrain_base_w : (tex_terrain.w > 0 ? tex_terrain.w : 256);
+    int base_h = stivufine_terrain_base_h > 0 ? stivufine_terrain_base_h : (tex_terrain.h > 0 ? tex_terrain.h : 256);
+    int cell = tile >= 0 ? tile / 256 : 0;
+    int local = tile >= 0 ? tile & 255 : 0;
+    int cells = stivufine_terrain_cells_per_row > 0 ? stivufine_terrain_cells_per_row : 1;
+    int tile_w = base_w / 16, tile_h = base_h / 16;
+    *x = (cell % cells) * base_w + (local & 15) * tile_w;
+    *y = (cell / cells) * base_h + (local >> 4) * tile_h;
+    *w = tile_w; *h = tile_h;
+}
+
+static void terrain_tile_uv(int tile, float *u0, float *v0, float *u1, float *v1) {
+    float aw = tex_terrain.w ? (float)tex_terrain.w : 256.0f;
+    float ah = tex_terrain.h ? (float)tex_terrain.h : 256.0f;
+    int tx, ty, pw, ph;
+    stivufine_terrain_tile_pixel_rect(tile, &tx, &ty, &pw, &ph);
+    *u0 = ((float)tx + 0.01f) / aw;
+    *v0 = ((float)ty + 0.01f) / ah;
+    *u1 = ((float)tx + (float)pw - 0.01f) / aw;
+    *v1 = ((float)ty + (float)ph - 0.01f) / ah;
+}
+
+#define PEX_PORTAL_TILE 14
+#define PEX_PORTAL_FRAME_COUNT 32
+static unsigned char g_portal_anim_frames[PEX_PORTAL_FRAME_COUNT][16 * 16 * 4];
+static int g_portal_anim_ready = 0;
+static int g_portal_uploaded_frame = -1;
+static unsigned char *g_portal_uploaded_rgba = NULL;
+static int g_portal_uploaded_w = 0;
+static int g_portal_uploaded_h = 0;
+
+static int pex_portal_clamp_u8(int v) {
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return v;
+}
+
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+/* Update only the portal cell (and its mip cells) instead of replacing and
+   regenerating the complete terrain atlas every animation tick.  On desktop
+   OpenGL the old full-atlas path was a large synchronous upload/CPU mipmap
+   spike, especially noticeable in portal-heavy server hubs. */
+static void pex_portal_upload_frame_subrect(int tx, int ty, const unsigned char *src) {
+    unsigned char level_pixels[16 * 16 * 4];
+    unsigned char next_pixels[16 * 16 * 4];
+    int w = 16, h = 16;
+    int x = tx, y = ty;
+    int max_levels = stivufine_texture_mipmap_level_for(&tex_terrain);
+
+    memcpy(level_pixels, src, sizeof(level_pixels));
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
+                    GL_RGBA, GL_UNSIGNED_BYTE, level_pixels);
+
+    for (int level = 1; level <= max_levels && (w > 1 || h > 1); ++level) {
+        int nw = w > 1 ? w >> 1 : 1;
+        int nh = h > 1 ? h >> 1 : 1;
+        for (int py = 0; py < nh; ++py) {
+            for (int px = 0; px < nw; ++px) {
+                int sx0 = px * 2, sy0 = py * 2;
+                int sx1 = sx0 + 1 < w ? sx0 + 1 : sx0;
+                int sy1 = sy0 + 1 < h ? sy0 + 1 : sy0;
+                const unsigned char *p0 = &level_pixels[(sy0 * w + sx0) * 4];
+                const unsigned char *p1 = &level_pixels[(sy0 * w + sx1) * 4];
+                const unsigned char *p2 = &level_pixels[(sy1 * w + sx1) * 4];
+                const unsigned char *p3 = &level_pixels[(sy1 * w + sx0) * 4];
+                unsigned char *dst = &next_pixels[(py * nw + px) * 4];
+                stivufine_alpha_blend_four(p0, p1, p2, p3, dst);
+            }
+        }
+        x >>= 1; y >>= 1;
+        glTexSubImage2D(GL_TEXTURE_2D, level, x, y, nw, nh,
+                        GL_RGBA, GL_UNSIGNED_BYTE, next_pixels);
+        memcpy(level_pixels, next_pixels, (size_t)nw * (size_t)nh * 4u);
+        w = nw; h = nh;
+    }
+}
+#endif
+
+static void pex_portal_build_frames(void) {
+    if (g_portal_anim_ready) return;
+    PexSkyJavaRandom rng;
+    pex_sky_java_random_set_seed(&rng, 100LL);
+    const float pi = 3.14159265358979323846f;
+    for (int frame = 0; frame < PEX_PORTAL_FRAME_COUNT; ++frame) {
+        for (int y = 0; y < 16; ++y) {
+            for (int x = 0; x < 16; ++x) {
+                float accum = 0.0f;
+                for (int layer = 0; layer < 2; ++layer) {
+                    float cx = (float)(layer * 16) * 0.5f;
+                    float cy = (float)(layer * 16) * 0.5f;
+                    float dx = ((float)x - cx) / 16.0f * 2.0f;
+                    float dy = ((float)y - cy) / 16.0f * 2.0f;
+                    if (dx < -1.0f) dx += 2.0f;
+                    if (dx >= 1.0f) dx -= 2.0f;
+                    if (dy < -1.0f) dy += 2.0f;
+                    if (dy >= 1.0f) dy -= 2.0f;
+                    float d2 = dx * dx + dy * dy;
+                    float spin = atan2f(dy, dx) + (((float)frame / 32.0f) * pi * 2.0f - d2 * 10.0f + (float)(layer * 2)) * (float)(layer * 2 - 1);
+                    float wave = (sinf(spin) + 1.0f) * 0.5f;
+                    accum += (wave / (d2 + 1.0f)) * 0.5f;
+                }
+                accum += pex_sky_java_random_next_float(&rng) * 0.1f;
+                int b = (int)(accum * 100.0f + 155.0f);
+                int r = (int)(accum * accum * 200.0f + 55.0f);
+                int g = (int)(accum * accum * accum * accum * 255.0f);
+                int a = (int)(accum * 100.0f + 155.0f);
+                unsigned char *dst = &g_portal_anim_frames[frame][(y * 16 + x) * 4];
+                dst[0] = (unsigned char)pex_portal_clamp_u8(r);
+                dst[1] = (unsigned char)pex_portal_clamp_u8(g);
+                dst[2] = (unsigned char)pex_portal_clamp_u8(b);
+                dst[3] = (unsigned char)pex_portal_clamp_u8(a);
+            }
+        }
+    }
+    g_portal_anim_ready = 1;
+}
+
+static void update_portal_texture_animation(void) {
+    if (!stivufine_animate_portal_texture()) return;
+    if (!tex_terrain.id || !tex_terrain.rgba || tex_terrain.w <= 0 || tex_terrain.h <= 0) return;
+    int tx, ty, tw, th;
+    stivufine_terrain_tile_pixel_rect(PEX_PORTAL_TILE, &tx, &ty, &tw, &th);
+    if (tw != 16 || th != 16 || tx + tw > tex_terrain.w || ty + th > tex_terrain.h) return;
+    pex_portal_build_frames();
+    int frame = (g_ingame_ticks + 1) & (PEX_PORTAL_FRAME_COUNT - 1);
+    if (frame == g_portal_uploaded_frame && g_portal_uploaded_rgba == tex_terrain.rgba &&
+        g_portal_uploaded_w == tex_terrain.w && g_portal_uploaded_h == tex_terrain.h) {
+        return;
+    }
+    const unsigned char *src = g_portal_anim_frames[frame];
+    for (int y = 0; y < 16; ++y) {
+        unsigned char *dst = &tex_terrain.rgba[((ty + y) * tex_terrain.w + tx) * 4];
+        memcpy(dst, src + y * 16 * 4, 16u * 4u);
+    }
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+    pex_portal_upload_frame_subrect(tx, ty, src);
+#else
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, tx, ty, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, src);
+#endif
+    /* Native D3D terrain meshes use a separate backend texture. Update only
+       the animated cell instead of destroying and recreating the full atlas. */
+    flat_direct_update_terrain_region(tx, ty, 16, 16, src);
+    g_portal_uploaded_frame = frame;
+    g_portal_uploaded_rgba = tex_terrain.rgba;
+    g_portal_uploaded_w = tex_terrain.w;
+    g_portal_uploaded_h = tex_terrain.h;
+}
+
+
+typedef struct PexLiquidTextureFX {
+    float a[256];
+    float b[256];
+    float c[256];
+    float d[256];
+    int tick;
+    int ready;
+} PexLiquidTextureFX;
+
+static PexLiquidTextureFX g_water_still_fx;
+static PexLiquidTextureFX g_water_flow_fx;
+static PexLiquidTextureFX g_lava_still_fx;
+static PexLiquidTextureFX g_lava_flow_fx;
+static int g_liquid_uploaded_tick = -1;
+static unsigned char *g_liquid_uploaded_rgba = NULL;
+static int g_liquid_uploaded_w = 0;
+static int g_liquid_uploaded_h = 0;
+
+static int pex_liquid_clamp_u8(int v) {
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return v;
+}
+
+static float pex_liquid_rand01(void) {
+    return (float)rand() / ((float)RAND_MAX + 1.0f);
+}
+
+static void pex_liquid_fx_water_tick(PexLiquidTextureFX *fx, int flowing, unsigned char out[16 * 16 * 4]) {
+    if (!fx) return;
+    fx->ready = 1;
+    fx->tick++;
+    for (int x = 0; x < 16; ++x) {
+        for (int y = 0; y < 16; ++y) {
+            float v = 0.0f;
+            if (flowing) {
+                for (int yy = y - 2; yy <= y; ++yy) v += fx->a[x + ((yy & 15) << 4)];
+                fx->b[x + (y << 4)] = v / 3.2f + fx->c[x + (y << 4)] * 0.8f;
+            } else {
+                for (int xx = x - 1; xx <= x + 1; ++xx) v += fx->a[(xx & 15) + (y << 4)];
+                fx->b[x + (y << 4)] = v / 3.3f + fx->c[x + (y << 4)] * 0.8f;
+            }
+        }
+    }
+    for (int x = 0; x < 16; ++x) {
+        for (int y = 0; y < 16; ++y) {
+            int i = x + (y << 4);
+            fx->c[i] += fx->d[i] * 0.05f;
+            if (fx->c[i] < 0.0f) fx->c[i] = 0.0f;
+            fx->d[i] -= flowing ? 0.3f : 0.1f;
+            if (pex_liquid_rand01() < (flowing ? 0.2f : 0.05f)) fx->d[i] = 0.5f;
+        }
+    }
+    float *tmp = fx->b; /* not swappable as arrays; copy through temp buffer below. */
+    float swap[256];
+    memcpy(swap, fx->b, sizeof(swap));
+    memcpy(fx->b, fx->a, sizeof(swap));
+    memcpy(fx->a, swap, sizeof(swap));
+    (void)tmp;
+    for (int i = 0; i < 256; ++i) {
+        int si = flowing ? ((i - fx->tick * 16) & 255) : i;
+        float v = fx->a[si];
+        if (v > 1.0f) v = 1.0f;
+        if (v < 0.0f) v = 0.0f;
+        float vv = v * v;
+        int r = (int)(32.0f + vv * 32.0f);
+        int g = (int)(50.0f + vv * 64.0f);
+        int b = 255;
+        int a = (int)(146.0f + vv * 50.0f);
+        out[i * 4 + 0] = (unsigned char)pex_liquid_clamp_u8(r);
+        out[i * 4 + 1] = (unsigned char)pex_liquid_clamp_u8(g);
+        out[i * 4 + 2] = (unsigned char)pex_liquid_clamp_u8(b);
+        out[i * 4 + 3] = (unsigned char)pex_liquid_clamp_u8(a);
+    }
+}
+
+static void pex_liquid_fx_lava_tick(PexLiquidTextureFX *fx, int flowing, unsigned char out[16 * 16 * 4]) {
+    if (!fx) return;
+    fx->ready = 1;
+    if (flowing) fx->tick++;
+    for (int x = 0; x < 16; ++x) {
+        for (int y = 0; y < 16; ++y) {
+            float v = 0.0f;
+            int ox = (int)(sinf((float)y * 6.28318530718f / 16.0f) * 1.2f);
+            int oy = (int)(sinf((float)x * 6.28318530718f / 16.0f) * 1.2f);
+            for (int xx = x - 1; xx <= x + 1; ++xx) {
+                for (int yy = y - 1; yy <= y + 1; ++yy) {
+                    int sx = (xx + ox) & 15;
+                    int sy = (yy + oy) & 15;
+                    v += fx->a[sx + (sy << 4)];
+                }
+            }
+            int i = x + (y << 4);
+            fx->b[i] = v / 10.0f + (fx->c[((x + 0) & 15) + (((y + 0) & 15) << 4)] +
+                                      fx->c[((x + 1) & 15) + (((y + 0) & 15) << 4)] +
+                                      fx->c[((x + 1) & 15) + (((y + 1) & 15) << 4)] +
+                                      fx->c[((x + 0) & 15) + (((y + 1) & 15) << 4)]) * 0.2f;
+            fx->c[i] += fx->d[i] * 0.01f;
+            if (fx->c[i] < 0.0f) fx->c[i] = 0.0f;
+            fx->d[i] -= 0.06f;
+            if (pex_liquid_rand01() < 0.005f) fx->d[i] = 1.5f;
+        }
+    }
+    float swap[256];
+    memcpy(swap, fx->b, sizeof(swap));
+    memcpy(fx->b, fx->a, sizeof(swap));
+    memcpy(fx->a, swap, sizeof(swap));
+    for (int i = 0; i < 256; ++i) {
+        int si = flowing ? ((i - (fx->tick / 3) * 16) & 255) : i;
+        float v = fx->a[si] * 2.0f;
+        if (v > 1.0f) v = 1.0f;
+        if (v < 0.0f) v = 0.0f;
+        int r = (int)(v * 100.0f + 155.0f);
+        int g = (int)(v * v * 255.0f);
+        int b = (int)(v * v * v * v * 128.0f);
+        out[i * 4 + 0] = (unsigned char)pex_liquid_clamp_u8(r);
+        out[i * 4 + 1] = (unsigned char)pex_liquid_clamp_u8(g);
+        out[i * 4 + 2] = (unsigned char)pex_liquid_clamp_u8(b);
+        out[i * 4 + 3] = 255;
+    }
+}
+
+static void pex_upload_animated_terrain_tile(int tile, int tile_size,
+                                             const unsigned char src[16 * 16 * 4]) {
+    if (!tex_terrain.id || !tex_terrain.rgba || tex_terrain.w <= 0 || tex_terrain.h <= 0 || !src) return;
+    if (tile_size < 1) tile_size = 1;
+    int tx, ty, tw, th;
+    stivufine_terrain_tile_pixel_rect(tile, &tx, &ty, &tw, &th);
+    if (tw <= 0 || th <= 0) return;
+    if (tx + tw * tile_size > tex_terrain.w || ty + th * tile_size > tex_terrain.h) return;
+
+    unsigned char stack_upload[16 * 16 * 4];
+    size_t upload_bytes = (size_t)tw * (size_t)th * 4u;
+    unsigned char *upload = upload_bytes <= sizeof(stack_upload) ? stack_upload : (unsigned char *)malloc(upload_bytes);
+    if (!upload) return;
+    for (int y = 0; y < th; ++y) {
+        int sy = (y * 16) / th;
+        for (int x = 0; x < tw; ++x) {
+            int sx = (x * 16) / tw;
+            memcpy(upload + ((size_t)y * (size_t)tw + (size_t)x) * 4u,
+                   src + (sy * 16 + sx) * 4, 4);
+        }
+    }
+
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+
+    /* Upload only the changed cells. The old implementation regenerated the
+       complete terrain mip chain four times per animation tick. */
+    for (int oy = 0; oy < tile_size; ++oy) {
+        for (int ox = 0; ox < tile_size; ++ox) {
+            int dx = tx + ox * tw;
+            int dy = ty + oy * th;
+            for (int y = 0; y < th; ++y) {
+                memcpy(&tex_terrain.rgba[((dy + y) * tex_terrain.w + dx) * 4],
+                       upload + (size_t)y * (size_t)tw * 4u,
+                       (size_t)tw * 4u);
+            }
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+            if (tw == 16 && th == 16) pex_portal_upload_frame_subrect(dx, dy, upload);
+            else glTexSubImage2D(GL_TEXTURE_2D, 0, dx, dy, tw, th, GL_RGBA, GL_UNSIGNED_BYTE, upload);
+#else
+            glTexSubImage2D(GL_TEXTURE_2D, 0, dx, dy, tw, th, GL_RGBA, GL_UNSIGNED_BYTE, upload);
+#endif
+            flat_direct_update_terrain_region(dx, dy, tw, th, upload);
+        }
+    }
+    if (upload != stack_upload) free(upload);
+}
+
+static void update_liquid_texture_animation(void) {
+    int do_water = stivufine_animate_water_texture();
+    int do_lava = stivufine_animate_lava_texture();
+    if (!do_water && !do_lava) return;
+    if (!tex_terrain.id || !tex_terrain.rgba || tex_terrain.w <= 0 || tex_terrain.h <= 0) return;
+    if (g_liquid_uploaded_tick == g_ingame_ticks && g_liquid_uploaded_rgba == tex_terrain.rgba &&
+        g_liquid_uploaded_w == tex_terrain.w && g_liquid_uploaded_h == tex_terrain.h) return;
+    unsigned char tilebuf[16 * 16 * 4];
+    if (do_water) {
+        pex_liquid_fx_water_tick(&g_water_still_fx, 0, tilebuf);
+        pex_upload_animated_terrain_tile(205, 1, tilebuf);
+        pex_liquid_fx_water_tick(&g_water_flow_fx, 1, tilebuf);
+        pex_upload_animated_terrain_tile(206, 2, tilebuf);
+    }
+    if (do_lava) {
+        pex_liquid_fx_lava_tick(&g_lava_still_fx, 0, tilebuf);
+        pex_upload_animated_terrain_tile(237, 1, tilebuf);
+        pex_liquid_fx_lava_tick(&g_lava_flow_fx, 1, tilebuf);
+        pex_upload_animated_terrain_tile(238, 2, tilebuf);
+    }
+    g_liquid_uploaded_tick = g_ingame_ticks;
+    g_liquid_uploaded_rgba = tex_terrain.rgba;
+    g_liquid_uploaded_w = tex_terrain.w;
+    g_liquid_uploaded_h = tex_terrain.h;
+}
+
+static float portal_interpolated_amount(float partial) {
+    float a = g_prev_time_in_portal + (g_time_in_portal - g_prev_time_in_portal) * partial;
+    if (a < 0.0f) a = 0.0f;
+    if (a > 1.0f) a = 1.0f;
+    return a;
+}
+
+static void apply_portal_camera_effect(float partial) {
+    float a = portal_interpolated_amount(partial);
+    if (a <= 0.0f) return;
+    float warp = 5.0f / (a * a + 5.0f) - a * 0.04f;
+    warp *= warp;
+    float spin = ((float)g_ingame_ticks + partial) * 20.0f;
+    glRotatef(spin, 0.0f, 1.0f, 1.0f);
+    glScalef(1.0f / warp, 1.0f, 1.0f);
+    glRotatef(-spin, 0.0f, 1.0f, 1.0f);
+}
+
+static void draw_portal_overlay(void) {
+    if (!tex_terrain.id) return;
+    float a = portal_interpolated_amount(g_frame_partial);
+    if (a <= 0.0f) return;
+    if (a < 1.0f) {
+        a *= a;
+        a *= a;
+        a = a * 0.8f + 0.2f;
+    }
+    float u0, v0, u1, v1;
+    terrain_tile_uv(PEX_PORTAL_TILE, &u0, &v0, &u1, &v1);
+    glDisable(GL_FOG);
+    setup_gui_projection();
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(1.0f, 1.0f, 1.0f, a);
+    glBegin(GL_QUADS);
+    glTexCoord2f(u0, v1); glVertex2f(0.0f, (float)g_gui_h);
+    glTexCoord2f(u1, v1); glVertex2f((float)g_gui_w, (float)g_gui_h);
+    glTexCoord2f(u1, v0); glVertex2f((float)g_gui_w, 0.0f);
+    glTexCoord2f(u0, v0); glVertex2f(0.0f, 0.0f);
+    glEnd();
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_ALPHA_TEST);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+}
+
+
+static int terrain_tile_has_opaque_pixels(int tile) {
+    if (!tex_terrain.rgba || tex_terrain.w <= 0 || tex_terrain.h <= 0) return 0;
+    int tx, ty, tw, th;
+    stivufine_terrain_tile_pixel_rect(tile, &tx, &ty, &tw, &th);
+    if (tx + tw > tex_terrain.w || ty + th > tex_terrain.h) return 0;
+    int count = 0;
+    for (int yy = 0; yy < th; yy++) {
+        for (int xx = 0; xx < tw; xx++) {
+            unsigned char *p = &tex_terrain.rgba[((ty + yy) * tex_terrain.w + (tx + xx)) * 4];
+            if (p[3] > 8) count++;
+        }
+    }
+    return count > 32;
+}
+
+static int chest_top_tile(void) { return 25; }
+static int chest_side_tile(void) { return 26; }
+static int chest_front_tile(void) { return 27; }
+/* Old terrain.png stores the double/large chest strip directly below the
+   single chest top/side strip.  Do not use cropped cuboid UVs or entity
+   item/chest.png here; the terrain atlas supplied by the downloaded client.jar
+   is the source of truth for this renderer. */
+static int large_chest_left_tile(void) { return chest_top_tile() + 16; }
+static int large_chest_right_tile(void) { return chest_side_tile() + 16; }
+static int furnace_front_tile(void) { return 44; }
+static int furnace_front_lit_tile(void) { return 61; }
+static int furnace_side_tile(void) { return 45; }
+static int furnace_top_tile(void) { return 62; }
+
+/* Java 1.2.5 BlockFluid uses 205/206 for water and 237/238 for lava.
+   Texture loading normalizes missing liquid slots, so never redirect a liquid
+   face to an unrelated terrain tile. */
+static int water_top_tile(void)  { return 205; }
+static int water_side_tile(void) { return 206; }
+static int lava_top_tile(void)   { return 237; }
+static int lava_side_tile(void)  { return 238; }
+static int liquid_top_tile_for_block(int id) { return (id == BLOCK_WATER || id == BLOCK_STILL_WATER) ? water_top_tile() : lava_top_tile(); }
+static int liquid_side_tile_for_block(int id) { return (id == BLOCK_WATER || id == BLOCK_STILL_WATER) ? water_side_tile() : lava_side_tile(); }
+
+
+/* Async terrain mesh path -----------------------------------------------------------
+   D3D9/D3D11 upload worker-built CPU meshes into native vertex/index buffers on
+   the render thread.
+   OpenGL keeps the same worker-built CPU mesh and draws it with client arrays on
+   the render thread.  That removes the old glNewList/glBegin section rebuild from
+   the main thread while still keeping all GL calls on the GL-owning thread. */
+typedef struct FlatDirectMeshBuilder {
+    PexVertex *v;
+    uint32_t *i;
+    uint32_t vcount, vcap;
+    uint32_t icount, icap;
+    int quad_cursor;
+    uint32_t color;
+    uint32_t light;
+    int light_resolved;
+    /* Captured fixed-function requirements. Android uses these flags to keep
+       fully opaque terrain out of the alpha-discard shader and to enable
+       back-face culling only for meshes whose emitters are one-sided. */
+    int uses_alpha_test;
+    int two_sided;
+    /* Android keeps real terrain layers instead of promoting an entire 16^3
+       section to the most expensive state because it contains one flower or
+       glass block. These are index boundaries inside the combined pass-0 mesh. */
+    uint32_t opaque_icount_end;
+    uint32_t alpha_one_sided_icount_end;
+} FlatDirectMeshBuilder;
+
+typedef struct FlatGLCpuMesh {
+    PexVertex *v;
+    PexVertex *lit_v;
+    uint32_t *i;
+    uint32_t vcount, icount;
+    GLuint list;
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+    GLuint vbo, ibo;
+    unsigned int vbo_lightmap_version;
+    int vbo_shader_mode;
+    int vbo_uploaded;
+    int ibo_uploaded;
+#endif
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    /* pass 0: [0]=opaque/cull, [1]=cutout/cull, [2]=cutout/two-sided.
+       pass 1 uses [2] for translucent liquid/portal geometry. */
+    AndroidTVStaticMesh *android_mesh[3];
+#endif
+    unsigned int version;
+    unsigned int lit_lightmap_version;
+    int origin_x, origin_z;
+    int alpha_test;
+    int two_sided;
+    int valid;
+} FlatGLCpuMesh;
+
+
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+#ifndef GL_ARRAY_BUFFER
+#define GL_ARRAY_BUFFER 0x8892
+#endif
+#ifndef GL_ELEMENT_ARRAY_BUFFER
+#define GL_ELEMENT_ARRAY_BUFFER 0x8893
+#endif
+#ifndef GL_STATIC_DRAW
+#define GL_STATIC_DRAW 0x88E4
+#endif
+typedef ptrdiff_t PexGLsizeiptr;
+typedef void (*PexGLGenBuffersProc)(GLsizei, GLuint*);
+typedef void (*PexGLDeleteBuffersProc)(GLsizei, const GLuint*);
+typedef void (*PexGLBindBufferProc)(GLenum, GLuint);
+typedef void (*PexGLBufferDataProc)(GLenum, PexGLsizeiptr, const GLvoid*, GLenum);
+static PexGLGenBuffersProc g_flat_glGenBuffers = NULL;
+static PexGLDeleteBuffersProc g_flat_glDeleteBuffers = NULL;
+static PexGLBindBufferProc g_flat_glBindBuffer = NULL;
+static PexGLBufferDataProc g_flat_glBufferData = NULL;
+static int g_flat_gl_vbo_checked = 0;
+static int g_flat_gl_vbo_available = 0;
+static int g_flat_gl_light_upload_budget = 0;
+
+static int flat_gl_vbo_supported(void) {
+    if (!g_flat_gl_vbo_checked) {
+        /* Do not permanently cache a negative result before SDL has created the
+           OpenGL context; world reset/free paths can run during startup. */
+        if (!SDL_GL_GetCurrentContext()) return 0;
+        g_flat_gl_vbo_checked = 1;
+        g_flat_glGenBuffers = (PexGLGenBuffersProc)SDL_GL_GetProcAddress("glGenBuffers");
+        g_flat_glDeleteBuffers = (PexGLDeleteBuffersProc)SDL_GL_GetProcAddress("glDeleteBuffers");
+        g_flat_glBindBuffer = (PexGLBindBufferProc)SDL_GL_GetProcAddress("glBindBuffer");
+        g_flat_glBufferData = (PexGLBufferDataProc)SDL_GL_GetProcAddress("glBufferData");
+        if (!g_flat_glGenBuffers) g_flat_glGenBuffers = (PexGLGenBuffersProc)SDL_GL_GetProcAddress("glGenBuffersARB");
+        if (!g_flat_glDeleteBuffers) g_flat_glDeleteBuffers = (PexGLDeleteBuffersProc)SDL_GL_GetProcAddress("glDeleteBuffersARB");
+        if (!g_flat_glBindBuffer) g_flat_glBindBuffer = (PexGLBindBufferProc)SDL_GL_GetProcAddress("glBindBufferARB");
+        if (!g_flat_glBufferData) g_flat_glBufferData = (PexGLBufferDataProc)SDL_GL_GetProcAddress("glBufferDataARB");
+        g_flat_gl_vbo_available = g_flat_glGenBuffers && g_flat_glDeleteBuffers && g_flat_glBindBuffer && g_flat_glBufferData;
+    }
+    return g_flat_gl_vbo_available;
+}
+static int flat_gl_cpu_mesh_upload_vbo(FlatGLCpuMesh *m);
+#endif
+
+static FlatGLCpuMesh g_flat_section_gl_cpu_mesh[FLAT_RENDER_SECTIONS_Y][FLAT_RENDER_CHUNKS][FLAT_RENDER_CHUNKS][2];
+/* Avoid a >1 MiB render-thread stack frame during world-window remaps. */
+static FlatGLCpuMesh g_flat_section_gl_cpu_mesh_remap_scratch[FLAT_RENDER_SECTIONS_Y][FLAT_RENDER_CHUNKS][FLAT_RENDER_CHUNKS][2];
+static int g_flat_gl_cpu_mesh_origin_x = 0x7fffffff;
+static int g_flat_gl_cpu_mesh_origin_z = 0x7fffffff;
+
+static PEX_THREAD_LOCAL FlatDirectMeshBuilder *g_flat_direct_builder = NULL;
+static PEX_THREAD_LOCAL int g_flat_direct_capture_only = 0;
+static PEX_THREAD_LOCAL FlatDirectMeshBuilder *g_flat_direct_capture_out0 = NULL;
+static PEX_THREAD_LOCAL FlatDirectMeshBuilder *g_flat_direct_capture_out1 = NULL;
+static PEX_THREAD_LOCAL int *g_flat_direct_capture_skip0 = NULL;
+static PEX_THREAD_LOCAL int *g_flat_direct_capture_skip1 = NULL;
+static PEX_THREAD_LOCAL int g_flat_direct_capture_success = 0;
+static PEX_THREAD_LOCAL int g_flat_direct_capture_aborted = 0;
+/* Set before any mesh-worker join.  CPU mesh construction checks this flag at
+   bounded intervals so Save and Quit never waits for a dense section to finish. */
+static volatile LONG g_async_section_mesh_stop = 0;
+static int async_section_mesh_cancel_requested(void) {
+    return g_flat_direct_capture_only &&
+           (g_flat_direct_capture_aborted ||
+            InterlockedCompareExchange(&g_async_section_mesh_stop, 0, 0) != 0);
+}
+static PexTextureHandle g_flat_direct_terrain_texture = 0;
+static unsigned char *g_flat_direct_terrain_rgba = NULL;
+static int g_flat_direct_terrain_w = 0, g_flat_direct_terrain_h = 0;
+
+static void flat_direct_update_terrain_region(int x, int y, int width, int height, const unsigned char *rgba) {
+    PexRendererBackend *rb = flat_direct_backend();
+    if (!rb || !rb->update_texture_region || !g_flat_direct_terrain_texture || !rgba) return;
+    rb->update_texture_region(g_flat_direct_terrain_texture, x, y, width, height,
+                              (const uint32_t*)rgba, width * 4);
+}
+
+
+static PexRendererBackend *flat_direct_backend(void) {
+#if defined(PEX_PLATFORM_PSP)
+    /* PSP has its own GU mesh backend.  This is important for real-world mode:
+       it lets section meshing run on the worker and only uploads/adopts the
+       completed mesh on the render thread instead of rebuilding GL display
+       lists inside the frame. */
+    return psp_gu_get_backend();
+#elif defined(PEX_PLATFORM_WII)
+    return wii_gx_get_backend();
+#else
+    if (pex_using_d3d9()) return renderer_d3d9_get_backend();
+    if (pex_using_d3d11()) return renderer_d3d11_get_backend();
+    return NULL;
+#endif
+}
+
+static uint32_t flat_pack_current_rgba(void) {
+    int r = (int)(g_d3d9.color[0] * 255.0f + 0.5f);
+    int g = (int)(g_d3d9.color[1] * 255.0f + 0.5f);
+    int b = (int)(g_d3d9.color[2] * 255.0f + 0.5f);
+    int a = (int)(g_d3d9.color[3] * 255.0f + 0.5f);
+    if (r < 0) r = 0; if (r > 255) r = 255;
+    if (g < 0) g = 0; if (g > 255) g = 255;
+    if (b < 0) b = 0; if (b > 255) b = 255;
+    if (a < 0) a = 0; if (a > 255) a = 255;
+    /* PexVertex.color is memory-RGBA.  That is exactly what D3D11
+       DXGI_FORMAT_R8G8B8A8_UNORM expects, and D3D9 converts it to ARGB
+       at upload time. */
+    return ((uint32_t)r) | ((uint32_t)g << 8) | ((uint32_t)b << 16) | ((uint32_t)a << 24);
+}
+
+static uint32_t flat_pack_rgba4f(float r, float g, float b, float a) {
+    int ri = (int)(r * 255.0f + 0.5f);
+    int gi = (int)(g * 255.0f + 0.5f);
+    int bi = (int)(b * 255.0f + 0.5f);
+    int ai = (int)(a * 255.0f + 0.5f);
+    if (ri < 0) ri = 0; if (ri > 255) ri = 255;
+    if (gi < 0) gi = 0; if (gi > 255) gi = 255;
+    if (bi < 0) bi = 0; if (bi > 255) bi = 255;
+    if (ai < 0) ai = 0; if (ai > 255) ai = 255;
+    return ((uint32_t)ri) | ((uint32_t)gi << 8) | ((uint32_t)bi << 16) | ((uint32_t)ai << 24);
+}
+
+static uint32_t flat_fullbright_packed_light(void) {
+    return (15u << 20) | (15u << 4);
+}
+
+static uint32_t flat_apply_lightmap_to_color(uint32_t rgba, uint32_t packed_light) {
+    float lr, lg, lb;
+    flat_lightmap_color((int)packed_light, &lr, &lg, &lb);
+    int r = (int)((float)(rgba & 255u) * lr + 0.5f);
+    int g = (int)((float)((rgba >> 8) & 255u) * lg + 0.5f);
+    int b = (int)((float)((rgba >> 16) & 255u) * lb + 0.5f);
+    int a = (int)((rgba >> 24) & 255u);
+    if (r < 0) r = 0; if (r > 255) r = 255;
+    if (g < 0) g = 0; if (g > 255) g = 255;
+    if (b < 0) b = 0; if (b > 255) b = 255;
+    return ((uint32_t)r) | ((uint32_t)g << 8) | ((uint32_t)b << 16) | ((uint32_t)a << 24);
+}
+
+static void flat_direct_set_color4f(float r, float g, float b, float a) {
+    if (g_flat_direct_builder) {
+        g_flat_direct_builder->color = flat_pack_rgba4f(r, g, b, a);
+    } else {
+        glColor4f(r, g, b, a);
+    }
+}
+
+static void flat_direct_set_color_light4f(float r, float g, float b, float a, uint32_t packed_light) {
+    if (g_flat_direct_builder) {
+        g_flat_direct_builder->color = flat_pack_rgba4f(r, g, b, a);
+        g_flat_direct_builder->light = packed_light;
+    } else {
+        float lr, lg, lb;
+        flat_lightmap_color((int)packed_light, &lr, &lg, &lb);
+        flat_direct_set_color4f(r * lr, g * lg, b * lb, a);
+    }
+}
+
+static PEX_THREAD_LOCAL int g_world_style_x = 0;
+static PEX_THREAD_LOCAL int g_world_style_y = 64;
+static PEX_THREAD_LOCAL int g_world_style_z = 0;
+static PEX_THREAD_LOCAL int g_world_light_x = 0;
+static PEX_THREAD_LOCAL int g_world_light_y = 65;
+static PEX_THREAD_LOCAL int g_world_light_z = 0;
+/* GUI/in-hand block item models must be lit like Java RenderItem.func_1227_a:
+   fixed face shading only, not the last sampled world light cell.  Without this
+   a stale zero-light world coordinate can make inventory/held 3D blocks render black. */
+static PEX_THREAD_LOCAL int g_force_fullbright_item_model = 0;
+
+static void world_style_set_pos(int x, int y, int z) {
+    g_world_style_x = x;
+    g_world_style_y = y;
+    g_world_style_z = z;
+}
+
+static void world_light_set_pos(int x, int y, int z) {
+    g_world_light_x = x;
+    g_world_light_y = y;
+    g_world_light_z = z;
+}
+
+static void world_light_set_pos_for_face(int x, int y, int z, int face) {
+    int lx = x, ly = y, lz = z;
+    if (face == 0) ly--;
+    else if (face == 1) ly++;
+    else if (face == 2) lz--;
+    else if (face == 3) lz++;
+    else if (face == 4) lx--;
+    else if (face == 5) lx++;
+    world_light_set_pos(lx, ly, lz);
+}
+
+/* World brightness now comes from the Java-style sky/block light helpers in
+   inventory.c.  Do not add roof/canopy hacks here; propagate sky/block light
+   into g_flat_*_light instead. */
+
+static int colorizer_lookup(Texture *tex, float temp, float humid, int fallback_rgb) {
+    if (!tex || !tex->rgba || tex->w <= 0 || tex->h <= 0) return fallback_rgb;
+    if (temp < 0.0f) temp = 0.0f; if (temp > 1.0f) temp = 1.0f;
+    if (humid < 0.0f) humid = 0.0f; if (humid > 1.0f) humid = 1.0f;
+    humid *= temp;
+    int ix = (int)((1.0f - temp) * (float)(tex->w - 1));
+    int iy = (int)((1.0f - humid) * (float)(tex->h - 1));
+    if (ix < 0) ix = 0; if (ix >= tex->w) ix = tex->w - 1;
+    if (iy < 0) iy = 0; if (iy >= tex->h) iy = tex->h - 1;
+    unsigned char *p = &tex->rgba[((iy * tex->w) + ix) * 4];
+    return ((int)p[0] << 16) | ((int)p[1] << 8) | (int)p[2];
+}
+
+static int java_swamp_tint_color(int base_rgb) {
+    /* BiomeGenSwamp 1.2.5: ((base & 16711422) + 5115470) / 2. */
+    return ((base_rgb & 0xFEFEFE) + 0x4E0E4E) / 2;
+}
+
+static int java_biome_water_color_for_id(int biome_id) {
+    if (biome_id == BIOME_SWAMPLAND && stivufine_swamp_colors_enabled()) return 0xE0FFAE;
+    return 0xFFFFFF;
+}
+
+static int rgb_average9(int a0, int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8) {
+    int vals[9] = { a0, a1, a2, a3, a4, a5, a6, a7, a8 };
+    int r = 0, g = 0, b = 0;
+    for (int i = 0; i < 9; ++i) {
+        r += (vals[i] >> 16) & 255;
+        g += (vals[i] >> 8) & 255;
+        b += vals[i] & 255;
+    }
+    return ((r / 9) << 16) | ((g / 9) << 8) | (b / 9);
+}
+
+typedef struct WorldBiomeColorCache {
+    BiomeManager mgr;
+    int mgr_ready;
+    long long seed;
+    int chunk_x;
+    int chunk_z;
+    unsigned char valid[16 * 16];
+    int biome_id[16 * 16];
+    int grass[16 * 16];
+    int foliage[16 * 16];
+    int water[16 * 16];
+    float temp[16 * 16];
+    float humid[16 * 16];
+    int swamp_colors;
+    int custom_colors;
+    unsigned char *grass_rgba;
+    unsigned char *foliage_rgba;
+    unsigned char *water_rgba;
+    unsigned char *pine_rgba;
+    unsigned char *birch_rgba;
+    unsigned char *swampgrass_rgba;
+    unsigned char *swampfoliage_rgba;
+} WorldBiomeColorCache;
+
+static PEX_THREAD_LOCAL WorldBiomeColorCache g_world_biome_color_cache;
+
+static void world_biome_color_cache_reset_chunk(WorldBiomeColorCache *c, int chunk_x, int chunk_z) {
+    c->chunk_x = chunk_x;
+    c->chunk_z = chunk_z;
+    memset(c->valid, 0, sizeof(c->valid));
+}
+
+static void world_biome_color_cache_prepare(WorldBiomeColorCache *c, int x, int z) {
+    int cx = floor_div16(x);
+    int cz = floor_div16(z);
+    int swamp_colors = stivufine_swamp_colors_enabled();
+    int custom_colors = stivufine_custom_colors_enabled();
+    unsigned char *grass_rgba = tex_grasscolor.rgba;
+    unsigned char *foliage_rgba = tex_foliagecolor.rgba;
+    unsigned char *water_rgba = tex_watercolor.rgba;
+    unsigned char *pine_rgba = tex_pinecolor.rgba;
+    unsigned char *birch_rgba = tex_birchcolor.rgba;
+    unsigned char *swampgrass_rgba = tex_swampgrasscolor.rgba;
+    unsigned char *swampfoliage_rgba = tex_swampfoliagecolor.rgba;
+    int color_state_changed = c->swamp_colors != swamp_colors || c->custom_colors != custom_colors ||
+                              c->grass_rgba != grass_rgba || c->foliage_rgba != foliage_rgba ||
+                              c->water_rgba != water_rgba || c->pine_rgba != pine_rgba || c->birch_rgba != birch_rgba ||
+                              c->swampgrass_rgba != swampgrass_rgba || c->swampfoliage_rgba != swampfoliage_rgba;
+    if (!c->mgr_ready || c->seed != g_world_seed) {
+        if (c->mgr_ready) { free(c->mgr.temp); memset(&c->mgr, 0, sizeof(c->mgr)); }
+        biome_manager_init(&c->mgr, g_world_seed);
+        c->seed = g_world_seed;
+        c->mgr_ready = 1;
+        c->chunk_x = 0x7fffffff;
+        c->chunk_z = 0x7fffffff;
+        memset(c->valid, 0, sizeof(c->valid));
+    }
+    if (color_state_changed) {
+        c->swamp_colors = swamp_colors;
+        c->custom_colors = custom_colors;
+        c->grass_rgba = grass_rgba;
+        c->foliage_rgba = foliage_rgba;
+        c->water_rgba = water_rgba;
+        c->pine_rgba = pine_rgba;
+        c->birch_rgba = birch_rgba;
+        c->swampgrass_rgba = swampgrass_rgba;
+        c->swampfoliage_rgba = swampfoliage_rgba;
+        c->chunk_x = 0x7fffffff;
+        c->chunk_z = 0x7fffffff;
+        memset(c->valid, 0, sizeof(c->valid));
+    }
+    if (c->chunk_x != cx || c->chunk_z != cz) {
+        world_biome_color_cache_reset_chunk(c, cx, cz);
+    }
+}
+
+static void biome_temp_humid_at(int x, int z, float *temp, float *humid) {
+    WorldBiomeColorCache *c = &g_world_biome_color_cache;
+    world_biome_color_cache_prepare(c, x, z);
+    int lx = x - c->chunk_x * 16;
+    int lz = z - c->chunk_z * 16;
+    int idx = lz * 16 + lx;
+    if (!c->valid[idx]) {
+        WorldBiome *biomes = biome_manager_get(&c->mgr, c->chunk_x * 16, c->chunk_z * 16, 16, 16);
+        for (int i = 0; i < 16 * 16; ++i) {
+            float t = biomes[i].temperature;
+            float h = biomes[i].rainfall;
+            int biome_id = biomes[i].id;
+            int grass = colorizer_lookup(&tex_grasscolor, t, h, 0x6FAD3A);
+            int foliage = colorizer_lookup(&tex_foliagecolor, t, h, 0x59A83A);
+            if (biome_id == BIOME_SWAMPLAND && stivufine_swamp_colors_enabled()) {
+                int swamp_grass_fallback = java_swamp_tint_color(grass);
+                int swamp_foliage_fallback = java_swamp_tint_color(foliage);
+                if (stivufine_custom_colors_enabled() && tex_swampgrasscolor.rgba)
+                    grass = colorizer_lookup(&tex_swampgrasscolor, t, h, swamp_grass_fallback);
+                else
+                    grass = swamp_grass_fallback;
+                if (stivufine_custom_colors_enabled() && tex_swampfoliagecolor.rgba)
+                    foliage = colorizer_lookup(&tex_swampfoliagecolor, t, h, swamp_foliage_fallback);
+                else
+                    foliage = swamp_foliage_fallback;
+            }
+            c->biome_id[i] = biome_id;
+            c->temp[i] = t;
+            c->humid[i] = h;
+            c->grass[i] = grass;
+            c->foliage[i] = foliage;
+            int water = java_biome_water_color_for_id(biome_id);
+            if (stivufine_custom_colors_enabled() && tex_watercolor.rgba)
+                water = colorizer_lookup(&tex_watercolor, t, h, water);
+            c->water[i] = water;
+            c->valid[i] = 1;
+        }
+    }
+    *temp = c->temp[idx];
+    *humid = c->humid[idx];
+}
+
+static int java_raw_grass_color_at(int x, int z) {
+    WorldBiomeColorCache *c = &g_world_biome_color_cache;
+    world_biome_color_cache_prepare(c, x, z);
+    int lx = x - c->chunk_x * 16;
+    int lz = z - c->chunk_z * 16;
+    int idx = lz * 16 + lx;
+    if (!c->valid[idx]) {
+        float t, h;
+        biome_temp_humid_at(x, z, &t, &h);
+    }
+    return c->grass[idx];
+}
+
+static int java_raw_foliage_color_at(int x, int z) {
+    WorldBiomeColorCache *c = &g_world_biome_color_cache;
+    world_biome_color_cache_prepare(c, x, z);
+    int lx = x - c->chunk_x * 16;
+    int lz = z - c->chunk_z * 16;
+    int idx = lz * 16 + lx;
+    if (!c->valid[idx]) {
+        float t, h;
+        biome_temp_humid_at(x, z, &t, &h);
+    }
+    return c->foliage[idx];
+}
+
+static int java_grass_color_at(int x, int z) {
+    if (!stivufine_smooth_biomes_enabled()) return java_raw_grass_color_at(x, z);
+    /* the custom colorizer.getSmoothColorMultiplier() averages the
+       surrounding 3x3 biome color samples when Smooth Biomes is enabled. */
+    return rgb_average9(java_raw_grass_color_at(x - 1, z - 1), java_raw_grass_color_at(x, z - 1), java_raw_grass_color_at(x + 1, z - 1),
+                        java_raw_grass_color_at(x - 1, z),     java_raw_grass_color_at(x, z),     java_raw_grass_color_at(x + 1, z),
+                        java_raw_grass_color_at(x - 1, z + 1), java_raw_grass_color_at(x, z + 1), java_raw_grass_color_at(x + 1, z + 1));
+}
+
+static int java_raw_foliage_color_for_meta_at(int x, int z, int meta) {
+    int type = meta & 3;
+    float t = 0.0f, h = 0.0f;
+    if (type == BLOCK_META_WOOD_SPRUCE) {
+        if (stivufine_custom_colors_enabled() && tex_pinecolor.rgba) {
+            biome_temp_humid_at(x, z, &t, &h);
+            return colorizer_lookup(&tex_pinecolor, t, h, 0x619961);
+        }
+        return 0x619961; /* ColorizerFoliage.getFoliageColorPine() */
+    }
+    if (type == BLOCK_META_WOOD_BIRCH) {
+        if (stivufine_custom_colors_enabled() && tex_birchcolor.rgba) {
+            biome_temp_humid_at(x, z, &t, &h);
+            return colorizer_lookup(&tex_birchcolor, t, h, 0x80A755);
+        }
+        return 0x80A755; /* ColorizerFoliage.getFoliageColorBirch() */
+    }
+    return java_raw_foliage_color_at(x, z);
+}
+
+static int java_foliage_color_for_meta_at(int x, int z, int meta) {
+    if (!stivufine_smooth_biomes_enabled()) return java_raw_foliage_color_for_meta_at(x, z, meta);
+    return rgb_average9(java_raw_foliage_color_for_meta_at(x - 1, z - 1, meta), java_raw_foliage_color_for_meta_at(x, z - 1, meta), java_raw_foliage_color_for_meta_at(x + 1, z - 1, meta),
+                        java_raw_foliage_color_for_meta_at(x - 1, z, meta),     java_raw_foliage_color_for_meta_at(x, z, meta),     java_raw_foliage_color_for_meta_at(x + 1, z, meta),
+                        java_raw_foliage_color_for_meta_at(x - 1, z + 1, meta), java_raw_foliage_color_for_meta_at(x, z + 1, meta), java_raw_foliage_color_for_meta_at(x + 1, z + 1, meta));
+}
+
+static int java_foliage_color_at(int x, int z) {
+    return java_foliage_color_for_meta_at(x, z, 0);
+}
+
+static void world_set_shade(float shade);
+static void world_set_color_shade(int rgb, float shade);
+
+static int java_raw_water_color_at(int x, int z) {
+    WorldBiomeColorCache *c = &g_world_biome_color_cache;
+    world_biome_color_cache_prepare(c, x, z);
+    int lx = x - c->chunk_x * 16;
+    int lz = z - c->chunk_z * 16;
+    int idx = lz * 16 + lx;
+    if (!c->valid[idx]) {
+        float t, h;
+        biome_temp_humid_at(x, z, &t, &h);
+    }
+    return c->water[idx];
+}
+
+static int java_water_color_at(int x, int z) {
+    if (stivufine_custom_colors_enabled() && tex_watercolor.rgba && !stivufine_smooth_biomes_enabled())
+        return java_raw_water_color_at(x, z);
+    /* Vanilla BlockFluid.colorMultiplier averages 3x3 biome water colors.
+       StivuFine also averages custom watercolorX.png through
+       CustomColorizer.getSmoothColor() while Smooth Biomes is enabled. */
+    return rgb_average9(java_raw_water_color_at(x - 1, z - 1), java_raw_water_color_at(x, z - 1), java_raw_water_color_at(x + 1, z - 1),
+                        java_raw_water_color_at(x - 1, z),     java_raw_water_color_at(x, z),     java_raw_water_color_at(x + 1, z),
+                        java_raw_water_color_at(x - 1, z + 1), java_raw_water_color_at(x, z + 1), java_raw_water_color_at(x + 1, z + 1));
+}
+
+static void world_set_liquid_shade(int is_water, int x, int z, float shade) {
+    if (is_water) world_set_color_shade(java_water_color_at(x, z), shade);
+    else world_set_shade(shade);
+}
+
+static int java_block_normal_cube_at(int x, int y, int z) {
+    int id = flat_get_block(x, y, z);
+    return id != 0 && flat_light_opacity_for_id(id) >= 255 && flat_block_is_solid(id);
+}
+
+static int flat_direct_reserve(FlatDirectMeshBuilder *b, uint32_t add_v, uint32_t add_i) {
+    if (!b) return 0;
+    if (async_section_mesh_cancel_requested()) {
+        g_flat_direct_capture_aborted = 1;
+        return 0;
+    }
+    if (b->vcount + add_v > b->vcap) {
+        uint32_t nc = b->vcap ? b->vcap * 2u : 4096u;
+        while (nc < b->vcount + add_v) nc *= 2u;
+        PexVertex *nv = (PexVertex*)realloc(b->v, (size_t)nc * sizeof(PexVertex));
+        if (!nv) { g_flat_direct_capture_aborted = 1; return 0; }
+        b->v = nv; b->vcap = nc;
+    }
+    if (b->icount + add_i > b->icap) {
+        uint32_t nc = b->icap ? b->icap * 2u : 6144u;
+        while (nc < b->icount + add_i) nc *= 2u;
+        uint32_t *ni = (uint32_t*)realloc(b->i, (size_t)nc * sizeof(uint32_t));
+        if (!ni) { g_flat_direct_capture_aborted = 1; return 0; }
+        b->i = ni; b->icap = nc;
+    }
+    return 1;
+}
+
+static void flat_direct_begin(FlatDirectMeshBuilder *b) {
+    memset(b, 0, sizeof(*b));
+    b->color = flat_pack_rgba4f(1.0f, 1.0f, 1.0f, 1.0f);
+    b->light = flat_fullbright_packed_light();
+    g_flat_direct_builder = b;
+    pex_gl_suppress_immediate(1);
+}
+
+static void flat_direct_end(void) {
+    pex_gl_suppress_immediate(0);
+    g_flat_direct_builder = NULL;
+}
+
+static void pex_world_gl_begin_guard(GLenum mode) {
+    if (!g_flat_direct_builder) glBegin(mode);
+}
+
+static void pex_world_gl_end_guard(void) {
+    if (!g_flat_direct_builder) glEnd();
+}
+
+static void pex_world_gl_enable_guard(GLenum cap) {
+    if (!g_flat_direct_builder) { glEnable(cap); return; }
+    if (cap == GL_ALPHA_TEST) g_flat_direct_builder->uses_alpha_test = 1;
+}
+static void pex_world_gl_disable_guard(GLenum cap) {
+    if (!g_flat_direct_builder) { glDisable(cap); return; }
+    /* Special/crossed geometry deliberately disables culling. Remember that
+       requirement instead of applying it while a worker is only capturing. */
+    if (cap == GL_CULL_FACE) g_flat_direct_builder->two_sided = 1;
+}
+static void pex_world_gl_bind_texture_guard(GLenum target, GLuint tex) { if (!g_flat_direct_builder) glBindTexture(target, tex); }
+static void pex_world_gl_alpha_func_guard(GLenum func, GLfloat ref) { if (!g_flat_direct_builder) glAlphaFunc(func, ref); }
+static void pex_world_gl_depth_mask_guard(GLboolean flag) { if (!g_flat_direct_builder) glDepthMask(flag); }
+static void world_gl_color_guard(GLfloat r, GLfloat g, GLfloat b, GLfloat a) { if (!g_flat_direct_builder) glColor4f(r, g, b, a); }
+
+/* main_android_tv.c maps legacy GL calls to the GLES2 shim before including this
+   file.  The direct-mesh guard below intentionally wraps those already-expanded
+   calls, but redefining the same macros trips Android/Clang warnings.  Undefine
+   any platform aliases first, then install the local suppression guard. */
+#ifdef glBegin
+#undef glBegin
+#endif
+#ifdef glEnd
+#undef glEnd
+#endif
+#ifdef glEnable
+#undef glEnable
+#endif
+#ifdef glDisable
+#undef glDisable
+#endif
+#ifdef glBindTexture
+#undef glBindTexture
+#endif
+#ifdef glAlphaFunc
+#undef glAlphaFunc
+#endif
+#ifdef glDepthMask
+#undef glDepthMask
+#endif
+#ifdef glColor4f
+#undef glColor4f
+#endif
+#define glBegin(mode) pex_world_gl_begin_guard(mode)
+#define glEnd() pex_world_gl_end_guard()
+#define glEnable(cap) pex_world_gl_enable_guard(cap)
+#define glDisable(cap) pex_world_gl_disable_guard(cap)
+#define glBindTexture(target, tex) pex_world_gl_bind_texture_guard(target, tex)
+#define glAlphaFunc(func, ref) pex_world_gl_alpha_func_guard(func, ref)
+#define glDepthMask(flag) pex_world_gl_depth_mask_guard(flag)
+#define glColor4f(r,g,b,a) world_gl_color_guard(r,g,b,a)
+
+static void flat_direct_vertex(float x, float y, float z, float u, float v) {
+    FlatDirectMeshBuilder *b = g_flat_direct_builder;
+    if (!b) return;
+    if (!flat_direct_reserve(b, 1, 6)) return;
+    uint32_t idx = b->vcount++;
+    b->v[idx].x = x; b->v[idx].y = y; b->v[idx].z = z;
+    b->v[idx].u = u; b->v[idx].v = v;
+    b->v[idx].color = b->color;
+    b->v[idx].light = b->light;
+    {
+        int block = (int)((b->light >> 4) & 15u);
+        int sky = (int)((b->light >> 20) & 15u);
+        b->v[idx].light_u = ((float)(block * 16 + 8)) / 256.0f;
+        b->v[idx].light_v = ((float)(sky * 16 + 8)) / 256.0f;
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+        b->v[idx].entity_id = pex_shaders_get_mesh_entity();
+#else
+        b->v[idx].entity_id = 0.0f;
+#endif
+        b->v[idx].normal_x = 0.0f; b->v[idx].normal_y = 1.0f; b->v[idx].normal_z = 0.0f;
+        b->v[idx].tangent_x = 1.0f; b->v[idx].tangent_y = 0.0f; b->v[idx].tangent_z = 0.0f; b->v[idx].tangent_w = 1.0f;
+        b->v[idx].mid_u = u; b->v[idx].mid_v = v;
+    }
+    b->quad_cursor++;
+    if (b->quad_cursor == 4) {
+        uint32_t q0 = idx - 3, q1 = idx - 2, q2 = idx - 1, q3 = idx;
+        PexVertex *a = &b->v[q0], *c = &b->v[q1], *d = &b->v[q2];
+        float e1x=c->x-a->x, e1y=c->y-a->y, e1z=c->z-a->z;
+        float e2x=d->x-a->x, e2y=d->y-a->y, e2z=d->z-a->z;
+        float nx=e1y*e2z-e1z*e2y, ny=e1z*e2x-e1x*e2z, nz=e1x*e2y-e1y*e2x;
+        float nl=sqrtf(nx*nx+ny*ny+nz*nz); if(nl>1.0e-7f){nx/=nl;ny/=nl;nz/=nl;} else {nx=0;ny=1;nz=0;}
+        float du1=c->u-a->u,dv1=c->v-a->v,du2=d->u-a->u,dv2=d->v-a->v;
+        float det=du1*dv2-du2*dv1,tx=1,ty=0,tz=0;
+        if(fabsf(det)>1.0e-8f){float r=1.0f/det;tx=(e1x*dv2-e2x*dv1)*r;ty=(e1y*dv2-e2y*dv1)*r;tz=(e1z*dv2-e2z*dv1)*r;float tl=sqrtf(tx*tx+ty*ty+tz*tz);if(tl>1.0e-7f){tx/=tl;ty/=tl;tz/=tl;}}
+        float mu=(b->v[q0].u+b->v[q1].u+b->v[q2].u+b->v[q3].u)*0.25f;
+        float mv=(b->v[q0].v+b->v[q1].v+b->v[q2].v+b->v[q3].v)*0.25f;
+        for(uint32_t qi=q0;qi<=q3;qi++){b->v[qi].normal_x=nx;b->v[qi].normal_y=ny;b->v[qi].normal_z=nz;b->v[qi].tangent_x=tx;b->v[qi].tangent_y=ty;b->v[qi].tangent_z=tz;b->v[qi].tangent_w=1.0f;b->v[qi].mid_u=mu;b->v[qi].mid_v=mv;}
+        b->i[b->icount++] = q0; b->i[b->icount++] = q1; b->i[b->icount++] = q2;
+        b->i[b->icount++] = q0; b->i[b->icount++] = q2; b->i[b->icount++] = q3;
+        b->quad_cursor = 0;
+    }
+}
+
+static void flat_direct_free_builder(FlatDirectMeshBuilder *b) {
+    if (!b) return;
+    free(b->v); free(b->i);
+    memset(b, 0, sizeof(*b));
+}
+
+static int flat_async_section_mesh_enabled(void) {
+#if defined(PEX_PLATFORM_WII) || defined(PEX_PLATFORM_WASM)
+    /* libogc/LWP and single-threaded browser builds have been crashing in the worker-mesh path while
+       preparing chunks: Dolphin reports DSI at flat_get_block() with a bogus
+       async snapshot pointer. Keep Wii section meshing synchronous on the
+       main thread until the port is stable. */
+    return 0;
+#elif defined(PEX_PLATFORM_PSP)
+    return flat_direct_backend() != NULL;
+#else
+    return tex_terrain.rgba != NULL;
+#endif
+}
+
+/* Fast graphics no longer has its own terrain renderer.  Both Fast and Fancy
+   now use the same stable Java/Fancy terrain pipeline: separate liquid pass,
+   cutout pass, and the same face-visibility rules.  Fast only disables visual
+   extras through g_opts.fancy_graphics (smooth lighting, fancy clouds, shadows,
+   transparent leaf textures, grass-side overlay), not through a different mesh
+   topology. */
+static int flat_fancy_terrain_pipeline_enabled(void) {
+    return 1;
+}
+
+static int flat_separate_liquid_pass_enabled(void) {
+    return flat_fancy_terrain_pipeline_enabled();
+}
+
+static int flat_fancy_cutout_terrain_enabled(void) {
+    return flat_fancy_terrain_pipeline_enabled();
+}
+
+static int flat_fancy_leaf_texture_enabled(void) {
+    return stivufine_fancy_trees_enabled();
+}
+
+static int flat_fancy_grass_overlay_enabled(void) {
+    return stivufine_fancy_grass_enabled();
+}
+
+static int flat_display_lists_supported(void) {
+#if defined(PEX_PLATFORM_PSP) || defined(PEX_PLATFORM_WII) || defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV) || defined(PEX_PLATFORM_LGWEBOS)
+    return 0;
+#else
+    /* Cached display lists bake glColor calls, so they cannot follow Java's
+       dynamic lightmap without rebuilding.  Keep async OpenGL terrain in CPU
+       vertex arrays and re-resolve packed sky/block light at draw time. */
+    return 0;
+#endif
+}
+
+static GLuint gl_compile_flat_mesh_list(const FlatDirectMeshBuilder *b) {
+#if defined(PEX_PLATFORM_PSP) || defined(PEX_PLATFORM_WII) || defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV) || defined(PEX_PLATFORM_LGWEBOS)
+    (void)b;
+    return 0;
+#else
+    if (!b || !b->v || !b->i || b->vcount == 0 || b->icount < 3 || !flat_display_lists_supported()) return 0;
+    GLuint list = glGenLists(1);
+    if (!list) return 0;
+    glNewList(list, GL_COMPILE);
+    glBegin(GL_TRIANGLES);
+    for (uint32_t n = 0; n < b->icount; ++n) {
+        uint32_t vi = b->i[n];
+        if (vi >= b->vcount) continue;
+        const PexVertex *v = &b->v[vi];
+        uint32_t color = flat_apply_lightmap_to_color(v->color, v->light);
+        const unsigned char *c = (const unsigned char*)&color;
+        glColor4ub(c[0], c[1], c[2], c[3]);
+        glTexCoord2f(v->u, v->v);
+        glVertex3f(v->x, v->y, v->z);
+    }
+    glEnd();
+    glEndList();
+    return list;
+#endif
+}
+
+static void flat_gl_cpu_mesh_free(FlatGLCpuMesh *m) {
+    if (!m) return;
+#if !defined(PEX_PLATFORM_PSP) && !defined(PEX_PLATFORM_WII) && !defined(PEX_PLATFORM_ANDROID) && !defined(PEX_PLATFORM_ANDROID_TV) && !defined(PEX_PLATFORM_LGWEBOS)
+    if (m->list && flat_display_lists_supported()) glDeleteLists(m->list, 1);
+#endif
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+    if (flat_gl_vbo_supported()) {
+        if (m->vbo) g_flat_glDeleteBuffers(1, &m->vbo);
+        if (m->ibo) g_flat_glDeleteBuffers(1, &m->ibo);
+    }
+#endif
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    for (int group = 0; group < 3; ++group) {
+        if (m->android_mesh[group]) pex_android_tv_static_mesh_destroy(m->android_mesh[group]);
+    }
+#endif
+    free(m->v);
+    free(m->lit_v);
+    free(m->i);
+    memset(m, 0, sizeof(*m));
+}
+
+static void flat_direct_resolve_builder_lightmap(FlatDirectMeshBuilder *b) {
+    if (!b || !b->v || b->light_resolved) return;
+    for (uint32_t i = 0; i < b->vcount; ++i) {
+        b->v[i].color = flat_apply_lightmap_to_color(b->v[i].color, b->v[i].light);
+    }
+    b->light_resolved = 1;
+}
+
+static void flat_cpu_mesh_free_all(void) {
+    for (int sy = 0; sy < FLAT_RENDER_SECTIONS_Y; ++sy) {
+        for (int cz = 0; cz < FLAT_RENDER_CHUNKS; ++cz) {
+            for (int cx = 0; cx < FLAT_RENDER_CHUNKS; ++cx) {
+                flat_gl_cpu_mesh_free(&g_flat_section_gl_cpu_mesh[sy][cz][cx][0]);
+                flat_gl_cpu_mesh_free(&g_flat_section_gl_cpu_mesh[sy][cz][cx][1]);
+            }
+        }
+    }
+}
+
+static void flat_delete_display_list_owned(GLuint list) {
+#if !defined(PEX_PLATFORM_PSP) && !defined(PEX_PLATFORM_WII) && !defined(PEX_PLATFORM_ANDROID) && !defined(PEX_PLATFORM_ANDROID_TV) && !defined(PEX_PLATFORM_LGWEBOS)
+    if (list && flat_display_lists_supported()) glDeleteLists(list, 1);
+#else
+    (void)list;
+#endif
+}
+
+/* Release every render-owned object belonging to the current world.  This runs
+   on the main/render thread after async mesh workers have stopped, so no worker
+   can publish a new handle after the sweep.  Texture-pack resources remain
+   alive because they belong to the client, not to a world session. */
+static int g_flat_world_render_release_active = 0;
+static int g_flat_world_render_release_phase = 0;
+static int g_flat_world_render_release_index = 0;
+
+static void flat_world_render_resources_release_begin(void) {
+    g_flat_world_render_release_active = 1;
+    g_flat_world_render_release_phase = 0;
+    g_flat_world_render_release_index = 0;
+}
+
+static int flat_world_render_resources_release_progress(void) {
+    const int section_total = FLAT_RENDER_SECTIONS_Y * FLAT_RENDER_CHUNKS * FLAT_RENDER_CHUNKS * 2;
+    const int chunk_total = FLAT_RENDER_CHUNKS * FLAT_RENDER_CHUNKS;
+    const int total = section_total + chunk_total + 1;
+    int done = 0;
+    if (!g_flat_world_render_release_active) return 100;
+    if (g_flat_world_render_release_phase == 0) done = g_flat_world_render_release_index;
+    else if (g_flat_world_render_release_phase == 1) done = section_total + g_flat_world_render_release_index;
+    else done = section_total + chunk_total;
+    if (done < 0) done = 0;
+    if (done > total) done = total;
+    return (done * 100) / total;
+}
+
+/* Release a bounded number of renderer objects on the main thread.  Save and
+   Quit calls this once per frame so a large render distance cannot turn the
+   progress screen into another apparent freeze. */
+static int flat_world_render_resources_release_step(int budget) {
+    if (!g_flat_world_render_release_active) return 1;
+    if (budget < 1) budget = 1;
+    PexRendererBackend *rb = flat_direct_backend();
+    const int section_total = FLAT_RENDER_SECTIONS_Y * FLAT_RENDER_CHUNKS * FLAT_RENDER_CHUNKS * 2;
+    const int chunk_total = FLAT_RENDER_CHUNKS * FLAT_RENDER_CHUNKS;
+
+    while (budget > 0 && g_flat_world_render_release_phase == 0) {
+        if (g_flat_world_render_release_index >= section_total) {
+            g_flat_world_render_release_phase = 1;
+            g_flat_world_render_release_index = 0;
+            break;
+        }
+        int idx = g_flat_world_render_release_index++;
+        int pass = idx & 1;
+        idx >>= 1;
+        int cx = idx % FLAT_RENDER_CHUNKS;
+        idx /= FLAT_RENDER_CHUNKS;
+        int cz = idx % FLAT_RENDER_CHUNKS;
+        int sy = idx / FLAT_RENDER_CHUNKS;
+
+        unsigned int *slot = &g_flat_section_direct_mesh[sy][cz][cx][pass];
+        if (rb && *slot) rb->destroy_mesh(*slot);
+        *slot = 0;
+        flat_delete_display_list_owned(g_flat_section_lists[sy][cz][cx][pass]);
+        g_flat_section_lists[sy][cz][cx][pass] = 0;
+        flat_gl_cpu_mesh_free(&g_flat_section_gl_cpu_mesh[sy][cz][cx][pass]);
+        budget--;
+    }
+
+    while (budget > 0 && g_flat_world_render_release_phase == 1) {
+        if (g_flat_world_render_release_index >= chunk_total) {
+            g_flat_world_render_release_phase = 2;
+            g_flat_world_render_release_index = 0;
+            break;
+        }
+        int idx = g_flat_world_render_release_index++;
+        int cx = idx % FLAT_RENDER_CHUNKS;
+        int cz = idx / FLAT_RENDER_CHUNKS;
+        flat_delete_display_list_owned(g_flat_world_chunk_lists[cz][cx]);
+        flat_delete_display_list_owned(g_flat_world_chunk_liquid_lists[cz][cx]);
+        g_flat_world_chunk_lists[cz][cx] = 0;
+        g_flat_world_chunk_liquid_lists[cz][cx] = 0;
+        budget--;
+    }
+
+    if (g_flat_world_render_release_phase == 2) {
+        memset(g_flat_section_lists, 0, sizeof(g_flat_section_lists));
+        memset(g_flat_section_direct_mesh, 0, sizeof(g_flat_section_direct_mesh));
+        g_flat_gl_cpu_mesh_origin_x = 0x7fffffff;
+        g_flat_gl_cpu_mesh_origin_z = 0x7fffffff;
+        g_flat_world_render_release_active = 0;
+        g_flat_world_render_release_phase = 0;
+        g_flat_world_render_release_index = 0;
+        pex_logf("world render resources released");
+        return 1;
+    }
+    return 0;
+}
+
+static void flat_world_render_resources_release(void) {
+    flat_world_render_resources_release_begin();
+    while (!flat_world_render_resources_release_step(4096)) { }
+}
+
+static void flat_cpu_mesh_remap_shift(int old_origin_x, int old_origin_z,
+                                                int new_origin_x, int new_origin_z) {
+    /* Android/OpenGL CPU meshes are stored outside the normal section-handle
+       arrays.  When the 256x256 active window slides, keep meshes for chunks
+       that remain in the window instead of dropping every section and forcing a
+       full-world rebuild on the next frame. */
+    if (old_origin_x == new_origin_x && old_origin_z == new_origin_z) return;
+    if (flat_direct_backend()) return;
+
+    FlatGLCpuMesh (*old_mesh)[FLAT_RENDER_CHUNKS][FLAT_RENDER_CHUNKS][2] =
+        g_flat_section_gl_cpu_mesh_remap_scratch;
+    memcpy(old_mesh, g_flat_section_gl_cpu_mesh, sizeof(g_flat_section_gl_cpu_mesh));
+    memset(g_flat_section_gl_cpu_mesh, 0, sizeof(g_flat_section_gl_cpu_mesh));
+
+    int old_base_cx = floor_div16(old_origin_x);
+    int old_base_cz = floor_div16(old_origin_z);
+    int new_base_cx = floor_div16(new_origin_x);
+    int new_base_cz = floor_div16(new_origin_z);
+
+    for (int ncz = 0; ncz < FLAT_RENDER_CHUNKS; ++ncz) {
+        for (int ncx = 0; ncx < FLAT_RENDER_CHUNKS; ++ncx) {
+            int wcx = new_base_cx + ncx;
+            int wcz = new_base_cz + ncz;
+            if (!stream_world_chunk_in_window(wcx, wcz, old_origin_x, old_origin_z)) continue;
+            int ocx = wcx - old_base_cx;
+            int ocz = wcz - old_base_cz;
+            if (ocx < 0 || ocx >= FLAT_RENDER_CHUNKS || ocz < 0 || ocz >= FLAT_RENDER_CHUNKS) continue;
+            for (int sy = 0; sy < FLAT_RENDER_SECTIONS_Y; ++sy) {
+                for (int pass = 0; pass < 2; ++pass) {
+                    g_flat_section_gl_cpu_mesh[sy][ncz][ncx][pass] = old_mesh[sy][ocz][ocx][pass];
+                    g_flat_section_gl_cpu_mesh[sy][ncz][ncx][pass].origin_x = new_origin_x;
+                    g_flat_section_gl_cpu_mesh[sy][ncz][ncx][pass].origin_z = new_origin_z;
+                    memset(&old_mesh[sy][ocz][ocx][pass], 0, sizeof(old_mesh[sy][ocz][ocx][pass]));
+                }
+            }
+        }
+    }
+
+    for (int sy = 0; sy < FLAT_RENDER_SECTIONS_Y; ++sy) {
+        for (int cz = 0; cz < FLAT_RENDER_CHUNKS; ++cz) {
+            for (int cx = 0; cx < FLAT_RENDER_CHUNKS; ++cx) {
+                flat_gl_cpu_mesh_free(&old_mesh[sy][cz][cx][0]);
+                flat_gl_cpu_mesh_free(&old_mesh[sy][cz][cx][1]);
+            }
+        }
+    }
+
+    g_flat_gl_cpu_mesh_origin_x = new_origin_x;
+    g_flat_gl_cpu_mesh_origin_z = new_origin_z;
+}
+
+static void flat_gl_cpu_mesh_check_origin(void) {
+    if (g_flat_gl_cpu_mesh_origin_x == g_flat_world_origin_x &&
+        g_flat_gl_cpu_mesh_origin_z == g_flat_world_origin_z) return;
+
+    /* Keep the OpenGL CPU/display-list section meshes that still belong to
+       chunks inside the active world window.  The old path freed every GL mesh
+       on each origin slide and dirtied the whole render cache; walking across a
+       stream boundary then forced a visible-world rebuild/install storm.  New
+       strips are already marked invalid by stream_remap_render_chunks(), so only
+       the first initialization still needs the full invalidate fallback. */
+    if (!flat_direct_backend() &&
+        g_flat_gl_cpu_mesh_origin_x != 0x7fffffff &&
+        g_flat_gl_cpu_mesh_origin_z != 0x7fffffff) {
+        flat_cpu_mesh_remap_shift(g_flat_gl_cpu_mesh_origin_x,
+                                  g_flat_gl_cpu_mesh_origin_z,
+                                  g_flat_world_origin_x,
+                                  g_flat_world_origin_z);
+        return;
+    }
+
+    flat_cpu_mesh_free_all();
+    g_flat_gl_cpu_mesh_origin_x = g_flat_world_origin_x;
+    g_flat_gl_cpu_mesh_origin_z = g_flat_world_origin_z;
+    for (int sy = 0; sy < FLAT_RENDER_SECTIONS_Y; ++sy) {
+        for (int cz = 0; cz < FLAT_RENDER_CHUNKS; ++cz) {
+            for (int cx = 0; cx < FLAT_RENDER_CHUNKS; ++cx) {
+                if (!flat_direct_backend()) {
+                    g_flat_section_valid[sy][cz][cx] = 0;
+                    g_flat_section_dirty[sy][cz][cx] = 1;
+                    flat_note_section_mesh_changed(sy, cz, cx);
+                }
+            }
+        }
+    }
+}
+
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+static size_t flat_android_mesh_gpu_bytes(const FlatGLCpuMesh *m) {
+    size_t total = 0;
+    if (!m) return 0;
+    for (int group = 0; group < 3; ++group) total += pex_android_tv_static_mesh_bytes(m->android_mesh[group]);
+    return total;
+}
+
+static int flat_android_mesh_gpu_batches(const FlatGLCpuMesh *m) {
+    int total = 0;
+    if (!m) return 0;
+    for (int group = 0; group < 3; ++group) total += pex_android_tv_static_mesh_batches(m->android_mesh[group]);
+    return total;
+}
+
+static size_t flat_android_builder_gpu_estimate(const FlatDirectMeshBuilder *b) {
+    if (!b) return 0;
+    size_t vb = (size_t)b->vcount * sizeof(PexVertex);
+    size_t ib = (size_t)b->icount * sizeof(GLushort);
+    return vb > SIZE_MAX - ib ? SIZE_MAX : vb + ib;
+}
+
+static int flat_android_builder_batch_estimate(const FlatDirectMeshBuilder *b, int pass) {
+    if (!b || b->icount < 3) return 0;
+    uint32_t ranges[3] = {0, 0, 0};
+    int range_count = 0;
+    if (pass == 0) {
+        uint32_t opaque_end = b->opaque_icount_end > b->icount ? b->icount : b->opaque_icount_end;
+        uint32_t alpha_end = b->alpha_one_sided_icount_end;
+        if (alpha_end < opaque_end) alpha_end = opaque_end;
+        if (alpha_end > b->icount) alpha_end = b->icount;
+        if (opaque_end) ranges[range_count++] = opaque_end;
+        if (alpha_end > opaque_end) ranges[range_count++] = alpha_end - opaque_end;
+        if (b->icount > alpha_end) ranges[range_count++] = b->icount - alpha_end;
+    } else {
+        ranges[range_count++] = b->icount;
+    }
+    int batches = 0;
+    for (int i = 0; i < range_count; ++i) batches += (int)((ranges[i] + 65531u) / 65532u);
+    /* Index-span splits can add batches even when triangle count is low. */
+    int vertex_batches = (int)((b->vcount + 65534u) / 65535u);
+    if (batches < vertex_batches) batches = vertex_batches;
+    return batches > 0 ? batches : 1;
+}
+
+static void flat_android_evict_section_meshes(int sy, int cz, int cx) {
+    for (int pass = 0; pass < 2; ++pass) {
+        FlatGLCpuMesh *m = &g_flat_section_gl_cpu_mesh[sy][cz][cx][pass];
+        if (flat_android_mesh_gpu_bytes(m) || flat_android_mesh_gpu_batches(m)) flat_gl_cpu_mesh_free(m);
+    }
+    g_flat_section_valid[sy][cz][cx] = 0;
+    g_flat_section_dirty[sy][cz][cx] = 1;
+    g_flat_section_mesh_building[sy][cz][cx] = 0;
+    g_flat_section_building_mesh_version[sy][cz][cx] = 0;
+    g_flat_section_building_light_version[sy][cz][cx] = 0;
+}
+
+/* Make room before asking a vendor GLES driver to allocate.  Some Xiaomi-era
+   drivers abort the process on overcommit instead of returning a recoverable
+   GL_OUT_OF_MEMORY, so never let resident terrain approach an unbounded count. */
+static int flat_android_reserve_gpu_mesh(size_t need_bytes, int need_batches,
+                                         int protect_sy, int protect_cz, int protect_cx) {
+    size_t budget = pex_android_tv_static_mesh_budget();
+    int batch_limit = pex_android_tv_static_mesh_batch_limit();
+    if (need_bytes > budget || need_batches > batch_limit) return 0;
+
+    int player_cx = floor_div16((int)floorf(g_player_x)) - floor_div16(g_flat_world_origin_x);
+    int player_cz = floor_div16((int)floorf(g_player_z)) - floor_div16(g_flat_world_origin_z);
+    int guard = FLAT_RENDER_SECTIONS_Y * FLAT_RENDER_CHUNKS * FLAT_RENDER_CHUNKS + 1;
+    while ((pex_android_tv_static_mesh_bytes_used() > budget - need_bytes ||
+            pex_android_tv_static_mesh_batches_used() > batch_limit - need_batches) && guard-- > 0) {
+        int best_sy = -1, best_cz = -1, best_cx = -1;
+        long long best_score = -1;
+        for (int sy = 0; sy < FLAT_RENDER_SECTIONS_Y; ++sy) {
+            for (int cz = 0; cz < FLAT_RENDER_CHUNKS; ++cz) {
+                for (int cx = 0; cx < FLAT_RENDER_CHUNKS; ++cx) {
+                    if (sy == protect_sy && cz == protect_cz && cx == protect_cx) continue;
+                    FlatGLCpuMesh *m0 = &g_flat_section_gl_cpu_mesh[sy][cz][cx][0];
+                    FlatGLCpuMesh *m1 = &g_flat_section_gl_cpu_mesh[sy][cz][cx][1];
+                    if (!flat_android_mesh_gpu_bytes(m0) && !flat_android_mesh_gpu_bytes(m1)) continue;
+                    long long dx = (long long)cx - player_cx;
+                    long long dz = (long long)cz - player_cz;
+                    long long dy = (long long)sy - (long long)((g_player_y - FLAT_WORLD_Y_MIN) / 16.0f);
+                    long long score = dx * dx * 16 + dz * dz * 16 + dy * dy;
+                    int radius = generated_render_radius() + 1;
+                    if (llabs(dx) > radius || llabs(dz) > radius) score += (1LL << 40);
+                    if (score > best_score) { best_score = score; best_sy = sy; best_cz = cz; best_cx = cx; }
+                }
+            }
+        }
+        if (best_sy < 0) break;
+        flat_android_evict_section_meshes(best_sy, best_cz, best_cx);
+    }
+    return pex_android_tv_static_mesh_bytes_used() <= budget - need_bytes &&
+           pex_android_tv_static_mesh_batches_used() <= batch_limit - need_batches;
+}
+#endif
+
+static int flat_gl_cpu_mesh_install(int sy, int cz, int cx, int pass, FlatDirectMeshBuilder *b, int skip, unsigned int version, int origin_x, int origin_z) {
+    FlatGLCpuMesh *m = &g_flat_section_gl_cpu_mesh[sy][cz][cx][pass];
+    if (g_loggy_enabled && !skip && b) {
+        g_loggy_mesh_installs++;
+        g_loggy_mesh_install_vertices += (int)b->vcount;
+        g_loggy_mesh_install_indices += (int)b->icount;
+    }
+    if (skip || !b || b->vcount == 0 || b->icount == 0) {
+        flat_gl_cpu_mesh_free(m);
+        if (b) { free(b->v); free(b->i); memset(b, 0, sizeof(*b)); }
+        return 1;
+    }
+
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    /* Upload transactionally.  Do not throw away a valid old section until all
+       new layer buffers have been accepted by GLES. */
+    FlatGLCpuMesh next;
+    memset(&next, 0, sizeof(next));
+    next.alpha_test = b->uses_alpha_test ? 1 : 0;
+    next.two_sided = b->two_sided ? 1 : 0;
+    next.vcount = b->vcount;
+    next.icount = b->icount;
+    next.version = version;
+    next.origin_x = origin_x;
+    next.origin_z = origin_z;
+
+    size_t need_bytes = flat_android_builder_gpu_estimate(b);
+    int need_batches = flat_android_builder_batch_estimate(b, pass);
+    if (!flat_android_reserve_gpu_mesh(need_bytes, need_batches, sy, cz, cx)) {
+        /* The mesh being replaced is reclaimable.  Release it only if the rest
+           of the cache could not make enough room, then try the reservation once. */
+        if (flat_android_mesh_gpu_bytes(m) || flat_android_mesh_gpu_batches(m)) flat_gl_cpu_mesh_free(m);
+        if (!flat_android_reserve_gpu_mesh(need_bytes, need_batches, sy, cz, cx)) {
+            free(b->v); free(b->i); memset(b, 0, sizeof(*b));
+            return 0;
+        }
+    }
+
+    int gpu_ok = 1;
+    if (pass == 0) {
+        uint32_t opaque_end = b->opaque_icount_end;
+        uint32_t alpha_one_end = b->alpha_one_sided_icount_end;
+        if (opaque_end > b->icount) opaque_end = b->icount;
+        if (alpha_one_end < opaque_end) alpha_one_end = opaque_end;
+        if (alpha_one_end > b->icount) alpha_one_end = b->icount;
+        if (opaque_end > 0) {
+            next.android_mesh[0] = pex_android_tv_static_mesh_create_range(b->v, b->vcount, b->i, 0, opaque_end);
+            if (!next.android_mesh[0]) gpu_ok = 0;
+        }
+        if (gpu_ok && alpha_one_end > opaque_end) {
+            next.android_mesh[1] = pex_android_tv_static_mesh_create_range(b->v, b->vcount, b->i, opaque_end, alpha_one_end - opaque_end);
+            if (!next.android_mesh[1]) gpu_ok = 0;
+        }
+        if (gpu_ok && b->icount > alpha_one_end) {
+            next.android_mesh[2] = pex_android_tv_static_mesh_create_range(b->v, b->vcount, b->i, alpha_one_end, b->icount - alpha_one_end);
+            if (!next.android_mesh[2]) gpu_ok = 0;
+        }
+    } else {
+        next.android_mesh[2] = pex_android_tv_static_mesh_create_range(b->v, b->vcount, b->i, 0, b->icount);
+        if (!next.android_mesh[2]) gpu_ok = 0;
+    }
+
+    if (!gpu_ok) {
+        flat_gl_cpu_mesh_free(&next);
+        free(b->v); free(b->i); memset(b, 0, sizeof(*b));
+        /* Keep the old valid mesh when possible; caller leaves this section dirty
+           and retries after the eviction/upload cooldown instead of crashing. */
+        return 0;
+    }
+
+    flat_gl_cpu_mesh_free(m);
+    *m = next;
+    m->valid = 1;
+    free(b->v);
+    free(b->i);
+    memset(b, 0, sizeof(*b));
+    return 1;
+#else
+    flat_gl_cpu_mesh_free(m);
+    m->alpha_test = b->uses_alpha_test ? 1 : 0;
+    m->two_sided = b->two_sided ? 1 : 0;
+    m->list = gl_compile_flat_mesh_list(b);
+    if (m->list) {
+        free(b->v);
+        free(b->i);
+        m->v = NULL;
+        m->i = NULL;
+    } else {
+        m->v = b->v;
+        m->i = b->i;
+    }
+    m->vcount = b->vcount;
+    m->icount = b->icount;
+    m->version = version;
+    m->origin_x = origin_x;
+    m->origin_z = origin_z;
+    m->valid = 1;
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+    flat_gl_cpu_mesh_upload_vbo(m);
+#endif
+    memset(b, 0, sizeof(*b));
+    return 1;
+#endif
+}
+
+static int flat_gl_cpu_mesh_drawable(int sy, int cz, int cx, int pass) {
+    FlatGLCpuMesh *m = &g_flat_section_gl_cpu_mesh[sy][cz][cx][pass];
+    return m->valid &&
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+           ((m->android_mesh[0] || m->android_mesh[1] || m->android_mesh[2]) || (m->v && m->i)) &&
+#else
+           ((m->list != 0) || (m->v && m->i)) &&
+#endif
+           m->vcount > 0 && m->icount > 0 &&
+           m->origin_x == g_flat_world_origin_x && m->origin_z == g_flat_world_origin_z;
+}
+
+static int flat_gl_cpu_mesh_ready(int sy, int cz, int cx, int pass) {
+    /* STRICT RENDER STATE:
+       A mesh that was already built and installed remains ready until geometry
+       version/origin changes or the payload is actually missing.  Do not treat
+       background light-version drift as missing payload; that caused automatic
+       rebuild loops and dark patch flicker. */
+    return flat_gl_cpu_mesh_drawable(sy, cz, cx, pass) &&
+           g_flat_section_gl_cpu_mesh[sy][cz][cx][pass].version == g_flat_section_mesh_version[sy][cz][cx] &&
+           flat_chunk_light_ready(cx, cz);
+}
+
+static void flat_gl_cpu_mesh_refresh_lightmap(FlatGLCpuMesh *m) {
+    if (!m || !m->valid || !m->v || m->vcount == 0) return;
+    unsigned int version = flat_current_lightmap_version();
+    if (m->lit_v && m->lit_lightmap_version == version) return;
+    PexVertex *nv = (PexVertex*)realloc(m->lit_v, (size_t)m->vcount * sizeof(PexVertex));
+    if (!nv) return;
+    m->lit_v = nv;
+    for (uint32_t i = 0; i < m->vcount; ++i) {
+        m->lit_v[i] = m->v[i];
+        m->lit_v[i].color = flat_apply_lightmap_to_color(m->v[i].color, m->v[i].light);
+    }
+    m->lit_lightmap_version = version;
+}
+
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+static void flat_android_update_lightmap_texture(void) {
+    static unsigned int uploaded_version = 0;
+    unsigned int version = flat_current_lightmap_version();
+    if (uploaded_version == version) return;
+
+    unsigned char rgba[16 * 16 * 4];
+    for (int sky = 0; sky < 16; ++sky) {
+        for (int block = 0; block < 16; ++block) {
+            float r, g, b;
+            int packed = (sky << 20) | (block << 4);
+            flat_lightmap_color(packed, &r, &g, &b);
+            int off = (sky * 16 + block) * 4;
+            rgba[off + 0] = (unsigned char)(r * 255.0f + 0.5f);
+            rgba[off + 1] = (unsigned char)(g * 255.0f + 0.5f);
+            rgba[off + 2] = (unsigned char)(b * 255.0f + 0.5f);
+            rgba[off + 3] = 255;
+        }
+    }
+    pex_android_tv_update_lightmap(rgba, version);
+    uploaded_version = version;
+}
+#endif
+
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+static int flat_gl_cpu_mesh_upload_vbo(FlatGLCpuMesh *m) {
+    if (!m || !m->valid || !m->v || !m->i || !flat_gl_vbo_supported()) return 0;
+    int shader_mode = pex_shaders_use_original_vertex_colors();
+    unsigned int wanted_light_version = shader_mode ? 0u : flat_current_lightmap_version();
+    int needs_vertex_upload = !m->vbo_uploaded || m->vbo_lightmap_version != wanted_light_version || m->vbo_shader_mode != shader_mode;
+    if (needs_vertex_upload && m->vbo_uploaded && g_flat_gl_light_upload_budget <= 0) {
+        /* Keep drawing the previous daylight colors until this mesh reaches the
+           bounded refresh queue. Updating hundreds of VBOs in one frame caused
+           periodic day/night hitches. */
+        needs_vertex_upload = 0;
+    }
+    if (!m->vbo) g_flat_glGenBuffers(1, &m->vbo);
+    if (!m->ibo) g_flat_glGenBuffers(1, &m->ibo);
+    if (!m->vbo || !m->ibo) return 0;
+    if (needs_vertex_upload) {
+        if (!shader_mode) flat_gl_cpu_mesh_refresh_lightmap(m);
+        const PexVertex *draw_v = shader_mode ? m->v : (m->lit_v ? m->lit_v : m->v);
+        unsigned int light_version = shader_mode ? 0u : (m->lit_v ? m->lit_lightmap_version : 0u);
+        g_flat_glBindBuffer(GL_ARRAY_BUFFER, m->vbo);
+        g_flat_glBufferData(GL_ARRAY_BUFFER, (PexGLsizeiptr)((size_t)m->vcount * sizeof(PexVertex)), draw_v, GL_STATIC_DRAW);
+        m->vbo_lightmap_version = light_version;
+        m->vbo_shader_mode = shader_mode;
+        m->vbo_uploaded = 1;
+        if (g_flat_gl_light_upload_budget > 0) g_flat_gl_light_upload_budget--;
+    }
+    g_flat_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m->ibo);
+    if (!m->ibo_uploaded) {
+        g_flat_glBufferData(GL_ELEMENT_ARRAY_BUFFER, (PexGLsizeiptr)((size_t)m->icount * sizeof(uint32_t)), m->i, GL_STATIC_DRAW);
+        m->ibo_uploaded = 1;
+    }
+    return m->vbo_uploaded && m->ibo_uploaded;
+}
+#endif
+
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+static GLushort *g_flat_android_index16_tmp = NULL;
+static uint32_t g_flat_android_index16_cap = 0;
+
+static int flat_android_ensure_index16_tmp(uint32_t count) {
+    if (count <= g_flat_android_index16_cap) return 1;
+    uint32_t cap = g_flat_android_index16_cap ? g_flat_android_index16_cap : 4096u;
+    while (cap < count) cap *= 2u;
+    GLushort *nv = (GLushort*)realloc(g_flat_android_index16_tmp, (size_t)cap * sizeof(*nv));
+    if (!nv) return 0;
+    g_flat_android_index16_tmp = nv;
+    g_flat_android_index16_cap = cap;
+    return 1;
+}
+
+static void flat_gl_draw_cpu_mesh_android16(FlatGLCpuMesh *m) {
+    /* Android GLES2 cannot draw GL_UNSIGNED_INT indices natively.  The shim has
+       a fast path for 16-bit indices, but falls back to allocating/duplicating
+       every indexed vertex when a section references more than 65535 vertices.
+       Fast graphics can still produce those big solid-pass sections, so split
+       the mesh into triangle windows, rebase each window to zero, and feed the
+       GLES2 fast path with GL_UNSIGNED_SHORT. */
+    const uint32_t max_window_vertices = 65535u;
+    const PexVertex *draw_v = m->lit_v ? m->lit_v : m->v;
+    uint32_t tri = 0;
+    while (tri + 2u < m->icount) {
+        uint32_t first = tri;
+        uint32_t min_idx = UINT32_MAX;
+        uint32_t max_idx = 0;
+        uint32_t out_count = 0;
+
+        while (tri + 2u < m->icount) {
+            uint32_t a = m->i[tri + 0u];
+            uint32_t b = m->i[tri + 1u];
+            uint32_t c = m->i[tri + 2u];
+            uint32_t tmin = a < b ? (a < c ? a : c) : (b < c ? b : c);
+            uint32_t tmax = a > b ? (a > c ? a : c) : (b > c ? b : c);
+            uint32_t nmin = min_idx == UINT32_MAX || tmin < min_idx ? tmin : min_idx;
+            uint32_t nmax = tmax > max_idx ? tmax : max_idx;
+
+            if (out_count > 0u && (nmax - nmin) >= max_window_vertices) break;
+            min_idx = nmin;
+            max_idx = nmax;
+            out_count += 3u;
+            tri += 3u;
+        }
+
+        if (out_count == 0u || min_idx == UINT32_MAX || max_idx >= m->vcount) {
+            tri = first + 3u;
+            continue;
+        }
+        if (!flat_android_ensure_index16_tmp(out_count)) return;
+        for (uint32_t i = 0; i < out_count; ++i) {
+            uint32_t idx = m->i[first + i];
+            g_flat_android_index16_tmp[i] = (GLushort)(idx - min_idx);
+        }
+
+        const PexVertex *base = &draw_v[min_idx];
+        glVertexPointer(3, GL_FLOAT, sizeof(PexVertex), (const GLvoid*)&base[0].x);
+        glTexCoordPointer(2, GL_FLOAT, sizeof(PexVertex), (const GLvoid*)&base[0].u);
+        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(PexVertex), (const GLvoid*)&base[0].color);
+        glDrawElements(GL_TRIANGLES, (GLsizei)out_count, GL_UNSIGNED_SHORT, (const GLvoid*)g_flat_android_index16_tmp);
+    }
+}
+#endif
+
+static void flat_gl_draw_cpu_mesh(FlatGLCpuMesh *m) {
+#if defined(PEX_PLATFORM_PSP)
+    (void)m;
+#else
+    if (!m || !m->valid || m->icount < 3) return;
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    for (int group = 0; group < 3; ++group) {
+        if (m->android_mesh[group]) { pex_android_tv_static_mesh_draw(m->android_mesh[group]); return; }
+    }
+#endif
+    if (m->list && flat_display_lists_supported()) { glCallList(m->list); return; }
+    if (!m->v || !m->i) return;
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+    if (flat_gl_cpu_mesh_upload_vbo(m)) {
+        g_flat_glBindBuffer(GL_ARRAY_BUFFER, m->vbo);
+        g_flat_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m->ibo);
+        glVertexPointer(3, GL_FLOAT, sizeof(PexVertex), (const GLvoid*)offsetof(PexVertex, x));
+        glTexCoordPointer(2, GL_FLOAT, sizeof(PexVertex), (const GLvoid*)offsetof(PexVertex, u));
+        glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(PexVertex), (const GLvoid*)offsetof(PexVertex, color));
+        pex_shaders_terrain_array_pointers(NULL, 1);
+        glDrawElements(GL_TRIANGLES, (GLsizei)m->icount, GL_UNSIGNED_INT, (const GLvoid*)0);
+        pex_shaders_terrain_arrays_end();
+        return;
+    }
+    /* A per-mesh allocation failure must not leave the previous mesh's buffers
+       bound, or the CPU fallback pointers below would be interpreted as VBO
+       byte offsets. */
+    if (flat_gl_vbo_supported()) {
+        g_flat_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        g_flat_glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+#endif
+    if (!pex_shaders_use_original_vertex_colors()) flat_gl_cpu_mesh_refresh_lightmap(m);
+    const PexVertex *draw_v = pex_shaders_use_original_vertex_colors() ? m->v : (m->lit_v ? m->lit_v : m->v);
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    flat_gl_draw_cpu_mesh_android16(m);
+#else
+    glVertexPointer(3, GL_FLOAT, sizeof(PexVertex), (const GLvoid*)&draw_v[0].x);
+    glTexCoordPointer(2, GL_FLOAT, sizeof(PexVertex), (const GLvoid*)&draw_v[0].u);
+    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(PexVertex), (const GLvoid*)&draw_v[0].color);
+    pex_shaders_terrain_array_pointers(draw_v, 0);
+    glDrawElements(GL_TRIANGLES, (GLsizei)m->icount, GL_UNSIGNED_INT, (const GLvoid*)m->i);
+    pex_shaders_terrain_arrays_end();
+#endif
+#endif
+}
+
+static PexTextureHandle flat_direct_terrain_handle(void) {
+    PexRendererBackend *rb = flat_direct_backend();
+    if (!rb || !tex_terrain.rgba || tex_terrain.w <= 0 || tex_terrain.h <= 0) return 0;
+    if (g_flat_direct_terrain_texture && g_flat_direct_terrain_rgba == tex_terrain.rgba &&
+        g_flat_direct_terrain_w == tex_terrain.w && g_flat_direct_terrain_h == tex_terrain.h) {
+        return g_flat_direct_terrain_texture;
+    }
+    if (g_flat_direct_terrain_texture) rb->destroy_texture(g_flat_direct_terrain_texture);
+    PexTextureDesc td;
+    memset(&td, 0, sizeof(td));
+    td.width = tex_terrain.w;
+    td.height = tex_terrain.h;
+    td.rgba_pixels = (const uint32_t*)tex_terrain.rgba;
+    td.repeat = 1;
+    td.nearest = 1;
+    g_flat_direct_terrain_texture = rb->create_texture(&td);
+    g_flat_direct_terrain_rgba = tex_terrain.rgba;
+    g_flat_direct_terrain_w = tex_terrain.w;
+    g_flat_direct_terrain_h = tex_terrain.h;
+    return g_flat_direct_terrain_texture;
+}
+
+static void flat_direct_upload_builder(int sy, int cz, int cx, int pass, FlatDirectMeshBuilder *b) {
+    PexRendererBackend *rb = flat_direct_backend();
+    unsigned int *slot = &g_flat_section_direct_mesh[sy][cz][cx][pass];
+    if (!rb || !b || b->vcount == 0 || b->icount == 0) {
+        if (rb && *slot) { rb->destroy_mesh(*slot); *slot = 0; }
+        return;
+    }
+    flat_direct_resolve_builder_lightmap(b);
+    PexMesh mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    mesh.vertices = b->v;
+    mesh.indices = b->i;
+    mesh.vertex_count = b->vcount;
+    mesh.index_count = b->icount;
+    /* Terrain sections update repeatedly while streaming.  Mark them dynamic so
+       the native D3D backends can reuse buffers and map/update them instead of
+       destroying and recreating GPU resources on every rebuild. */
+    mesh.dynamic = 1;
+    if (*slot) rb->update_mesh(*slot, &mesh);
+    else *slot = rb->upload_mesh(&mesh);
+}
+
+static void flat_direct_make_state(PexRenderState *st, int pass) {
+    memset(st, 0, sizeof(*st));
+    st->texture = flat_direct_terrain_handle();
+    st->texture_enabled = st->texture ? 1 : 0;
+    st->blend_enabled = (pass == 1) ? 1 : 0;
+    st->alpha_test_enabled = (pass == 0) ? 1 : 0;
+    st->depth_enabled = 1;
+    st->depth_write = (pass == 0) ? 1 : 0;
+    st->fog_enabled = g_d3d9.fog_enabled;
+    st->fog_start = g_d3d9.fog_start;
+    st->fog_end = g_d3d9.fog_end;
+    st->fog_color = g_d3d9.fog_color;
+#if defined(PEX_PLATFORM_WII)
+    glGetFloatv(GL_MODELVIEW_MATRIX, st->modelview);
+    glGetFloatv(GL_PROJECTION_MATRIX, st->projection);
+#else
+    memcpy(st->modelview, g_d3d9.modelview.m, sizeof(st->modelview));
+    memcpy(st->projection, g_d3d9.projection.m, sizeof(st->projection));
+#endif
+}
+
+static void world_set_shade(float shade) {
+    if (g_force_fullbright_item_model) {
+        flat_direct_set_color_light4f(shade, shade, shade, 1.0f, flat_fullbright_packed_light());
+        return;
+    }
+    flat_direct_set_color_light4f(shade, shade, shade, 1.0f,
+                                  (uint32_t)flat_pack_sky_block_light(g_world_light_x, g_world_light_y, g_world_light_z, 0));
+}
+
+static void world_set_color_shade(int rgb, float shade) {
+    float r = ((rgb >> 16) & 255) / 255.0f;
+    float g = ((rgb >> 8) & 255) / 255.0f;
+    float b = (rgb & 255) / 255.0f;
+    uint32_t packed = flat_fullbright_packed_light();
+    if (!g_force_fullbright_item_model) {
+        packed = (uint32_t)flat_pack_sky_block_light(g_world_light_x, g_world_light_y, g_world_light_z, 0);
+    }
+    flat_direct_set_color_light4f(r * shade, g * shade, b * shade, 1.0f, packed);
+}
+
+static void world_tex_vertex(float x, float y, float z, float u, float v) {
+    if (g_flat_direct_builder) { flat_direct_vertex(x, y, z, u, v); return; }
+    glTexCoord2f(u, v);
+    glVertex3f(x, y, z);
+}
+
+
+static int dig_particle_tile_for_block_face(int id, int face) {
+    /* Particles use the same terrain tile families as the block renderer.  The
+       previous fallback returned dirt for most IDs, so sand/gravel/wood/etc.
+       broke with dirt particles. */
+    if (id == BLOCK_GRASS) {
+        /* This terrain atlas stores the grass-top tile as a grayscale mask;
+           without biome tint it looks like stone in dig particles.  Use the
+           already-green grass side for top-hit particles too. */
+        if (face == 1) return 3;
+        if (face == 0) return 2;
+        return 3;
+    }
+    if (id == BLOCK_WATER || id == BLOCK_STILL_WATER) return liquid_top_tile_for_block(id);
+    if (id == BLOCK_LAVA || id == BLOCK_STILL_LAVA) return liquid_top_tile_for_block(id);
+    if (id == BLOCK_STONE) return 1;
+    if (id == BLOCK_DIRT) return 2;
+    if (id == BLOCK_COBBLESTONE) return 16;
+    if (id == BLOCK_BEDROCK) return 17;
+    if (id == BLOCK_PLANKS) return 4;
+    if (id == BLOCK_SAND) return 18;
+    if (id == BLOCK_GRAVEL) return 19;
+    if (id == BLOCK_LOG) return (face == 0 || face == 1) ? 21 : 20;
+    if (id == BLOCK_LEAVES) return flat_fancy_leaf_texture_enabled() ? 52 : 53;
+    if (id == BLOCK_GLASS) return 49;
+    if (id == BLOCK_GOLD_ORE) return 32;
+    if (id == BLOCK_IRON_ORE) return 33;
+    if (id == BLOCK_COAL_ORE) return 34;
+    if (id == BLOCK_BOOKSHELF) return (face == 0 || face == 1) ? 4 : 35;
+    if (id == BLOCK_MOSSY_COBBLESTONE) return 36;
+    if (id == BLOCK_OBSIDIAN) return 37;
+    if (id == BLOCK_GOLD_BLOCK) return 39;
+    if (id == BLOCK_IRON_BLOCK) return 38;
+    if (id == BLOCK_DIAMOND_BLOCK) return 40;
+    if (id == BLOCK_DOUBLE_SLAB || id == BLOCK_SLAB) return (face == 0 || face == 1) ? 6 : 5;
+    if (id == BLOCK_BRICK) return 7;
+    if (id == BLOCK_TNT) return (face == 0 ? 10 : (face == 1 ? 9 : 8));
+    if (id == BLOCK_MOB_SPAWNER) return 65;
+    if (id == BLOCK_WOOD_STAIRS || id == BLOCK_WOOD_PRESSURE_PLATE || id == BLOCK_FENCE) return 4;
+    if (id == BLOCK_COBBLE_STAIRS) return 16;
+    if (id == BLOCK_CRAFTING_TABLE) {
+        if (face == 1) return 43;
+        if (face == 0) return 4;
+        if (face == 2 || face == 3) return 59;
+        return 60;
+    }
+    if (id == BLOCK_CHEST) {
+        if (face == 1 || face == 0) return chest_top_tile();
+        if (face == 3) return chest_front_tile();
+        return chest_side_tile();
+    }
+    if (id == BLOCK_DIAMOND_ORE) return 50;
+    if (id == BLOCK_REDSTONE_ORE || id == BLOCK_REDSTONE_ORE_GLOWING) return 51;
+    if (id == BLOCK_LAPIS_ORE) return 38;
+    if (id == BLOCK_LAPIS_BLOCK) return 39;
+    if (id == BLOCK_FURNACE || id == BLOCK_FURNACE_LIT) {
+        if (face == 1 || face == 0) return furnace_top_tile();
+        if (face == 3) return id == BLOCK_FURNACE_LIT ? furnace_front_lit_tile() : furnace_front_tile();
+        return furnace_side_tile();
+    }
+    if (id == BLOCK_SIGN_POST || id == BLOCK_WALL_SIGN) return 4;
+    if (id == BLOCK_WOOD_DOOR) return 97;
+    if (id == BLOCK_LADDER) return 83;
+    if (id == BLOCK_RAILS) return 128;
+    if (id == BLOCK_LEVER) return 96;
+    if (id == BLOCK_STONE_PRESSURE_PLATE || id == BLOCK_STONE_BUTTON) return 1;
+    if (id == BLOCK_IRON_DOOR) return 98;
+    if (id == BLOCK_REDSTONE_WIRE) return 84;
+    if (id == BLOCK_REDSTONE_TORCH_OFF) return 115;
+    if (id == BLOCK_REDSTONE_TORCH_ON) return 99;
+    if (id == BLOCK_YELLOW_FLOWER) return 13;
+    if (id == BLOCK_RED_ROSE) return 12;
+    if (id == BLOCK_BROWN_MUSHROOM) return 29;
+    if (id == BLOCK_RED_MUSHROOM) return 28;
+    if (id == BLOCK_WOOL) return 64;
+    if (id == BLOCK_SNOW_LAYER || id == BLOCK_SNOW_BLOCK) return 66;
+    if (id == BLOCK_ICE) return 67;
+    if (id == BLOCK_FARMLAND) return face == 1 ? 87 : 2;
+    if (id == BLOCK_CACTUS) return (face == 1 ? 69 : (face == 0 ? 71 : 70));
+    if (id == BLOCK_CLAY) return 72;
+    if (id == BLOCK_REEDS) return 73;
+    if (id == BLOCK_JUKEBOX) return (face == 1 ? 75 : 74);
+    if (id == BLOCK_PUMPKIN || id == BLOCK_JACK_O_LANTERN) return (face == 1 || face == 0) ? 102 : (face == 3 ? 119 : 118);
+    if (id == BLOCK_NETHERRACK) return 103;
+    if (id == BLOCK_SOUL_SAND) return 104;
+    if (id == BLOCK_GLOWSTONE) return 105;
+    if (id == BLOCK_PORTAL) return 14;
+    return 2;
+}
+
+static int dig_particle_tile_for_block(int id) {
+    /* Destroy particles in Java use the block's base texture.  Use a stable,
+       visible face for special blocks but keep sand/gravel/etc. on their actual
+       atlas tiles instead of falling through to dirt. */
+    if (id == BLOCK_GRASS) return 3;
+    if (id == BLOCK_LOG || id == BLOCK_CACTUS || id == BLOCK_PUMPKIN || id == BLOCK_JACK_O_LANTERN || id == BLOCK_FURNACE || id == BLOCK_FURNACE_LIT || id == BLOCK_CRAFTING_TABLE || id == BLOCK_CHEST || id == BLOCK_TNT || id == BLOCK_FARMLAND || id == BLOCK_JUKEBOX) {
+        return dig_particle_tile_for_block_face(id, 3);
+    }
+    return dig_particle_tile_for_block_face(id, 1);
+}
+
+static void dig_particle_color_for_block(int id, int wx, int wz, float *r, float *g, float *b) {
+    /* EntityDiggingFX darkens dig particles, then some blocks (notably foliage)
+       multiply that by the block color.  Leaves should use the same biome
+       foliage tint as the rendered block instead of the gray placeholder. */
+    *r = 0.6f; *g = 0.6f; *b = 0.6f;
+    if (id == BLOCK_LEAVES) {
+        int col = java_foliage_color_at(wx, wz);
+        *r *= (float)((col >> 16) & 255) / 255.0f;
+        *g *= (float)((col >> 8) & 255) / 255.0f;
+        *b *= (float)(col & 255) / 255.0f;
+    }
+}
+
+static float frand01(void) {
+    return (float)rand() / (float)RAND_MAX;
+}
+
+static void add_dig_particle(float x, float y, float z, float mx, float my, float mz,
+                             int tile, int block_id, int tint_x, int tint_z,
+                             float motion_scale, float size_scale) {
+    if (!stivufine_particle_allowed()) return;
+    DigParticle *p = &g_dig_particles[g_next_dig_particle++ % MAX_DIG_PARTICLES];
+    memset(p, 0, sizeof(*p));
+    p->active = 1;
+    p->kind = PARTICLE_DIG;
+    p->tile = tile;
+    p->x = p->prev_x = x;
+    p->y = p->prev_y = y;
+    p->z = p->prev_z = z;
+    p->mx = mx + (frand01() * 2.0f - 1.0f) * 0.4f;
+    p->my = my + (frand01() * 2.0f - 1.0f) * 0.4f;
+    p->mz = mz + (frand01() * 2.0f - 1.0f) * 0.4f;
+
+    float mag = sqrtf(p->mx * p->mx + p->my * p->my + p->mz * p->mz);
+    if (mag < 0.0001f) mag = 0.0001f;
+    float speed = (frand01() + frand01() + 1.0f) * 0.15f;
+    p->mx = p->mx / mag * speed * 0.4f;
+    p->my = p->my / mag * speed * 0.4f + 0.1f;
+    p->mz = p->mz / mag * speed * 0.4f;
+
+    /* EntityFX.func_407_b(0.2F) for hit particles. */
+    p->mx *= motion_scale;
+    p->my = (p->my - 0.1f) * motion_scale + 0.1f;
+    p->mz *= motion_scale;
+
+    p->tex_u_jitter = frand01() * 3.0f;
+    p->tex_v_jitter = frand01() * 3.0f;
+    p->scale = ((frand01() * 0.5f + 0.5f) * 2.0f) * 0.5f * size_scale; /* digging halves EntityFX scale */
+    p->gravity = 1.0f;
+    p->max_age = (int)(4.0f / (frand01() * 0.9f + 0.1f));
+    if (p->max_age < 1) p->max_age = 1;
+    p->age = 0;
+    dig_particle_color_for_block(block_id, tint_x, tint_z, &p->r, &p->g, &p->b);
+}
+
+static void spawn_block_destroy_particles(int bx, int by, int bz, int block_id) {
+    /* Exact source structure: EffectRenderer.func_1186_a uses a 4x4x4 grid.
+       pos = block + (i+0.5)/4, motion = pos - block - 0.5. */
+    const int n = 4;
+    int tile = dig_particle_tile_for_block(block_id);
+    for (int ix = 0; ix < n; ix++) {
+        for (int iy = 0; iy < n; iy++) {
+            for (int iz = 0; iz < n; iz++) {
+                float x = (float)bx + ((float)ix + 0.5f) / (float)n;
+                float y = (float)by + ((float)iy + 0.5f) / (float)n;
+                float z = (float)bz + ((float)iz + 0.5f) / (float)n;
+                add_dig_particle(x, y, z,
+                                 x - (float)bx - 0.5f,
+                                 y - (float)by - 0.5f,
+                                 z - (float)bz - 0.5f,
+                                 tile, block_id, bx, bz, 1.0f, 1.0f);
+            }
+        }
+    }
+}
+
+static void spawn_block_hit_particle(int bx, int by, int bz, int face, int block_id) {
+    /* Port of EffectRenderer.func_1191_a with Block min/max = full cube and
+       then EntityFX.func_407_b(0.2F).func_405_d(0.6F). */
+    const float eps = 0.1f;
+    float x = (float)bx + frand01() * (1.0f - eps * 2.0f) + eps;
+    float y = (float)by + frand01() * (1.0f - eps * 2.0f) + eps;
+    float z = (float)bz + frand01() * (1.0f - eps * 2.0f) + eps;
+    if (face == 0) y = (float)by - eps;
+    if (face == 1) y = (float)by + 1.0f + eps;
+    if (face == 2) z = (float)bz - eps;
+    if (face == 3) z = (float)bz + 1.0f + eps;
+    if (face == 4) x = (float)bx - eps;
+    if (face == 5) x = (float)bx + 1.0f + eps;
+    add_dig_particle(x, y, z, 0.0f, 0.0f, 0.0f,
+                     dig_particle_tile_for_block_face(block_id, face), block_id, bx, bz,
+                     0.2f, 0.6f);
+}
+
+
+static void add_bubble_particle(float x, float y, float z, float mx, float my, float mz) {
+    if (!stivufine_water_particles_enabled()) return;
+    DigParticle *p = &g_dig_particles[g_next_dig_particle++ % MAX_DIG_PARTICLES];
+    memset(p, 0, sizeof(*p));
+    p->active = 1;
+    p->kind = PARTICLE_BUBBLE;
+    p->tile = 32;
+    p->x = p->prev_x = x;
+    p->y = p->prev_y = y;
+    p->z = p->prev_z = z;
+    p->r = p->g = p->b = 1.0f;
+    p->scale = ((frand01() * 0.5f + 0.5f) * 2.0f) * (frand01() * 0.6f + 0.2f);
+    p->mx = mx * 0.2f + (frand01() * 2.0f - 1.0f) * 0.02f;
+    p->my = my * 0.2f + (frand01() * 2.0f - 1.0f) * 0.02f;
+    p->mz = mz * 0.2f + (frand01() * 2.0f - 1.0f) * 0.02f;
+    p->gravity = -0.05f; /* bubble onUpdate adds +0.002 Y, so negative gravity in the shared updater. */
+    p->max_age = (int)(8.0f / (frand01() * 0.8f + 0.2f));
+    if (p->max_age < 1) p->max_age = 1;
+}
+
+static void add_splash_particle(float x, float y, float z, float mx, float my, float mz) {
+    if (!stivufine_water_particles_enabled()) return;
+    DigParticle *p = &g_dig_particles[g_next_dig_particle++ % MAX_DIG_PARTICLES];
+    memset(p, 0, sizeof(*p));
+    p->active = 1;
+    p->kind = PARTICLE_SPLASH;
+    p->tile = 20 + (rand() & 3); /* EntityRainFX 19..22 then EntitySplashFX increments. */
+    p->x = p->prev_x = x;
+    p->y = p->prev_y = y;
+    p->z = p->prev_z = z;
+    p->r = p->g = p->b = 1.0f;
+    p->scale = (frand01() * 0.5f + 0.5f) * 2.0f;
+    p->mx = (frand01() * 2.0f - 1.0f) * 0.4f * 0.3f;
+    p->my = frand01() * 0.2f + 0.1f;
+    p->mz = (frand01() * 2.0f - 1.0f) * 0.4f * 0.3f;
+    if (my == 0.0f && (mx != 0.0f || mz != 0.0f)) {
+        p->mx = mx;
+        p->my = my + 0.1f;
+        p->mz = mz;
+    }
+    p->gravity = 1.0f;
+    p->max_age = (int)(8.0f / (frand01() * 0.8f + 0.2f));
+    if (p->max_age < 1) p->max_age = 1;
+}
+
+static void add_portal_particle(float x, float y, float z, float mx, float my, float mz) {
+    if (!stivufine_portal_particles_enabled()) return;
+    DigParticle *p = &g_dig_particles[g_next_dig_particle++ % MAX_DIG_PARTICLES];
+    memset(p, 0, sizeof(*p));
+    p->active = 1;
+    p->kind = PARTICLE_PORTAL;
+    p->tile = rand() & 7;
+    p->x = p->prev_x = p->ox = x;
+    p->y = p->prev_y = p->oy = y;
+    p->z = p->prev_z = p->oz = z;
+    p->mx = mx;
+    p->my = my;
+    p->mz = mz;
+    float c = frand01() * 0.6f + 0.4f;
+    p->r = c * 0.9f;
+    p->g = c * 0.3f;
+    p->b = c;
+    p->scale = frand01() * 0.2f + 0.5f;
+    p->gravity = 0.0f;
+    p->max_age = (int)(frand01() * 10.0f) + 40;
+    p->age = 0;
+}
+
+static DigParticle *alloc_effect_particle(int kind, float x, float y, float z) {
+    if (!stivufine_particle_allowed()) return NULL;
+    DigParticle *p = &g_dig_particles[g_next_dig_particle++ % MAX_DIG_PARTICLES];
+    memset(p, 0, sizeof(*p));
+    p->active = 1;
+    p->kind = kind;
+    p->x = p->prev_x = x;
+    p->y = p->prev_y = y;
+    p->z = p->prev_z = z;
+    p->r = p->g = p->b = 1.0f;
+    return p;
+}
+
+static void add_crit_particle(float x, float y, float z, float mx, float my, float mz) {
+    DigParticle *p = alloc_effect_particle(PARTICLE_CRIT, x, y, z);
+    if (!p) return;
+    p->tile = 65;
+    p->mx = (frand01() * 2.0f - 1.0f) * 0.04f + mx * 0.4f;
+    p->my = (frand01() * 2.0f - 1.0f) * 0.04f + my * 0.4f;
+    p->mz = (frand01() * 2.0f - 1.0f) * 0.04f + mz * 0.4f;
+    float c = frand01() * 0.3f + 0.6f;
+    p->r = p->g = p->b = c;
+    p->base_scale = (frand01() * 0.5f + 0.5f) * 2.0f * (12.0f / 16.0f);
+    p->scale = p->base_scale;
+    p->max_age = (int)(6.0f / (frand01() * 0.8f + 0.6f));
+    if (p->max_age < 1) p->max_age = 1;
+}
+
+static void add_smoke_particle(float x, float y, float z, float mx, float my, float mz, float size) {
+    DigParticle *p = alloc_effect_particle(PARTICLE_SMOKE, x, y, z);
+    if (!p) return;
+    p->tile = 7;
+    p->mx = (frand01() * 2.0f - 1.0f) * 0.04f + mx;
+    p->my = (frand01() * 2.0f - 1.0f) * 0.04f + my;
+    p->mz = (frand01() * 2.0f - 1.0f) * 0.04f + mz;
+    float c = frand01() * 0.3f;
+    p->r = p->g = p->b = c;
+    p->base_scale = (frand01() * 0.5f + 0.5f) * 2.0f * (12.0f / 16.0f) * size;
+    p->scale = p->base_scale;
+    p->max_age = (int)(8.0f / (frand01() * 0.8f + 0.2f) * size);
+    if (p->max_age < 1) p->max_age = 1;
+}
+
+static void add_flame_particle(float x, float y, float z, float mx, float my, float mz) {
+    DigParticle *p = alloc_effect_particle(PARTICLE_FLAME, x, y, z);
+    if (!p) return;
+    p->tile = 48;
+    p->mx = (frand01() * 2.0f - 1.0f) * 0.004f + mx;
+    p->my = (frand01() * 2.0f - 1.0f) * 0.004f + my;
+    p->mz = (frand01() * 2.0f - 1.0f) * 0.004f + mz;
+    p->base_scale = p->scale = (frand01() * 0.5f + 0.5f) * 2.0f;
+    p->max_age = (int)(8.0f / (frand01() * 0.8f + 0.2f)) + 4;
+    if (p->max_age < 1) p->max_age = 1;
+}
+
+static void add_explode_particle(float x, float y, float z, float mx, float my, float mz) {
+    DigParticle *p = alloc_effect_particle(PARTICLE_EXPLODE, x, y, z);
+    if (!p) return;
+    p->tile = 7;
+    p->mx = mx + (frand01() * 2.0f - 1.0f) * 0.05f;
+    p->my = my + (frand01() * 2.0f - 1.0f) * 0.05f;
+    p->mz = mz + (frand01() * 2.0f - 1.0f) * 0.05f;
+    float c = frand01() * 0.3f + 0.7f;
+    p->r = p->g = p->b = c;
+    p->base_scale = p->scale = frand01() * frand01() * 6.0f + 1.0f;
+    p->max_age = (int)(16.0f / (frand01() * 0.8f + 0.2f)) + 2;
+    if (p->max_age < 1) p->max_age = 1;
+}
+
+static void spawn_portal_block_particles(int bx, int by, int bz) {
+    for (int i = 0; i < 4; ++i) {
+        float x = (float)bx + frand01();
+        float y = (float)by + frand01();
+        float z = (float)bz + frand01();
+        float mx = (frand01() - 0.5f) * 0.5f;
+        float my = (frand01() - 0.5f) * 0.5f;
+        float mz = (frand01() - 0.5f) * 0.5f;
+        int side = (rand() & 1) * 2 - 1;
+        int xneg_portal = flat_in_bounds(bx - 1, by, bz) && flat_get_block(bx - 1, by, bz) == BLOCK_PORTAL;
+        int xpos_portal = flat_in_bounds(bx + 1, by, bz) && flat_get_block(bx + 1, by, bz) == BLOCK_PORTAL;
+        if (!xneg_portal && !xpos_portal) {
+            x = (float)bx + 0.5f + 0.25f * (float)side;
+            mx = frand01() * 2.0f * (float)side;
+        } else {
+            z = (float)bz + 0.5f + 0.25f * (float)side;
+            mz = frand01() * 2.0f * (float)side;
+        }
+        add_portal_particle(x, y, z, mx, my, mz);
+    }
+}
+
+static void update_portal_ambient_effects(void) {
+    if (g_mp_connected || g_player_dead) return;
+    int pcx = (int)floorf(g_player_x);
+    int pcy = (int)floorf(g_player_y - 0.6f);
+    int pcz = (int)floorf(g_player_z);
+    for (int attempt = 0; attempt < 18; ++attempt) {
+        int x = pcx + (rand() % 33) - 16;
+        int y = pcy + (rand() % 17) - 8;
+        int z = pcz + (rand() % 33) - 16;
+        if (!flat_in_bounds(x, y, z) || flat_get_block(x, y, z) != BLOCK_PORTAL) continue;
+        if ((rand() % 100) == 0) {
+            pex_sound_play_at("portal.portal", (float)x + 0.5f, (float)y + 0.5f, (float)z + 0.5f, 0.5f, 0.8f + frand01() * 0.4f);
+        }
+        spawn_portal_block_particles(x, y, z);
+        break;
+    }
+}
+
+static void spawn_water_entry_particles(float x, float y, float z, float mx, float mz) {
+    float width = 0.6f; /* player width in Entity.java */
+    int n = (int)(1.0f + width * 20.0f);
+    float floor_y = floorf(y);
+    for (int i = 0; i < n; ++i) {
+        float ox = (frand01() * 2.0f - 1.0f) * width;
+        float oz = (frand01() * 2.0f - 1.0f) * width;
+        add_bubble_particle(x + ox, floor_y + 1.0f, z + oz, mx, -frand01() * 0.2f, mz);
+    }
+    for (int i = 0; i < n; ++i) {
+        float ox = (frand01() * 2.0f - 1.0f) * width;
+        float oz = (frand01() * 2.0f - 1.0f) * width;
+        add_splash_particle(x + ox, floor_y + 1.0f, z + oz, mx, 0.0f, mz);
+    }
+}
+
+static void update_dig_particles(void) {
+    for (int i = 0; i < MAX_DIG_PARTICLES; i++) {
+        DigParticle *p = &g_dig_particles[i];
+        if (!p->active) continue;
+        p->prev_x = p->x;
+        p->prev_y = p->y;
+        p->prev_z = p->z;
+        if (p->age++ >= p->max_age) {
+            p->active = 0;
+            continue;
+        }
+
+        if (p->kind == PARTICLE_BUBBLE) {
+            p->my += 0.002f;
+            p->x += p->mx; p->y += p->my; p->z += p->mz;
+            p->mx *= 0.85f; p->my *= 0.85f; p->mz *= 0.85f;
+            if (!block_is_water(flat_get_block((int)floorf(p->x), (int)floorf(p->y), (int)floorf(p->z)))) p->active = 0;
+        } else if (p->kind == PARTICLE_PORTAL) {
+            float t = (float)p->age / (float)(p->max_age > 0 ? p->max_age : 1);
+            float curve = 1.0f - (-t + t * t * 2.0f);
+            p->x = p->ox + p->mx * curve;
+            p->y = p->oy + p->my * curve + (1.0f - t);
+            p->z = p->oz + p->mz * curve;
+        } else if (p->kind == PARTICLE_CRIT) {
+            p->x += p->mx; p->y += p->my; p->z += p->mz;
+            p->g *= 0.96f; p->b *= 0.90f;
+            p->mx *= 0.70f; p->my *= 0.70f; p->mz *= 0.70f;
+            p->my -= 0.02f;
+        } else if (p->kind == PARTICLE_SMOKE) {
+            p->tile = 7 - p->age * 8 / (p->max_age > 0 ? p->max_age : 1);
+            if (p->tile < 0) p->tile = 0;
+            p->my += 0.004f;
+            p->x += p->mx; p->y += p->my; p->z += p->mz;
+            p->mx *= 0.96f; p->my *= 0.96f; p->mz *= 0.96f;
+        } else if (p->kind == PARTICLE_FLAME) {
+            p->x += p->mx; p->y += p->my; p->z += p->mz;
+            p->mx *= 0.96f; p->my *= 0.96f; p->mz *= 0.96f;
+        } else if (p->kind == PARTICLE_EXPLODE) {
+            p->tile = 7 - p->age * 8 / (p->max_age > 0 ? p->max_age : 1);
+            if (p->tile < 0) p->tile = 0;
+            p->my += 0.004f;
+            p->x += p->mx; p->y += p->my; p->z += p->mz;
+            p->mx *= 0.90f; p->my *= 0.90f; p->mz *= 0.90f;
+        } else {
+            p->my -= (p->kind == PARTICLE_SPLASH ? 0.06f : 0.04f) * p->gravity;
+            p->x += p->mx; p->y += p->my; p->z += p->mz;
+            if (p->y < 0.02f) {
+                p->y = 0.02f;
+                if (p->kind == PARTICLE_SPLASH && frand01() < 0.5f) p->active = 0;
+                p->my = 0.0f; p->mx *= 0.7f; p->mz *= 0.7f;
+            }
+            p->mx *= 0.98f; p->my *= 0.98f; p->mz *= 0.98f;
+        }
+
+        if (p->active && p->kind >= PARTICLE_CRIT) {
+            int bx = (int)floorf(p->x), by = (int)floorf(p->y - 0.02f), bz = (int)floorf(p->z);
+            if (flat_block_is_solid(flat_get_block(bx, by, bz)) && p->my < 0.0f) {
+                p->my = 0.0f; p->mx *= 0.7f; p->mz *= 0.7f;
+            }
+        }
+    }
+}
+
+static void draw_dig_particles(float partial) {
+    if (!tex_terrain.id) return;
+
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    float yaw = lerp_angle(pr->prev_yaw, pr->yaw, partial) * (float)M_PI / 180.0f;
+    float pitch = (pr->prev_pitch + (pr->pitch - pr->prev_pitch) * partial) * (float)M_PI / 180.0f;
+    float cos_yaw = cosf(yaw);
+    float sin_yaw = sinf(yaw);
+    float x_rot = -sin_yaw * sinf(pitch);
+    float z_rot = cos_yaw * sinf(pitch);
+    float yz_rot = cosf(pitch);
+
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.1f);
+    glDisable(GL_CULL_FACE);
+
+    glBegin(GL_QUADS);
+    for (int i = 0; i < MAX_DIG_PARTICLES; i++) {
+        DigParticle *p = &g_dig_particles[i];
+        if (!p->active || p->kind != PARTICLE_DIG) continue;
+
+        float u0, v0, u1, v1;
+        terrain_tile_uv(p->tile, &u0, &v0, &u1, &v1);
+
+        /* EntityDiggingFX draws a 1/4 sub-cell of the terrain tile. */
+        float tile_w = (u1 - u0);
+        float tile_h = (v1 - v0);
+        float su0 = u0 + tile_w * (p->tex_u_jitter / 4.0f);
+        float sv0 = v0 + tile_h * (p->tex_v_jitter / 4.0f);
+        float su1 = su0 + tile_w * (0.999f / 4.0f);
+        float sv1 = sv0 + tile_h * (0.999f / 4.0f);
+
+        float px = p->prev_x + (p->x - p->prev_x) * partial;
+        float py = p->prev_y + (p->y - p->prev_y) * partial;
+        float pz = p->prev_z + (p->z - p->prev_z) * partial;
+        float q = 0.1f * p->scale;
+        float br = flat_light_brightness((int)floorf(px), (int)floorf(py), (int)floorf(pz));
+
+        glColor4f(p->r * br, p->g * br, p->b * br, 1.0f);
+        world_tex_vertex(px - cos_yaw * q - x_rot * q, py - yz_rot * q, pz - sin_yaw * q - z_rot * q, su0, sv1);
+        world_tex_vertex(px - cos_yaw * q + x_rot * q, py + yz_rot * q, pz - sin_yaw * q + z_rot * q, su0, sv0);
+        world_tex_vertex(px + cos_yaw * q + x_rot * q, py + yz_rot * q, pz + sin_yaw * q + z_rot * q, su1, sv0);
+        world_tex_vertex(px + cos_yaw * q - x_rot * q, py - yz_rot * q, pz + sin_yaw * q - z_rot * q, su1, sv1);
+    }
+    glEnd();
+
+    if (tex_particles.id) {
+        glBindTexture(GL_TEXTURE_2D, tex_particles.id);
+        glBegin(GL_QUADS);
+        for (int i = 0; i < MAX_DIG_PARTICLES; i++) {
+            DigParticle *p = &g_dig_particles[i];
+            if (!p->active || p->kind == PARTICLE_DIG) continue;
+            float u0 = (float)(p->tile % 16) / 16.0f;
+            float u1 = u0 + 0.999f / 16.0f;
+            float v0 = (float)(p->tile / 16) / 16.0f;
+            float v1 = v0 + 0.999f / 16.0f;
+            float px = p->prev_x + (p->x - p->prev_x) * partial;
+            float py = p->prev_y + (p->y - p->prev_y) * partial;
+            float pz = p->prev_z + (p->z - p->prev_z) * partial;
+            float q = 0.1f * p->scale;
+            float br = flat_light_brightness((int)floorf(px), (int)floorf(py), (int)floorf(pz));
+            if (p->kind == PARTICLE_PORTAL) {
+                float life = ((float)p->age + partial) / (float)(p->max_age > 0 ? p->max_age : 1);
+                if (life < 0.0f) life = 0.0f; if (life > 1.0f) life = 1.0f;
+                float grow = 1.0f - (1.0f - life) * (1.0f - life);
+                q = 0.1f * p->scale * grow;
+                br = 1.0f;
+            } else if (p->kind == PARTICLE_CRIT || p->kind == PARTICLE_SMOKE) {
+                float grow = (((float)p->age + partial) / (float)(p->max_age > 0 ? p->max_age : 1)) * 32.0f;
+                if (grow < 0.0f) grow = 0.0f; if (grow > 1.0f) grow = 1.0f;
+                q = 0.1f * p->base_scale * grow;
+            } else if (p->kind == PARTICLE_FLAME) {
+                float life = ((float)p->age + partial) / (float)(p->max_age > 0 ? p->max_age : 1);
+                if (life < 0.0f) life = 0.0f; if (life > 1.0f) life = 1.0f;
+                q = 0.1f * p->base_scale * (1.0f - life * life * 0.5f);
+                br = 1.0f;
+            } else if (p->kind == PARTICLE_EXPLODE) {
+                q = 0.1f * p->base_scale;
+            }
+            glColor4f(p->r * br, p->g * br, p->b * br, 1.0f);
+            world_tex_vertex(px - cos_yaw * q - x_rot * q, py - yz_rot * q, pz - sin_yaw * q - z_rot * q, u0, v1);
+            world_tex_vertex(px - cos_yaw * q + x_rot * q, py + yz_rot * q, pz - sin_yaw * q + z_rot * q, u0, v0);
+            world_tex_vertex(px + cos_yaw * q + x_rot * q, py + yz_rot * q, pz + sin_yaw * q + z_rot * q, u1, v0);
+            world_tex_vertex(px + cos_yaw * q - x_rot * q, py - yz_rot * q, pz + sin_yaw * q - z_rot * q, u1, v1);
+        }
+        glEnd();
+    }
+
+    glColor4f(1, 1, 1, 1);
+    glDisable(GL_ALPHA_TEST);
+}
+
+
+static void draw_grass_block(float x, float y, float z) {
+    float x0 = x, x1 = x + 1.0f;
+    float y0 = y, y1 = y + 1.0f;
+    float z0 = z, z1 = z + 1.0f;
+    float u0,v0,u1,v1;
+    int bx = (int)floorf(x), by = (int)floorf(y), bz = (int)floorf(z);
+    world_style_set_pos(bx, by, bz);
+
+    /* Beta terrain.png indices: 0=grass top, 2=dirt, 3=grass side. */
+    terrain_tile_uv(0, &u0, &v0, &u1, &v1);
+    world_light_set_pos_for_face(bx, by, bz, 1);
+    world_set_color_shade(java_grass_color_at(bx, bz), 1.0f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0);
+    world_tex_vertex(x1, y1, z0, u1, v0);
+    world_tex_vertex(x1, y1, z1, u1, v1);
+    world_tex_vertex(x0, y1, z1, u0, v1);
+    glEnd();
+
+    terrain_tile_uv(3, &u0, &v0, &u1, &v1);
+    world_light_set_pos_for_face(bx, by, bz, 2);
+    world_set_shade(0.80f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x1, y1, z0, u0, v0);
+    world_tex_vertex(x0, y1, z0, u1, v0);
+    world_tex_vertex(x0, y0, z0, u1, v1);
+    world_tex_vertex(x1, y0, z0, u0, v1);
+
+    world_tex_vertex(x0, y1, z1, u0, v0);
+    world_tex_vertex(x1, y1, z1, u1, v0);
+    world_tex_vertex(x1, y0, z1, u1, v1);
+    world_tex_vertex(x0, y0, z1, u0, v1);
+    glEnd();
+
+    world_light_set_pos_for_face(bx, by, bz, 4);
+    world_set_shade(0.60f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0);
+    world_tex_vertex(x0, y1, z1, u1, v0);
+    world_tex_vertex(x0, y0, z1, u1, v1);
+    world_tex_vertex(x0, y0, z0, u0, v1);
+
+    world_tex_vertex(x1, y1, z1, u0, v0);
+    world_tex_vertex(x1, y1, z0, u1, v0);
+    world_tex_vertex(x1, y0, z0, u1, v1);
+    world_tex_vertex(x1, y0, z1, u0, v1);
+    glEnd();
+
+    terrain_tile_uv(2, &u0, &v0, &u1, &v1);
+    world_light_set_pos_for_face(bx, by, bz, 0);
+    world_set_shade(0.50f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y0, z1, u0, v0);
+    world_tex_vertex(x1, y0, z1, u1, v0);
+    world_tex_vertex(x1, y0, z0, u1, v1);
+    world_tex_vertex(x0, y0, z0, u0, v1);
+    glEnd();
+}
+
+static void draw_dirt_block(float x, float y, float z) {
+    float x0 = x, x1 = x + 1.0f;
+    float y0 = y, y1 = y + 1.0f;
+    float z0 = z, z1 = z + 1.0f;
+    float u0,v0,u1,v1;
+    terrain_tile_uv(2, &u0, &v0, &u1, &v1);
+    world_set_shade(1.0f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y1, z1, u1, v1); world_tex_vertex(x0, y1, z1, u0, v1);
+    glEnd();
+    world_set_shade(0.80f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x1, y1, z0, u0, v0); world_tex_vertex(x0, y1, z0, u1, v0); world_tex_vertex(x0, y0, z0, u1, v1); world_tex_vertex(x1, y0, z0, u0, v1);
+    world_tex_vertex(x0, y1, z1, u0, v0); world_tex_vertex(x1, y1, z1, u1, v0); world_tex_vertex(x1, y0, z1, u1, v1); world_tex_vertex(x0, y0, z1, u0, v1);
+    glEnd();
+    world_set_shade(0.60f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x0, y1, z1, u1, v0); world_tex_vertex(x0, y0, z1, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    world_tex_vertex(x1, y1, z1, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x1, y0, z1, u0, v1);
+    glEnd();
+    world_set_shade(0.50f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y0, z1, u0, v0); world_tex_vertex(x1, y0, z1, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    glEnd();
+}
+
+static void draw_textured_cube_tile(float x, float y, float z, int tile) {
+    float x0 = x, x1 = x + 1.0f;
+    float y0 = y, y1 = y + 1.0f;
+    float z0 = z, z1 = z + 1.0f;
+    float u0,v0,u1,v1;
+    terrain_tile_uv(tile, &u0, &v0, &u1, &v1);
+    world_set_shade(1.0f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y1, z1, u1, v1); world_tex_vertex(x0, y1, z1, u0, v1);
+    glEnd();
+    world_set_shade(0.80f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x1, y1, z0, u0, v0); world_tex_vertex(x0, y1, z0, u1, v0); world_tex_vertex(x0, y0, z0, u1, v1); world_tex_vertex(x1, y0, z0, u0, v1);
+    world_tex_vertex(x0, y1, z1, u0, v0); world_tex_vertex(x1, y1, z1, u1, v0); world_tex_vertex(x1, y0, z1, u1, v1); world_tex_vertex(x0, y0, z1, u0, v1);
+    glEnd();
+    world_set_shade(0.60f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x0, y1, z1, u1, v0); world_tex_vertex(x0, y0, z1, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    world_tex_vertex(x1, y1, z1, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x1, y0, z1, u0, v1);
+    glEnd();
+    world_set_shade(0.50f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y0, z1, u0, v0); world_tex_vertex(x1, y0, z1, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    glEnd();
+}
+
+static void draw_bedrock_block(float x, float y, float z) {
+    draw_textured_cube_tile(x, y, z, 17); /* Bare Bones bedrock */
+}
+
+static void draw_planks_block(float x, float y, float z) {
+    draw_textured_cube_tile(x, y, z, 4); /* terrain tile 4 = wooden planks */
+}
+
+static void draw_log_block(float x, float y, float z) {
+    /* Classic terrain.png:
+       20 = log side, 21 = log top/end. */
+    float x0 = x, x1 = x + 1.0f;
+    float y0 = y, y1 = y + 1.0f;
+    float z0 = z, z1 = z + 1.0f;
+    float u0, v0, u1, v1;
+
+    terrain_tile_uv(21, &u0, &v0, &u1, &v1);
+    world_set_shade(1.0f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y1, z1, u1, v1); world_tex_vertex(x0, y1, z1, u0, v1);
+    world_tex_vertex(x0, y0, z1, u0, v0); world_tex_vertex(x1, y0, z1, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    glEnd();
+
+    terrain_tile_uv(20, &u0, &v0, &u1, &v1);
+    world_set_shade(0.80f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x1, y1, z0, u0, v0); world_tex_vertex(x0, y1, z0, u1, v0); world_tex_vertex(x0, y0, z0, u1, v1); world_tex_vertex(x1, y0, z0, u0, v1);
+    world_tex_vertex(x0, y1, z1, u0, v0); world_tex_vertex(x1, y1, z1, u1, v0); world_tex_vertex(x1, y0, z1, u1, v1); world_tex_vertex(x0, y0, z1, u0, v1);
+    glEnd();
+
+    world_set_shade(0.60f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x0, y1, z1, u1, v0); world_tex_vertex(x0, y0, z1, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    world_tex_vertex(x1, y1, z1, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x1, y0, z1, u0, v1);
+    glEnd();
+}
+
+static void draw_crafting_table_block(float x, float y, float z) {
+    /* Classic terrain.png: 43=crafting table top, 59=side, 60=front. */
+    float x0 = x, x1 = x + 1.0f;
+    float y0 = y, y1 = y + 1.0f;
+    float z0 = z, z1 = z + 1.0f;
+    float u0, v0, u1, v1;
+
+    terrain_tile_uv(43, &u0, &v0, &u1, &v1);
+    world_set_shade(1.0f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y1, z1, u1, v1); world_tex_vertex(x0, y1, z1, u0, v1);
+    glEnd();
+
+    terrain_tile_uv(59, &u0, &v0, &u1, &v1);
+    world_set_shade(0.80f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z1, u0, v0); world_tex_vertex(x1, y1, z1, u1, v0); world_tex_vertex(x1, y0, z1, u1, v1); world_tex_vertex(x0, y0, z1, u0, v1);
+    world_tex_vertex(x1, y1, z0, u0, v0); world_tex_vertex(x0, y1, z0, u1, v0); world_tex_vertex(x0, y0, z0, u1, v1); world_tex_vertex(x1, y0, z0, u0, v1);
+    glEnd();
+
+    terrain_tile_uv(60, &u0, &v0, &u1, &v1);
+    world_set_shade(0.60f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x0, y1, z1, u1, v0); world_tex_vertex(x0, y0, z1, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    world_tex_vertex(x1, y1, z1, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x1, y0, z1, u0, v1);
+    glEnd();
+
+    terrain_tile_uv(4, &u0, &v0, &u1, &v1);
+    world_set_shade(0.50f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y0, z1, u0, v0); world_tex_vertex(x1, y0, z1, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    glEnd();
+}
+
+
+static void draw_chest_block(float x, float y, float z) {
+    /* Beta-style chest is smaller than a full cube. */
+    float inset = 1.0f / 16.0f;
+    float x0 = x + inset, x1 = x + 1.0f - inset;
+    float y0 = y, y1 = y + 14.0f / 16.0f;
+    float z0 = z + inset, z1 = z + 1.0f - inset;
+    float u0, v0, u1, v1;
+
+    terrain_tile_uv(chest_top_tile(), &u0, &v0, &u1, &v1);
+    world_set_shade(1.0f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y1, z1, u1, v1); world_tex_vertex(x0, y1, z1, u0, v1);
+    glEnd();
+
+    terrain_tile_uv(chest_top_tile(), &u0, &v0, &u1, &v1);
+    world_set_shade(0.50f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y0, z1, u0, v0); world_tex_vertex(x1, y0, z1, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    glEnd();
+
+    terrain_tile_uv(chest_front_tile(), &u0, &v0, &u1, &v1);
+    world_set_shade(0.80f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z1, u0, v0); world_tex_vertex(x1, y1, z1, u1, v0); world_tex_vertex(x1, y0, z1, u1, v1); world_tex_vertex(x0, y0, z1, u0, v1);
+    glEnd();
+
+    terrain_tile_uv(chest_side_tile(), &u0, &v0, &u1, &v1);
+    world_set_shade(0.80f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x1, y1, z0, u0, v0); world_tex_vertex(x0, y1, z0, u1, v0); world_tex_vertex(x0, y0, z0, u1, v1); world_tex_vertex(x1, y0, z0, u0, v1);
+    glEnd();
+
+    world_set_shade(0.60f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x0, y1, z1, u1, v0); world_tex_vertex(x0, y0, z1, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    world_tex_vertex(x1, y1, z1, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x1, y0, z1, u0, v1);
+    glEnd();
+}
+
+static void draw_furnace_block_id(int id, float x, float y, float z) {
+    /* User-supplied terrain listing, 1-based X:Y:
+       front 13:3 => tile 44, sides 14:3 => tile 45,
+       top/bottom 15:3 => tile 46. */
+    float x0 = x, x1 = x + 1.0f;
+    float y0 = y, y1 = y + 1.0f;
+    float z0 = z, z1 = z + 1.0f;
+    float u0, v0, u1, v1;
+
+    terrain_tile_uv(furnace_top_tile(), &u0, &v0, &u1, &v1);
+    world_set_shade(1.0f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y1, z1, u1, v1); world_tex_vertex(x0, y1, z1, u0, v1);
+    glEnd();
+
+    terrain_tile_uv(furnace_top_tile(), &u0, &v0, &u1, &v1);
+    world_set_shade(0.50f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y0, z1, u0, v0); world_tex_vertex(x1, y0, z1, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    glEnd();
+
+    terrain_tile_uv(id == BLOCK_FURNACE_LIT ? furnace_front_lit_tile() : furnace_front_tile(), &u0, &v0, &u1, &v1);
+    world_set_shade(0.80f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z1, u0, v0); world_tex_vertex(x1, y1, z1, u1, v0); world_tex_vertex(x1, y0, z1, u1, v1); world_tex_vertex(x0, y0, z1, u0, v1);
+    glEnd();
+
+    terrain_tile_uv(furnace_side_tile(), &u0, &v0, &u1, &v1);
+    world_set_shade(0.80f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x1, y1, z0, u0, v0); world_tex_vertex(x0, y1, z0, u1, v0); world_tex_vertex(x0, y0, z0, u1, v1); world_tex_vertex(x1, y0, z0, u0, v1);
+    glEnd();
+
+    world_set_shade(0.60f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x0, y1, z1, u1, v0); world_tex_vertex(x0, y0, z1, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    world_tex_vertex(x1, y1, z1, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x1, y0, z1, u0, v1);
+    glEnd();
+}
+
+
+
+
+static void draw_generic_world_block_model(int id, float x, float y, float z);
+static int block_uses_cross_plant_model(int id);
+static void draw_cross_plant_block(int id, float x, float y, float z);
+static void draw_snow_layer_block(float x, float y, float z);
+static int block_uses_special_model(int id);
+static void draw_special_block_model(int id, int x, int y, int z);
+
+static void draw_world_block_id(int id, float x, float y, float z) {
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+    pex_shaders_set_mesh_entity((float)id);
+#endif
+    if (id == BLOCK_GRASS) draw_grass_block(x, y, z);
+    else if (id == BLOCK_STONE) draw_textured_cube_tile(x, y, z, 1);
+    else if (id == BLOCK_DIRT) draw_dirt_block(x, y, z);
+    else if (id == BLOCK_COBBLESTONE) draw_textured_cube_tile(x, y, z, 16);
+    else if (id == BLOCK_BEDROCK) draw_bedrock_block(x, y, z);
+    else if (id == BLOCK_PLANKS) draw_planks_block(x, y, z);
+    else if (id == BLOCK_LOG) draw_log_block(x, y, z);
+    else if (id == BLOCK_CRAFTING_TABLE) draw_crafting_table_block(x, y, z);
+    else if (id == BLOCK_FURNACE || id == BLOCK_FURNACE_LIT) draw_furnace_block_id(id, x, y, z);
+    else if (id == BLOCK_CHEST) draw_chest_block(x, y, z);
+    else if (id == BLOCK_SNOW_LAYER) draw_snow_layer_block(x, y, z);
+    else if (block_uses_cross_plant_model(id)) draw_cross_plant_block(id, x, y, z);
+    else if (id >= 1 && id <= 91) draw_generic_world_block_model(id, x, y, z);
+}
+
+typedef struct BlockBounds {
+    float x0, y0, z0, x1, y1, z1;
+} BlockBounds;
+
+static BlockBounds block_bounds_for_selection(int id, int x, int y, int z) {
+    BlockBounds b = {(float)x, (float)y, (float)z, (float)x + 1.0f, (float)y + 1.0f, (float)z + 1.0f};
+    int meta = flat_get_meta(x, y, z);
+    if (id == BLOCK_SNOW_LAYER) b.y1 = (float)y + 2.0f / 16.0f;
+    else if (id == BLOCK_SLAB) b.y1 = (float)y + 0.5f;
+    else if (id == BLOCK_STONE_PRESSURE_PLATE || id == BLOCK_WOOD_PRESSURE_PLATE) {
+        float e = 1.0f / 16.0f;
+        b.x0 = (float)x + e; b.x1 = (float)x + 1.0f - e;
+        b.z0 = (float)z + e; b.z1 = (float)z + 1.0f - e;
+        b.y1 = (float)y + ((meta & 1) ? (1.0f / 32.0f) : (1.0f / 16.0f));
+    } else if (id == BLOCK_RAILS || id == BLOCK_REDSTONE_WIRE) {
+        b.y1 = (float)y + 0.10f;
+    } else if (id == BLOCK_CACTUS) {
+        b.x0 = (float)x + 0.0625f; b.x1 = (float)x + 0.9375f;
+        b.z0 = (float)z + 0.0625f; b.z1 = (float)z + 0.9375f;
+    } else if (id == BLOCK_CHEST) {
+        b.x0 = (float)x + 0.0625f; b.x1 = (float)x + 0.9375f;
+        b.z0 = (float)z + 0.0625f; b.z1 = (float)z + 0.9375f;
+        b.y1 = (float)y + 14.0f / 16.0f;
+    } else if (block_is_door_id(id)) {
+        int ly = door_meta_is_upper(meta) ? (y - 1) : y;
+        int lower_meta = flat_get_meta(x, ly, z);
+        int state = ((lower_meta & 4) == 0) ? ((lower_meta - 1) & 3) : (lower_meta & 3);
+        float t = 3.0f / 16.0f;
+        if (state == 0) b.z1 = (float)z + t;
+        else if (state == 1) b.x0 = (float)x + 1.0f - t;
+        else if (state == 2) b.z0 = (float)z + 1.0f - t;
+        else b.x1 = (float)x + t;
+    } else if (id == BLOCK_TORCH || id == BLOCK_REDSTONE_TORCH_OFF || id == BLOCK_REDSTONE_TORCH_ON) {
+        int side = meta & 7;
+        float r = 0.15f;
+        if (side == 1) { b.x0 = (float)x; b.x1 = (float)x + r * 2.0f; b.y0 = (float)y + 0.2f; b.y1 = (float)y + 0.8f; b.z0 = (float)z + 0.5f - r; b.z1 = (float)z + 0.5f + r; }
+        else if (side == 2) { b.x0 = (float)x + 1.0f - r * 2.0f; b.x1 = (float)x + 1.0f; b.y0 = (float)y + 0.2f; b.y1 = (float)y + 0.8f; b.z0 = (float)z + 0.5f - r; b.z1 = (float)z + 0.5f + r; }
+        else if (side == 3) { b.x0 = (float)x + 0.5f - r; b.x1 = (float)x + 0.5f + r; b.y0 = (float)y + 0.2f; b.y1 = (float)y + 0.8f; b.z0 = (float)z; b.z1 = (float)z + r * 2.0f; }
+        else if (side == 4) { b.x0 = (float)x + 0.5f - r; b.x1 = (float)x + 0.5f + r; b.y0 = (float)y + 0.2f; b.y1 = (float)y + 0.8f; b.z0 = (float)z + 1.0f - r * 2.0f; b.z1 = (float)z + 1.0f; }
+        else { r = 0.1f; b.x0 = (float)x + 0.5f - r; b.x1 = (float)x + 0.5f + r; b.y1 = (float)y + 0.6f; b.z0 = (float)z + 0.5f - r; b.z1 = (float)z + 0.5f + r; }
+    } else if (id == BLOCK_STONE_BUTTON) {
+        int side = meta & 7;
+        float t = (meta & 8) ? (1.0f / 16.0f) : (2.0f / 16.0f);
+        b.y0 = (float)y + 6.0f / 16.0f; b.y1 = (float)y + 10.0f / 16.0f;
+        if (side == 1) { b.x0 = (float)x; b.x1 = (float)x + t; b.z0 = (float)z + 0.5f - 3.0f/16.0f; b.z1 = (float)z + 0.5f + 3.0f/16.0f; }
+        else if (side == 2) { b.x0 = (float)x + 1.0f - t; b.x1 = (float)x + 1.0f; b.z0 = (float)z + 0.5f - 3.0f/16.0f; b.z1 = (float)z + 0.5f + 3.0f/16.0f; }
+        else if (side == 3) { b.x0 = (float)x + 0.5f - 3.0f/16.0f; b.x1 = (float)x + 0.5f + 3.0f/16.0f; b.z0 = (float)z; b.z1 = (float)z + t; }
+        else { b.x0 = (float)x + 0.5f - 3.0f/16.0f; b.x1 = (float)x + 0.5f + 3.0f/16.0f; b.z0 = (float)z + 1.0f - t; b.z1 = (float)z + 1.0f; }
+    } else if (id == BLOCK_LADDER || id == BLOCK_WALL_SIGN) {
+        int side = meta;
+        float e = (id == BLOCK_LADDER) ? (2.0f / 16.0f) : 0.10f;
+        if (side == 2) { b.z0 = (float)z + 1.0f - e; }
+        else if (side == 3) { b.z1 = (float)z + e; }
+        else if (side == 4) { b.x0 = (float)x + 1.0f - e; }
+        else if (side == 5) { b.x1 = (float)x + e; }
+    } else if (id == BLOCK_LEVER) {
+        int side = meta & 7;
+        float w = 3.0f / 16.0f;
+        float l = 0.25f;
+        float h = 3.0f / 16.0f;
+        if (side == 5) { b.x0 = (float)x + 0.5f - w; b.x1 = (float)x + 0.5f + w; b.y1 = (float)y + h; b.z0 = (float)z + 0.5f - l; b.z1 = (float)z + 0.5f + l; }
+        else if (side == 6) { b.x0 = (float)x + 0.5f - l; b.x1 = (float)x + 0.5f + l; b.y1 = (float)y + h; b.z0 = (float)z + 0.5f - w; b.z1 = (float)z + 0.5f + w; }
+        else if (side == 4) { b.x0 = (float)x + 0.5f - w; b.x1 = (float)x + 0.5f + w; b.y0 = (float)y + 0.5f - l; b.y1 = (float)y + 0.5f + l; b.z0 = (float)z + 1.0f - h; }
+        else if (side == 3) { b.x0 = (float)x + 0.5f - w; b.x1 = (float)x + 0.5f + w; b.y0 = (float)y + 0.5f - l; b.y1 = (float)y + 0.5f + l; b.z1 = (float)z + h; }
+        else if (side == 2) { b.x0 = (float)x + 1.0f - h; b.y0 = (float)y + 0.5f - l; b.y1 = (float)y + 0.5f + l; b.z0 = (float)z + 0.5f - w; b.z1 = (float)z + 0.5f + w; }
+        else { b.x1 = (float)x + h; b.y0 = (float)y + 0.5f - l; b.y1 = (float)y + 0.5f + l; b.z0 = (float)z + 0.5f - w; b.z1 = (float)z + 0.5f + w; }
+    } else if (id == BLOCK_SIGN_POST) {
+        b.x0 = (float)x + 0.25f; b.x1 = (float)x + 0.75f;
+        b.z0 = (float)z + 0.4375f; b.z1 = (float)z + 0.5625f;
+    }
+    return b;
+}
+
+static void emit_overlay_bounds_textured(BlockBounds b, int stage) {
+    if (stage < 0) return;
+    if (stage > 9) stage = 9;
+    float u0,v0,u1,v1;
+    terrain_tile_uv(240 + stage, &u0, &v0, &u1, &v1);
+    glBegin(GL_QUADS);
+    world_tex_vertex(b.x0, b.y1, b.z0, u0, v0); world_tex_vertex(b.x1, b.y1, b.z0, u1, v0); world_tex_vertex(b.x1, b.y1, b.z1, u1, v1); world_tex_vertex(b.x0, b.y1, b.z1, u0, v1);
+    world_tex_vertex(b.x1, b.y1, b.z0, u0, v0); world_tex_vertex(b.x0, b.y1, b.z0, u1, v0); world_tex_vertex(b.x0, b.y0, b.z0, u1, v1); world_tex_vertex(b.x1, b.y0, b.z0, u0, v1);
+    world_tex_vertex(b.x0, b.y1, b.z1, u0, v0); world_tex_vertex(b.x1, b.y1, b.z1, u1, v0); world_tex_vertex(b.x1, b.y0, b.z1, u1, v1); world_tex_vertex(b.x0, b.y0, b.z1, u0, v1);
+    world_tex_vertex(b.x0, b.y1, b.z0, u0, v0); world_tex_vertex(b.x0, b.y1, b.z1, u1, v0); world_tex_vertex(b.x0, b.y0, b.z1, u1, v1); world_tex_vertex(b.x0, b.y0, b.z0, u0, v1);
+    world_tex_vertex(b.x1, b.y1, b.z1, u0, v0); world_tex_vertex(b.x1, b.y1, b.z0, u1, v0); world_tex_vertex(b.x1, b.y0, b.z0, u1, v1); world_tex_vertex(b.x1, b.y0, b.z1, u0, v1);
+    world_tex_vertex(b.x0, b.y0, b.z1, u0, v0); world_tex_vertex(b.x1, b.y0, b.z1, u1, v0); world_tex_vertex(b.x1, b.y0, b.z0, u1, v1); world_tex_vertex(b.x0, b.y0, b.z0, u0, v1);
+    glEnd();
+}
+
+static void draw_break_overlay_cube(float x, float y, float z, int stage) {
+    if (stage < 0) return;
+    int bx = (int)floorf(x + 0.01f), by = (int)floorf(y + 0.01f), bz = (int)floorf(z + 0.01f);
+    int id = flat_get_block(bx, by, bz);
+    BlockBounds b = block_bounds_for_selection(id, bx, by, bz);
+
+    float e = 0.002f;
+    b.x0 -= e; b.y0 -= e; b.z0 -= e; b.x1 += e; b.y1 += e; b.z1 += e;
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glEnable(GL_BLEND);
+#if defined(PEX_PLATFORM_PSP)
+    /* PSP terrain destroy-stage tiles need alpha testing.  Without it, the
+       transparent gray parts of destroy_stage show as a flat gray cube. */
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.15f);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(1,1,1,1.0f);
+#else
+    glBlendFunc(GL_DST_COLOR, GL_SRC_COLOR);
+    glColor4f(1,1,1,1);
+#endif
+    glDepthMask(GL_FALSE);
+    emit_overlay_bounds_textured(b, stage);
+    glDepthMask(GL_TRUE);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+
+
+static void draw_java_entity_shadow(float x, float y, float z, float shadow_size, float shadow_alpha);
+
+static void draw_falling_blocks(float partial) {
+    if (!tex_terrain.id) return;
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDisable(GL_CULL_FACE);
+    glColor4f(1, 1, 1, 1);
+    for (int i = 0; i < MAX_FALLING_BLOCK_ENTITIES; i++) {
+        FlatFallingBlock *fb = &g_falling_blocks[i];
+        if (!fb->active || fb->block_id <= 0) continue;
+        float x, y, z;
+        if (g_mp_connected && fb->path_duration > 0) {
+            double elapsed = now_seconds() - fb->path_start_time;
+            if (elapsed < 0.0) elapsed = 0.0;
+            float t = (float)(elapsed * 20.0 / (double)fb->path_duration);
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            x = fb->start_x + (fb->end_x - fb->start_x) * t;
+            y = fb->start_y + (fb->end_y - fb->start_y) * t;
+            z = fb->start_z + (fb->end_z - fb->start_z) * t;
+        } else {
+            x = fb->prev_x + (fb->x - fb->prev_x) * partial;
+            y = fb->prev_y + (fb->y - fb->prev_y) * partial;
+            z = fb->prev_z + (fb->z - fb->prev_z) * partial;
+        }
+        draw_java_entity_shadow(x, y, z, 0.50f, 1.0f);
+
+        /* draw_java_entity_shadow binds tex_shadow.  Falling blocks need the
+           terrain atlas rebound per entity, otherwise they sample the shadow
+           texture and appear black until they land back in the terrain mesh. */
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+        glDisable(GL_BLEND);
+        glColor4f(1, 1, 1, 1);
+
+        glPushMatrix();
+        glTranslatef(x, y, z);
+        /* Falling block entities are not baked into the terrain light mesh yet.
+           Render them like Java entity blocks: stable entity brightness, not the
+           last sampled world face light, which made falling sand/gravel black. */
+        g_force_fullbright_item_model++;
+        world_style_set_pos((int)floorf(x), (int)floorf(y), (int)floorf(z));
+        world_light_set_pos((int)floorf(x), (int)floorf(y), (int)floorf(z));
+        draw_world_block_id(fb->block_id, -0.5f, -0.5f, -0.5f);
+        g_force_fullbright_item_model--;
+        glPopMatrix();
+    }
+}
+
+static void draw_remote_break_overlays(void) {
+    if (!g_mp_connected || !tex_terrain.id) return;
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    for (int i = 0; i < PEX_NET_MAX_PLAYERS; i++) {
+        PexNetRenderPlayerState *r = &g_mp_render_players[i];
+        if (!r->active || r->skin_only || !r->mining_active || r->mining_time <= 0.0f) continue;
+        if (flat_get_block(r->mining_x, r->mining_y, r->mining_z) == 0) continue;
+        draw_break_overlay_cube((float)r->mining_x, (float)r->mining_y, (float)r->mining_z, r->mining_stage);
+    }
+}
+
+static int java_shadow_block_top(int x, int y, int z, float *top_y, float *brightness) {
+    for (int yy = y; yy >= y - 4 && yy >= FLAT_WORLD_Y_MIN; --yy) {
+        int id = flat_get_block(x, yy, z);
+        if (!id || block_is_liquid(id) || !flat_block_is_solid(id)) continue;
+        *top_y = (float)yy + 1.002f;
+        *brightness = flat_light_brightness(x, yy + 1, z);
+        return 1;
+    }
+    return 0;
+}
+
+static void draw_java_entity_shadow(float x, float y, float z, float shadow_size, float shadow_alpha) {
+    if (!g_opts.fancy_graphics || !tex_shadow.id || shadow_size <= 0.0f || shadow_alpha <= 0.0f) return;
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_shadow.id);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    /* Render.java/RenderManager shadow quads rely on texture alpha and normal
+       alpha blending.  Real OpenGL still had the terrain/mob alpha-test state
+       live here, so dim shadow pixels were clipped; D3D backends did not expose
+       the same failure. */
+    glDisable(GL_ALPHA_TEST);
+    glDepthMask(GL_FALSE);
+    glColor4f(1, 1, 1, 1);
+
+    float radius = shadow_size;
+    int x0 = (int)floorf(x - radius - 1.0f);
+    int x1 = (int)floorf(x + radius + 1.0f);
+    int z0 = (int)floorf(z - radius - 1.0f);
+    int z1 = (int)floorf(z + radius + 1.0f);
+    int cy = (int)floorf(y);
+    glBegin(GL_QUADS);
+    for (int bz = z0; bz <= z1; ++bz) {
+        for (int bx = x0; bx <= x1; ++bx) {
+            float sy = 0.0f, br = 1.0f;
+            if (!java_shadow_block_top(bx, cy, bz, &sy, &br)) continue;
+            float dy = y - sy;
+            if (dy < 0.0f || dy > 4.0f) continue;
+            float cx = (float)bx + 0.5f;
+            float cz = (float)bz + 0.5f;
+            float dx = (cx - x) / radius;
+            float dz = (cz - z) / radius;
+            float dist = sqrtf(dx * dx + dz * dz);
+            if (dist > 1.35f) continue;
+            float alpha = (shadow_alpha - dy / 2.0f) * 0.35f * (1.0f - dist / 1.35f) * br;
+            if (alpha <= 0.0f) continue;
+            if (alpha > 0.22f) alpha = 0.22f;
+            glColor4f(1.0f, 1.0f, 1.0f, alpha);
+            glTexCoord2f(0, 1); glVertex3f((float)bx,     sy, (float)bz + 1);
+            glTexCoord2f(1, 1); glVertex3f((float)bx + 1, sy, (float)bz + 1);
+            glTexCoord2f(1, 0); glVertex3f((float)bx + 1, sy, (float)bz);
+            glTexCoord2f(0, 0); glVertex3f((float)bx,     sy, (float)bz);
+        }
+    }
+    glEnd();
+
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.1f);
+    glColor4f(1,1,1,1);
+}
+
+
+static int render_item_as_block_id(int id) {
+    if (id < 1 || id > BLOCK_REDSTONE_LAMP_ON) return 0;
+    if (block_is_liquid(id)) return 0;
+    if (id == BLOCK_SAPLING || id == BLOCK_YELLOW_FLOWER || id == BLOCK_RED_ROSE ||
+        id == BLOCK_BROWN_MUSHROOM || id == BLOCK_RED_MUSHROOM || id == BLOCK_TORCH ||
+        id == BLOCK_REDSTONE_TORCH_OFF || id == BLOCK_REDSTONE_TORCH_ON || id == BLOCK_FIRE ||
+        id == BLOCK_REDSTONE_WIRE || id == BLOCK_CROPS || id == BLOCK_SIGN_POST ||
+        id == BLOCK_WALL_SIGN || id == BLOCK_WOOD_DOOR || id == BLOCK_IRON_DOOR ||
+        id == BLOCK_LADDER || id == BLOCK_RAILS || id == BLOCK_LEVER || id == BLOCK_REEDS ||
+        id == BLOCK_PORTAL || id == BLOCK_TALL_GRASS || id == BLOCK_DEAD_BUSH ||
+        id == BLOCK_POWERED_RAIL || id == BLOCK_DETECTOR_RAIL || id == BLOCK_VINE ||
+        id == BLOCK_LILY_PAD || id == BLOCK_NETHER_WART || id == BLOCK_PUMPKIN_STEM ||
+        id == BLOCK_MELON_STEM || id == BLOCK_REDSTONE_REPEATER_OFF ||
+        id == BLOCK_REDSTONE_REPEATER_ON || id == BLOCK_END_PORTAL) return 0;
+    return 1;
+}
+
+static int world_item_is_block_id(int id) {
+    return id >= 1 && id <= BLOCK_REDSTONE_LAMP_ON;
+}
+
+static int world_block_item_tile(int id) {
+    switch (id) {
+        case BLOCK_SAPLING: return 15;
+        case BLOCK_YELLOW_FLOWER: return 13;
+        case BLOCK_RED_ROSE: return 12;
+        case BLOCK_BROWN_MUSHROOM: return 29;
+        case BLOCK_RED_MUSHROOM: return 28;
+        case BLOCK_TORCH: return 80;
+        case BLOCK_FIRE: return 31;
+        case BLOCK_REDSTONE_WIRE: return 164;
+        case BLOCK_CROPS: return 88;
+        case BLOCK_SIGN_POST:
+        case BLOCK_WALL_SIGN: return 4;
+        case BLOCK_WOOD_DOOR: return 97;
+        case BLOCK_IRON_DOOR: return 98;
+        case BLOCK_LADDER: return 83;
+        case BLOCK_RAILS: return 128;
+        case BLOCK_POWERED_RAIL: return 179;
+        case BLOCK_DETECTOR_RAIL: return 195;
+        case BLOCK_LEVER: return 96;
+        case BLOCK_REEDS: return 73;
+        case BLOCK_REDSTONE_TORCH_OFF: return 115;
+        case BLOCK_REDSTONE_TORCH_ON: return 99;
+        case BLOCK_TALL_GRASS: return 39;
+        case BLOCK_DEAD_BUSH: return 55;
+        case BLOCK_VINE: return 143;
+        case BLOCK_LILY_PAD: return 76;
+        case BLOCK_NETHER_WART: return 226;
+        case BLOCK_PUMPKIN_STEM:
+        case BLOCK_MELON_STEM: return 19;
+        case BLOCK_REDSTONE_REPEATER_OFF: return 131;
+        case BLOCK_REDSTONE_REPEATER_ON: return 147;
+        case BLOCK_END_PORTAL: return 15;
+        default: return 1;
+    }
+}
+
+static void draw_block_item_model(int id, float x, float y, float z);
+static void draw_block_item_model_with_meta(int id, int meta, float x, float y, float z);
+
+
+static void item_tile_uv(int tile, float *u0, float *v0, float *u1, float *v1) {
+    int tx = tile & 15;
+    int ty = tile >> 4;
+    float step = 1.0f / 16.0f;
+    *u0 = tx * step;
+    *v0 = ty * step;
+    *u1 = *u0 + step;
+    *v1 = *v0 + step;
+}
+
+static void draw_dropped_item_sprite(int tile) {
+    if (!tex_items.id) return;
+    float u0, v0, u1, v1;
+    item_tile_uv(tile, &u0, &v0, &u1, &v1);
+
+    /* Caller sets entity/item brightness before drawing. */
+    glDisable(GL_CULL_FACE);
+    glBindTexture(GL_TEXTURE_2D, tex_items.id);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.1f);
+    glBegin(GL_QUADS);
+    glTexCoord2f(u0, v1); glVertex3f(-0.5f, -0.5f, 0.0f);
+    glTexCoord2f(u1, v1); glVertex3f( 0.5f, -0.5f, 0.0f);
+    glTexCoord2f(u1, v0); glVertex3f( 0.5f,  0.5f, 0.0f);
+    glTexCoord2f(u0, v0); glVertex3f(-0.5f,  0.5f, 0.0f);
+    glEnd();
+    glDisable(GL_ALPHA_TEST);
+}
+
+static void draw_dropped_terrain_sprite(int tile) {
+    if (!tex_terrain.id) return;
+    float u0, v0, u1, v1;
+    terrain_tile_uv(tile, &u0, &v0, &u1, &v1);
+
+    /* Caller sets entity/item brightness before drawing. */
+    glDisable(GL_CULL_FACE);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.1f);
+    glBegin(GL_QUADS);
+    glTexCoord2f(u0, v1); glVertex3f(-0.5f, -0.5f, 0.0f);
+    glTexCoord2f(u1, v1); glVertex3f( 0.5f, -0.5f, 0.0f);
+    glTexCoord2f(u1, v0); glVertex3f( 0.5f,  0.5f, 0.0f);
+    glTexCoord2f(u0, v0); glVertex3f(-0.5f,  0.5f, 0.0f);
+    glEnd();
+    glDisable(GL_ALPHA_TEST);
+}
+
+static int dropped_item_copy_count(int count) {
+    /* RenderItem.java: >1 -> 2, >5 -> 3, >20 -> 4. */
+    if (count > 20) return 4;
+    if (count > 5) return 3;
+    if (count > 1) return 2;
+    return 1;
+}
+
+typedef struct PexRenderJavaRandom48 { unsigned long long seed; } PexRenderJavaRandom48;
+static void pex_render_java_random_seed(PexRenderJavaRandom48 *r, unsigned long long seed) {
+    r->seed=(seed ^ 0x5DEECE66DULL)&((1ULL<<48)-1ULL);
+}
+static unsigned int pex_render_java_random_next(PexRenderJavaRandom48 *r, int bits) {
+    r->seed=(r->seed*0x5DEECE66DULL+0xBULL)&((1ULL<<48)-1ULL);
+    return (unsigned int)(r->seed>>(48-bits));
+}
+static float pex_render_java_random_float(PexRenderJavaRandom48 *r) {
+    return (float)pex_render_java_random_next(r,24)/(float)(1<<24);
+}
+static void dropped_item_copy_offset(int copy, float amplitude, float divisor, float *x, float *y, float *z) {
+    PexRenderJavaRandom48 r; pex_render_java_random_seed(&r,187ULL);
+    *x=*y=*z=0.0f;
+    for (int i=1;i<=copy;++i) {
+        *x=(pex_render_java_random_float(&r)*2.0f-1.0f)*amplitude/divisor;
+        *y=(pex_render_java_random_float(&r)*2.0f-1.0f)*amplitude/divisor;
+        *z=(pex_render_java_random_float(&r)*2.0f-1.0f)*amplitude/divisor;
+    }
+}
+
+static void dropped_item_set_rgb(int rgb) {
+    glColor4f((float)((rgb >> 16) & 255) / 255.0f,
+              (float)((rgb >> 8) & 255) / 255.0f,
+              (float)(rgb & 255) / 255.0f, 1.0f);
+}
+
+/* RenderItem 1.2.5 supports two item passes for potion bottles and spawn eggs.
+   Keep those layers coincident, and use metadata-aware icons/tints for normal
+   items and flat block icons. */
+static void draw_dropped_flat_stack_125(const ItemStack *st, int terrain_icon) {
+    if (!st || stack_empty(st)) return;
+    if (terrain_icon) {
+        dropped_item_set_rgb(java125_item_block_tint(st));
+        draw_dropped_terrain_sprite(world_block_item_tile(st->id));
+        glColor4f(1,1,1,1);
+        return;
+    }
+    if (st->id == ITEM_MONSTER_PLACER) {
+        dropped_item_set_rgb(spawn_egg_color(st->damage, 0));
+        draw_dropped_item_sprite(item_icon_tile(st->id));
+        dropped_item_set_rgb(spawn_egg_color(st->damage, 1));
+        draw_dropped_item_sprite(item_icon_tile(st->id) + 16);
+    } else if (st->id == ITEM_POTION) {
+        dropped_item_set_rgb(pex_potion_color_from_damage(st->damage));
+        draw_dropped_item_sprite(141);
+        glColor4f(1,1,1,1);
+        draw_dropped_item_sprite((st->damage & 16384) ? 154 : 140);
+    } else {
+        glColor4f(1,1,1,1);
+        draw_dropped_item_sprite(item_icon_tile_for_stack(st));
+    }
+    glColor4f(1,1,1,1);
+}
+
+
+static void draw_vehicle_box_tile(int tile, float x0, float y0, float z0, float x1, float y1, float z1) {
+    if (!tex_terrain.id) return;
+    float u0, v0, u1, v1;
+    terrain_tile_uv(tile, &u0, &v0, &u1, &v1);
+    world_set_shade(1.0f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y1, z1, u1, v1); world_tex_vertex(x0, y1, z1, u0, v1);
+    glEnd();
+    world_set_shade(0.8f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x1, y1, z0, u0, v0); world_tex_vertex(x0, y1, z0, u1, v0); world_tex_vertex(x0, y0, z0, u1, v1); world_tex_vertex(x1, y0, z0, u0, v1);
+    world_tex_vertex(x0, y1, z1, u0, v0); world_tex_vertex(x1, y1, z1, u1, v0); world_tex_vertex(x1, y0, z1, u1, v1); world_tex_vertex(x0, y0, z1, u0, v1);
+    glEnd();
+    world_set_shade(0.6f);
+    glBegin(GL_QUADS);
+    world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x0, y1, z1, u1, v0); world_tex_vertex(x0, y0, z1, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    world_tex_vertex(x1, y1, z1, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x1, y0, z1, u0, v1);
+    glEnd();
+}
+
+static void draw_vehicle_boat_model(void) {
+    /* ModelBoat parity is still pending.  This keeps spawned boats visible with
+       the correct wooden atlas while the item function/entity path is wired. */
+    draw_vehicle_box_tile(4, -0.70f, -0.18f, -0.38f, 0.70f, 0.00f, 0.38f);  /* floor */
+    draw_vehicle_box_tile(4, -0.78f, -0.15f, -0.46f, -0.62f, 0.42f, 0.46f); /* left side */
+    draw_vehicle_box_tile(4,  0.62f, -0.15f, -0.46f,  0.78f, 0.42f, 0.46f); /* right side */
+    draw_vehicle_box_tile(4, -0.62f, -0.15f, -0.54f,  0.62f, 0.42f,-0.38f); /* front */
+    draw_vehicle_box_tile(4, -0.62f, -0.15f,  0.38f,  0.62f, 0.42f, 0.54f); /* back */
+}
+
+static void draw_vehicle_minecart_model(int type) {
+    int tile = 22; /* iron block-ish atlas tile in classic terrain.png */
+    draw_vehicle_box_tile(tile, -0.50f, -0.25f, -0.50f, 0.50f, -0.06f, 0.50f);
+    draw_vehicle_box_tile(tile, -0.60f, -0.20f, -0.58f, -0.42f, 0.42f, 0.58f);
+    draw_vehicle_box_tile(tile,  0.42f, -0.20f, -0.58f,  0.60f, 0.42f, 0.58f);
+    draw_vehicle_box_tile(tile, -0.42f, -0.20f, -0.60f,  0.42f, 0.42f,-0.42f);
+    draw_vehicle_box_tile(tile, -0.42f, -0.20f,  0.42f,  0.42f, 0.42f, 0.60f);
+    if (type == FLAT_VEHICLE_MINECART_CHEST) {
+        draw_vehicle_box_tile(25, -0.32f, 0.05f, -0.32f, 0.32f, 0.55f, 0.32f);
+    } else if (type == FLAT_VEHICLE_MINECART_FURNACE) {
+        draw_vehicle_box_tile(45, -0.32f, 0.05f, -0.32f, 0.32f, 0.55f, 0.32f);
+    }
+}
+
+static void draw_vehicles(float partial) {
+    if (!tex_terrain.id) return;
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glColor4f(1,1,1,1);
+    for (int i = 0; i < MAX_VEHICLE_ENTITIES; ++i) {
+        FlatVehicle *v = &g_vehicles[i];
+        if (!v->active) continue;
+        float x = v->prev_x + (v->x - v->prev_x) * partial;
+        float y = v->prev_y + (v->y - v->prev_y) * partial;
+        float z = v->prev_z + (v->z - v->prev_z) * partial;
+        float yaw = lerp_angle(v->prev_yaw, v->yaw, partial);
+        draw_java_entity_shadow(x, y, z, v->type == FLAT_VEHICLE_BOAT ? 0.70f : 0.55f, 1.0f);
+        glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+        glPushMatrix();
+        glTranslatef(x, y, z);
+        glRotatef(yaw, 0.0f, 1.0f, 0.0f);
+        if (v->type == FLAT_VEHICLE_BOAT) draw_vehicle_boat_model();
+        else draw_vehicle_minecart_model(v->type);
+        glPopMatrix();
+    }
+}
+
+static void entity_item_light_prepare(float x, float y, float z);
+
+static void draw_projectile_fire_overlay_125(float x, float y, float z) {
+    if (!tex_terrain.id) return;
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glPushMatrix();
+    glTranslatef(x, y, z);
+    glScalef(0.7f, 0.7f, 0.7f); /* EntityArrow width 0.5 * Render fire scale 1.4. */
+    glRotatef(-g_player_yaw, 0, 1, 0);
+    glColor4f(1, 1, 1, 1);
+    float half = 0.5f, yoff = 0.0f, zoff = 0.0f;
+    for (int layer = 0; layer < 2; ++layer) {
+        int tile = 31 + (layer & 1) * 16;
+        float u0, v0, u1, v1;
+        terrain_tile_uv(tile, &u0, &v0, &u1, &v1);
+        if ((layer / 2) % 2 == 0) { float t = u0; u0 = u1; u1 = t; }
+        glBegin(GL_QUADS);
+        glTexCoord2f(u1, v1); glVertex3f( half, -yoff, zoff);
+        glTexCoord2f(u0, v1); glVertex3f(-half, -yoff, zoff);
+        glTexCoord2f(u0, v0); glVertex3f(-half, 1.4f - yoff, zoff);
+        glTexCoord2f(u1, v0); glVertex3f( half, 1.4f - yoff, zoff);
+        glEnd();
+        yoff -= 0.45f; half *= 0.9f; zoff += 0.03f;
+    }
+    glPopMatrix();
+}
+
+static void draw_projectile_billboard_quad(int tile) {
+    float u0, v0, u1, v1;
+    item_tile_uv(tile, &u0, &v0, &u1, &v1);
+    glBegin(GL_QUADS);
+    glTexCoord2f(u0, v1); glVertex3f(-0.5f, -0.25f, 0.0f);
+    glTexCoord2f(u1, v1); glVertex3f( 0.5f, -0.25f, 0.0f);
+    glTexCoord2f(u1, v0); glVertex3f( 0.5f,  0.75f, 0.0f);
+    glTexCoord2f(u0, v0); glVertex3f(-0.5f,  0.75f, 0.0f);
+    glEnd();
+}
+
+static void draw_projectiles(float partial) {
+    if (!tex_items.id) return;
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    for (int i = 0; i < MAX_PROJECTILE_ENTITIES; ++i) {
+        FlatProjectile *p = &g_projectiles[i];
+        if (!p->active) continue;
+        float x = p->prev_x + (p->x - p->prev_x) * partial;
+        float y = p->prev_y + (p->y - p->prev_y) * partial;
+        float z = p->prev_z + (p->z - p->prev_z) * partial;
+        entity_item_light_prepare(x, y, z);
+        glPushMatrix();
+        glTranslatef(x, y, z);
+        if (p->type == FLAT_PROJECTILE_ARROW) {
+            float yaw = lerp_angle(p->prev_yaw, p->yaw, partial);
+            float pitch = p->prev_pitch + (p->pitch - p->prev_pitch) * partial;
+            glBindTexture(GL_TEXTURE_2D, tex_arrows.id ? tex_arrows.id : tex_items.id);
+            glRotatef(yaw - 90.0f, 0.0f, 1.0f, 0.0f);
+            glRotatef(pitch, 0.0f, 0.0f, 1.0f);
+            float shake = (float)p->arrow_shake - partial;
+            if (shake > 0.0f) glRotatef(-sinf(shake * 3.0f) * shake, 0.0f, 0.0f, 1.0f);
+            glRotatef(45.0f, 1.0f, 0.0f, 0.0f);
+            glScalef(0.05625f, 0.05625f, 0.05625f);
+            glTranslatef(-4.0f, 0.0f, 0.0f);
+            if (tex_arrows.id) {
+                /* RenderArrow 1.2.5, /item/arrows.png (32x32). */
+                glBegin(GL_QUADS);
+                glTexCoord2f(0.0f, 0.15625f); glVertex3f(-7,-2,-2);
+                glTexCoord2f(0.15625f,0.15625f); glVertex3f(-7,-2, 2);
+                glTexCoord2f(0.15625f,0.3125f); glVertex3f(-7, 2, 2);
+                glTexCoord2f(0.0f,0.3125f); glVertex3f(-7, 2,-2);
+                glTexCoord2f(0.0f,0.15625f); glVertex3f(-7, 2,-2);
+                glTexCoord2f(0.15625f,0.15625f); glVertex3f(-7, 2, 2);
+                glTexCoord2f(0.15625f,0.3125f); glVertex3f(-7,-2, 2);
+                glTexCoord2f(0.0f,0.3125f); glVertex3f(-7,-2,-2);
+                glEnd();
+                for (int f=0; f<4; ++f) {
+                    glRotatef(90.0f,1,0,0);
+                    glBegin(GL_QUADS);
+                    glTexCoord2f(0.0f,0.0f); glVertex3f(-8,-2,0);
+                    glTexCoord2f(0.5f,0.0f); glVertex3f( 8,-2,0);
+                    glTexCoord2f(0.5f,0.15625f); glVertex3f( 8, 2,0);
+                    glTexCoord2f(0.0f,0.15625f); glVertex3f(-8, 2,0);
+                    glEnd();
+                }
+            } else {
+                /* Texture-pack fallback when arrows.png is absent. */
+                int tile=item_icon_tile(ITEM_ARROW);
+                float u0,v0,u1,v1; item_tile_uv(tile,&u0,&v0,&u1,&v1);
+                for(int f=0;f<4;++f){
+                    glBegin(GL_QUADS);
+                    glTexCoord2f(u0,v0);glVertex3f(-8,-2,0);
+                    glTexCoord2f(u1,v0);glVertex3f( 8,-2,0);
+                    glTexCoord2f(u1,v1);glVertex3f( 8, 2,0);
+                    glTexCoord2f(u0,v1);glVertex3f(-8, 2,0);
+                    glEnd();
+                    glRotatef(90.0f,1,0,0);
+                }
+            }
+        } else {
+            int item=ITEM_POTION;
+            float scale=0.5f;
+            if(p->type==FLAT_PROJECTILE_XP_BOTTLE)item=ITEM_EXP_BOTTLE;
+            else if(p->type==FLAT_PROJECTILE_SNOWBALL)item=ITEM_SNOWBALL;
+            else if(p->type==FLAT_PROJECTILE_SMALL_FIREBALL){item=ITEM_FIREBALL_CHARGE;scale=0.5f;}
+            else if(p->type==FLAT_PROJECTILE_LARGE_FIREBALL){item=ITEM_FIREBALL_CHARGE;scale=2.0f;}
+            glBindTexture(GL_TEXTURE_2D,tex_items.id);
+            glScalef(scale,scale,scale);
+            glRotatef(180.0f-g_player_yaw,0,1,0);
+            glRotatef(-g_player_pitch,1,0,0);
+            if(p->type==FLAT_PROJECTILE_POTION){
+                int color=pex_potion_color_from_damage(p->item_damage);
+                glColor4f((float)((color>>16)&255)/255.0f,(float)((color>>8)&255)/255.0f,(float)(color&255)/255.0f,1.0f);
+                draw_projectile_billboard_quad(141);
+                glColor4f(1,1,1,1);
+            }
+            draw_projectile_billboard_quad(item_icon_tile(item));
+        }
+        glPopMatrix();
+        if (p->fire_ticks > 0) draw_projectile_fire_overlay_125(x, y, z);
+    }
+    glBindTexture(GL_TEXTURE_2D,tex_items.id);
+    glColor4f(1,1,1,1);
+}
+
+static int xp_orb_texture_index(int value) {
+    return value>=2477?10:value>=1237?9:value>=617?8:value>=307?7:value>=149?6:
+           value>=73?5:value>=37?4:value>=17?3:value>=7?2:value>=3?1:0;
+}
+
+static void draw_xp_orbs(float partial) {
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    for (int i=0;i<MAX_XP_ORBS;++i) {
+        FlatXPOrb *o=&g_xp_orbs[i]; if(!o->active) continue;
+        float x=o->prev_x+(o->x-o->prev_x)*partial;
+        float y=o->prev_y+(o->y-o->prev_y)*partial;
+        float z=o->prev_z+(o->z-o->prev_z)*partial;
+        float phase=((float)o->color+partial)*0.5f;
+        float red=(sinf(phase)+1.0f)*0.5f;
+        float blue=(sinf(phase+(float)M_PI*4.0f/3.0f)+1.0f)*0.10f;
+        draw_java_entity_shadow(x,y,z,0.15f,12.0f/16.0f);
+        glPushMatrix();
+        glTranslatef(x,y,z);
+        glRotatef(180.0f-g_player_yaw,0,1,0);
+        glRotatef(-g_player_pitch,1,0,0);
+        glScalef(0.30f,0.30f,0.30f);
+        if (tex_xporb.id) {
+            int t=xp_orb_texture_index(o->value);
+            float u0=(float)((t%4)*16)/64.0f, u1=u0+16.0f/64.0f;
+            float v0=(float)((t/4)*16)/64.0f, v1=v0+16.0f/64.0f;
+            glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D,tex_xporb.id);
+            glColor4f(red,1.0f,blue,128.0f/255.0f);
+            glBegin(GL_QUADS);
+            glTexCoord2f(u0,v1); glVertex3f(-0.5f,-0.25f,0);
+            glTexCoord2f(u1,v1); glVertex3f( 0.5f,-0.25f,0);
+            glTexCoord2f(u1,v0); glVertex3f( 0.5f, 0.75f,0);
+            glTexCoord2f(u0,v0); glVertex3f(-0.5f, 0.75f,0);
+            glEnd();
+        } else {
+            glDisable(GL_TEXTURE_2D); glColor4f(red,1.0f,blue,0.75f);
+            glBegin(GL_QUADS);
+            glVertex3f(-0.5f,-0.25f,0); glVertex3f(0.5f,-0.25f,0);
+            glVertex3f(0.5f,0.75f,0); glVertex3f(-0.5f,0.75f,0);
+            glEnd(); glEnable(GL_TEXTURE_2D);
+        }
+        glPopMatrix();
+    }
+    glColor4f(1,1,1,1); glEnable(GL_TEXTURE_2D);
+}
+
+static float entity_light_factor_at(float x, float y, float z) {
+    float br = flat_light_brightness((int)floorf(x), (int)floorf(y), (int)floorf(z));
+    if (br < 0.18f) br = 0.18f;
+    if (br > 1.0f) br = 1.0f;
+    return br;
+}
+
+static void entity_item_light_prepare(float x, float y, float z) {
+    float br = entity_light_factor_at(x, y, z);
+    glColor4f(br, br, br, 1.0f);
+    int lx = (int)floorf(x);
+    int ly = (int)floorf(y);
+    int lz = (int)floorf(z);
+    world_style_set_pos(lx, ly, lz);
+    world_light_set_pos(lx, ly, lz);
+}
+
+static void draw_dropped_items(void) {
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    float yaw = lerp_angle(pr->prev_yaw, pr->yaw, g_frame_partial);
+    float item_partial = g_frame_partial;
+    for (int i = 0; i < MAX_DROP_ENTITIES; i++) {
+        FlatDroppedItem *e = &g_drops[i];
+        if (!e->active) continue;
+        float x = e->prev_x + (e->x - e->prev_x) * item_partial;
+        float y = e->prev_y + (e->y - e->prev_y) * item_partial;
+        float z = e->prev_z + (e->z - e->prev_z) * item_partial;
+        if (g_mp_connected && e->net_id > 0) {
+            PexNetRenderDropState *r = pex_net_find_render_drop(e->net_id);
+            if (r && r->active) {
+                x = r->x;
+                y = r->y;
+                z = r->z;
+            }
+        }
+        float bob = sinf(((float)e->age + g_frame_partial) / 10.0f + e->rot) * 0.1f + 0.1f;
+        int copies = dropped_item_copy_count(e->stack.count);
+
+        draw_java_entity_shadow(x, y, z, 0.15f, 1.0f);
+
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        entity_item_light_prepare(x, y + 0.5f, z);
+        glPushMatrix();
+        glTranslatef(x, y + bob, z);
+
+        int render_type = world_item_is_block_id(e->stack.id) ? java125_block_render_type(e->stack.id) : -1;
+        if (world_item_is_block_id(e->stack.id) && java125_render_item_in_3d(render_type) && tex_terrain.id) {
+            glRotatef((((float)e->age + g_frame_partial) / 20.0f + e->rot) * 57.29578f, 0.0f, 1.0f, 0.0f);
+            float block_scale = (render_type == 1 || render_type == 19 || render_type == 12 || render_type == 2) ? 0.5f : 0.25f;
+            glScalef(block_scale, block_scale, block_scale);
+            for (int c=0;c<copies;++c) {
+                glPushMatrix();
+                float ox,oy,oz; dropped_item_copy_offset(c,0.20f,block_scale,&ox,&oy,&oz);
+                glTranslatef(ox,oy,oz);
+                glBindTexture(GL_TEXTURE_2D,tex_terrain.id);
+                draw_block_item_model_with_meta(e->stack.id, e->stack.damage, -0.5f,-0.5f,-0.5f);
+                glPopMatrix();
+            }
+        } else {
+            glScalef(0.5f,0.5f,0.5f);
+            int terrain_icon=world_item_is_block_id(e->stack.id);
+            for (int c=0;c<copies;++c) {
+                glPushMatrix();
+                float ox,oy,oz; dropped_item_copy_offset(c,0.30f,1.0f,&ox,&oy,&oz);
+                glTranslatef(ox,oy,oz);
+                glRotatef(180.0f-yaw,0,1,0);
+                draw_dropped_flat_stack_125(&e->stack, terrain_icon);
+                glPopMatrix();
+            }
+        }
+        glPopMatrix();
+    }
+}
+
+
+static void draw_pickup_fx_items(void) {
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    float yaw = lerp_angle(pr->prev_yaw, pr->yaw, g_frame_partial);
+    for (int i = 0; i < MAX_PICKUP_FX; ++i) {
+        PickupFx *fx = &g_pickup_fx[i];
+        if (!fx->active) continue;
+        float t = ((float)fx->age + g_frame_partial) / (float)(fx->max_age > 0 ? fx->max_age : 3);
+        if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+        t = t * t;
+        float px = pr->prev_x + (pr->x - pr->prev_x) * g_frame_partial;
+        float py = pr->prev_y + (pr->y - pr->prev_y) * g_frame_partial - 0.5f;
+        float pz = pr->prev_z + (pr->z - pr->prev_z) * g_frame_partial;
+        float x = fx->start_x + (px - fx->start_x) * t;
+        float y = fx->start_y + (py - fx->start_y) * t;
+        float z = fx->start_z + (pz - fx->start_z) * t;
+
+        entity_item_light_prepare(x, y + 0.5f, z);
+        glPushMatrix();
+        glTranslatef(x, y, z);
+        glRotatef((((float)fx->age + g_frame_partial) / 20.0f + fx->rot) * 57.29578f, 0.0f, 1.0f, 0.0f);
+        if (render_item_as_block_id(fx->stack.id) && tex_terrain.id) {
+            glScalef(0.25f, 0.25f, 0.25f);
+            glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+            draw_block_item_model_with_meta(fx->stack.id, fx->stack.damage, -0.5f, -0.5f, -0.5f);
+        } else if (world_item_is_block_id(fx->stack.id) && tex_terrain.id) {
+            glRotatef(180.0f - yaw, 0.0f, 1.0f, 0.0f);
+            glScalef(0.5f, 0.5f, 0.5f);
+            draw_dropped_terrain_sprite(world_block_item_tile(fx->stack.id));
+        } else if (tex_items.id) {
+            glRotatef(180.0f - yaw, 0.0f, 1.0f, 0.0f);
+            glScalef(0.5f, 0.5f, 0.5f);
+            draw_dropped_item_sprite(item_icon_tile(fx->stack.id));
+        }
+        glPopMatrix();
+    }
+}
+
+static void draw_block_selection_border(void) {
+    FlatRayHit hit = flat_raycast();
+    int id = flat_get_block(hit.bx, hit.by, hit.bz);
+    if (!hit.hit || id == 0) return;
+
+    float e = 0.002f;
+    BlockBounds b = block_bounds_for_selection(id, hit.bx, hit.by, hit.bz);
+    float x0 = b.x0 - e, y0 = b.y0 - e, z0 = b.z0 - e;
+    float x1 = b.x1 + e, y1 = b.y1 + e, z1 = b.z1 + e;
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_TEXTURE_2D);
+    glDepthMask(GL_FALSE);
+    glLineWidth(2.0f);
+    glColor4f(0.0f, 0.0f, 0.0f, 0.45f);
+
+    glBegin(GL_LINE_STRIP);
+    glVertex3f(x0,y0,z0); glVertex3f(x1,y0,z0); glVertex3f(x1,y0,z1); glVertex3f(x0,y0,z1); glVertex3f(x0,y0,z0);
+    glEnd();
+
+    glBegin(GL_LINE_STRIP);
+    glVertex3f(x0,y1,z0); glVertex3f(x1,y1,z0); glVertex3f(x1,y1,z1); glVertex3f(x0,y1,z1); glVertex3f(x0,y1,z0);
+    glEnd();
+
+    glBegin(GL_LINES);
+    glVertex3f(x0,y0,z0); glVertex3f(x0,y1,z0);
+    glVertex3f(x1,y0,z0); glVertex3f(x1,y1,z0);
+    glVertex3f(x1,y0,z1); glVertex3f(x1,y1,z1);
+    glVertex3f(x0,y0,z1); glVertex3f(x0,y1,z1);
+    glEnd();
+
+    glLineWidth(1.0f);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_TEXTURE_2D);
+    glColor4f(1,1,1,1);
+}
+
+static int block_occludes_render_face(int id) {
+    if (id == 0) return 0;
+    if (block_is_liquid(id)) return flat_separate_liquid_pass_enabled() ? 0 : 1;
+    if (id == BLOCK_CHEST) return 0; /* chest model is smaller than a full cube; never cull neighboring faces behind it */
+    if (id == BLOCK_SLAB || id == BLOCK_WOOD_STAIRS || id == BLOCK_COBBLE_STAIRS ||
+        id == BLOCK_BRICK_STAIRS || id == BLOCK_STONE_BRICK_STAIRS || id == BLOCK_NETHER_BRICK_STAIRS ||
+        id == BLOCK_FENCE || id == BLOCK_NETHER_BRICK_FENCE || id == BLOCK_GLASS_PANE ||
+        id == BLOCK_IRON_BARS || id == BLOCK_CACTUS || block_is_door_id(id) ||
+        id == BLOCK_LADDER || id == BLOCK_RAILS || id == BLOCK_POWERED_RAIL || id == BLOCK_DETECTOR_RAIL ||
+        id == BLOCK_STONE_PRESSURE_PLATE || id == BLOCK_WOOD_PRESSURE_PLATE || id == BLOCK_STONE_BUTTON ||
+        id == BLOCK_LEVER || id == BLOCK_TORCH || id == BLOCK_REDSTONE_TORCH_OFF || id == BLOCK_REDSTONE_TORCH_ON ||
+        id == BLOCK_WEB || id == BLOCK_LILY_PAD || id == BLOCK_END_PORTAL || id == BLOCK_END_PORTAL_FRAME || id == BLOCK_PORTAL) return 0;
+    if (id == BLOCK_LEAVES) return flat_fancy_cutout_terrain_enabled() ? 0 : 1;
+    if (id == BLOCK_GLASS || id == BLOCK_SAPLING ||
+        id == BLOCK_YELLOW_FLOWER || id == BLOCK_RED_ROSE ||
+        id == BLOCK_BROWN_MUSHROOM || id == BLOCK_RED_MUSHROOM ||
+        id == BLOCK_TORCH || id == BLOCK_FIRE || id == BLOCK_REDSTONE_WIRE ||
+        id == BLOCK_REDSTONE_TORCH_OFF || id == BLOCK_REDSTONE_TORCH_ON ||
+        id == BLOCK_REEDS || id == BLOCK_TALL_GRASS || id == BLOCK_DEAD_BUSH ||
+        id == BLOCK_VINE || id == BLOCK_NETHER_WART || id == BLOCK_SNOW_LAYER) return 0;
+    return 1;
+}
+
+static int neighbor_for_face(int x, int y, int z, int face) {
+    if (face == 0) return (y <= FLAT_WORLD_Y_MIN) ? BLOCK_BEDROCK : flat_get_block(x, y - 1, z);
+    if (face == 1) return flat_get_block(x, y + 1, z);
+    if (face == 2) return flat_get_block(x, y, z - 1);
+    if (face == 3) return flat_get_block(x, y, z + 1);
+    if (face == 4) return flat_get_block(x - 1, y, z);
+    if (face == 5) return flat_get_block(x + 1, y, z);
+    return BLOCK_BEDROCK;
+}
+
+static int block_uses_cross_plant_model(int id) {
+    return id == BLOCK_SAPLING || id == BLOCK_YELLOW_FLOWER || id == BLOCK_RED_ROSE ||
+           id == BLOCK_BROWN_MUSHROOM || id == BLOCK_RED_MUSHROOM ||
+           id == BLOCK_REEDS || id == BLOCK_TALL_GRASS || id == BLOCK_DEAD_BUSH ||
+           id == BLOCK_NETHER_WART || id == BLOCK_FIRE || id == BLOCK_REDSTONE_WIRE ||
+           id == BLOCK_CROPS || id == BLOCK_PUMPKIN_STEM || id == BLOCK_MELON_STEM;
+}
+
+static int cross_plant_tile_for_block_meta(int id, int meta) {
+    if (id == BLOCK_YELLOW_FLOWER) return 13;
+    if (id == BLOCK_RED_ROSE) return 12;
+    if (id == BLOCK_SAPLING) { meta &= 3; return meta == 1 ? 63 : (meta == 2 ? 79 : (meta == 3 ? 30 : 15)); }
+    if (id == BLOCK_BROWN_MUSHROOM) return 29;
+    if (id == BLOCK_RED_MUSHROOM) return 28;
+    if (id == BLOCK_REEDS) return 73;
+    if (id == BLOCK_TALL_GRASS) return meta == 1 ? 39 : (meta == 2 ? 56 : 55);
+    if (id == BLOCK_DEAD_BUSH) return 55;
+    if (id == BLOCK_NETHER_WART) return meta >= 3 ? 228 : (meta > 0 ? 227 : 226);
+    if (id == BLOCK_PUMPKIN_STEM || id == BLOCK_MELON_STEM) return 19;
+    if (id == BLOCK_FIRE) return 31;
+    if (id == BLOCK_REDSTONE_WIRE) return 84;
+    if (id == BLOCK_CROPS) return 88;
+    return 12;
+}
+static int cross_plant_tile_for_block(int id) { return cross_plant_tile_for_block_meta(id, 0); }
+
+static void emit_cross_plant_block_float(int id, float x, float y, float z) {
+    int bx = (int)floorf(x);
+    int by = (int)floorf(y);
+    int bz = (int)floorf(z);
+    world_style_set_pos(bx, by, bz);
+    g_world_light_x = bx;
+    g_world_light_y = by;
+    g_world_light_z = bz;
+
+    float u0, v0, u1, v1;
+    terrain_tile_uv(cross_plant_tile_for_block_meta(id, flat_get_meta(bx, by, bz)), &u0, &v0, &u1, &v1);
+    if (id == BLOCK_YELLOW_FLOWER || id == BLOCK_RED_ROSE || id == BLOCK_CROPS) {
+        /* The rose texture has empty pixels at the top of the tile.  Crop that
+           transparent cap for the world model so flowers do not look buried
+           low in the grass. */
+        float th = tex_terrain.h ? (float)tex_terrain.h : 256.0f;
+        v0 += 4.0f / th;
+    }
+
+    float x0 = x + 0.10f, x1 = x + 0.90f;
+    float y0 = y,       y1 = y + 1.00f;
+    float z0 = z + 0.10f, z1 = z + 0.90f;
+
+    /* Grass/fern textures in terrain.png are grayscale masks in this era;
+       Java tints them with the biome grass color at render time.  Without this
+       pass they show up as the gray "paper" plants visible in snowy/tundra
+       screenshots. */
+    if (id == BLOCK_TALL_GRASS) world_set_color_shade(java_grass_color_at(bx, bz), 1.0f);
+    else if (id == BLOCK_REEDS || id == BLOCK_SAPLING) world_set_color_shade(java_foliage_color_at(bx, bz), 1.0f);
+    else world_set_shade(1.0f);
+    world_tex_vertex(x0, y1, z0, u0, v0);
+    world_tex_vertex(x1, y1, z1, u1, v0);
+    world_tex_vertex(x1, y0, z1, u1, v1);
+    world_tex_vertex(x0, y0, z0, u0, v1);
+
+    world_tex_vertex(x1, y1, z0, u0, v0);
+    world_tex_vertex(x0, y1, z1, u1, v0);
+    world_tex_vertex(x0, y0, z1, u1, v1);
+    world_tex_vertex(x1, y0, z0, u0, v1);
+}
+
+static void emit_cross_plant_block(int id, int x, int y, int z) {
+    emit_cross_plant_block_float(id, (float)x, (float)y, (float)z);
+}
+
+static void draw_cross_plant_block(int id, float x, float y, float z) {
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.5f);
+    glBegin(GL_QUADS);
+    emit_cross_plant_block_float(id, x, y, z);
+    glEnd();
+    glDisable(GL_ALPHA_TEST);
+}
+
+static int flat_face_exposed_for_block(int id, int x, int y, int z, int face) {
+    if (face == 0 && y <= FLAT_WORLD_Y_MIN) return 0; /* bottom of bedrock never needs drawing */
+    int n = neighbor_for_face(x, y, z, face);
+
+    /* Java BlockLeavesBase:
+       - Fast leaves hide faces against the same block.
+       - Fancy leaves render through neighboring leaf blocks because leaves are
+         not opaque.  This renderer is two-sided on the terrain path, so keep
+         one canonical quad for each leaf/leaf boundary instead of two coplanar
+         quads.  That preserves the Java fancy-leaf visible interior without
+         z-fighting or texture overlap. */
+    if (id == BLOCK_LEAVES && n == BLOCK_LEAVES) {
+        if (!flat_fancy_cutout_terrain_enabled()) return 0;
+        return (face == 1 || face == 3 || face == 5);
+    }
+
+    /* BlockBreakable.shouldSideBeRendered() hides the shared face between
+       adjacent glass blocks.  Treating glass as merely non-occluding made every
+       block in a glass wall keep all six faces, including pairs of coplanar
+       internal quads.  Large windows therefore multiplied vertex work, alpha
+       testing, overdraw, and connected-texture neighbour checks. */
+    if (id == BLOCK_GLASS && n == BLOCK_GLASS) return 0;
+
+    /* A snow layer sits directly on the top face of the supporting block.
+       Rendering the covered grass/dirt/stone top doubles the visible-surface
+       cost across snowy biomes and creates unnecessary overdraw/z pressure.
+       Java batches snow through RenderBlocks' standard path; in this C port we
+       explicitly skip the hidden support top to keep snow fields cheap. */
+    if (face == 1 && n == BLOCK_SNOW_LAYER) return 0;
+
+    /* Liquids use their own occlusion rule.  Even in Fast graphics, do not draw
+       faces between water blocks; otherwise oceans become stacks of internal
+       opaque quads and look broken from underwater. */
+    if (block_is_liquid(id)) {
+        if (block_is_liquid(n)) return 0;
+        return !block_occludes_render_face(n);
+    }
+
+    /* Solid terrain touching water must keep its face.  In Fast graphics water
+       itself is opaque, but the player can stand inside it; if the terrain face
+       is culled, going underwater turns the water volume into an x-ray hole. */
+    if (block_is_liquid(n)) return 1;
+
+    return !block_occludes_render_face(n);
+}
+
+static int flat_face_exposed(int x, int y, int z, int face) {
+    return flat_face_exposed_for_block(flat_get_block(x, y, z), x, y, z, face);
+}
+
+static int liquid_face_exposed(int x, int y, int z, int face) {
+    int n = neighbor_for_face(x, y, z, face);
+    if (block_is_liquid(n)) return 0;
+    return !block_occludes_render_face(n);
+}
+
+static float world_face_base_shade(int face) {
+    if (face == 0) return 0.50f;
+    if (face == 2 || face == 3) return 0.80f;
+    if (face == 4 || face == 5) return 0.60f;
+    return 1.0f;
+}
+
+static int stivufine_lily_pad_color(void) {
+    if (stivufine_custom_colors_enabled() && stivufine_lilypad_color >= 0) return stivufine_lilypad_color;
+    return 0x208030; /* BlockLilyPad.getBlockColor() / colorMultiplier() in Java 1.2.5. */
+}
+
+static int world_face_tint_rgb(int id, int x, int y, int z, int face, int tile) {
+    if (id == BLOCK_GRASS) {
+        if (face == 1) return java_grass_color_at(x, z);
+        if (face >= 2 && face <= 5 && tile == 0) return java_grass_color_at(x, z);
+    }
+    if (id == BLOCK_LEAVES) return java_foliage_color_for_meta_at(x, z, flat_get_meta(x, y, z));
+    if (id == BLOCK_LILY_PAD) return stivufine_lily_pad_color();
+    return 0xFFFFFF;
+}
+
+static uint32_t world_ao_cell_mixed_brightness(int x, int y, int z) {
+    return (uint32_t)flat_pack_sky_block_light(x, y, z, 0);
+}
+
+static int world_ao_cell_is_normal_cube(int x, int y, int z) {
+    return block_occludes_render_face(flat_get_block(x, y, z));
+}
+
+static float world_ao_cell_value(int x, int y, int z, int *blocks_grass) {
+    int id = flat_get_block(x, y, z);
+    int can_block_grass = flat_block_can_block_grass_java(id);
+    if (blocks_grass) *blocks_grass = !can_block_grass;
+    return world_ao_cell_is_normal_cube(x, y, z) ? 0.2f : 1.0f;
+}
+
+static uint32_t world_ao_mix_brightness(uint32_t a, uint32_t b, uint32_t c, uint32_t fallback) {
+    if (a == 0) a = fallback;
+    if (b == 0) b = fallback;
+    if (c == 0) c = fallback;
+    return ((a + b + c + fallback) >> 2) & 0x00FF00FFu;
+}
+
+static int smooth_block_lighting_enabled(int id) {
+    return stivufine_smooth_lighting_enabled() &&
+           !g_force_fullbright_item_model &&
+           flat_block_light_value_for_id(id) == 0;
+}
+
+static void world_face_sample_frame(int face,
+                                    int *nx, int *ny, int *nz,
+                                    int *ax, int *ay, int *az,
+                                    int *bx, int *by, int *bz,
+                                    int corner_a[4], int corner_b[4]) {
+    *nx = *ny = *nz = 0;
+    *ax = *ay = *az = 0;
+    *bx = *by = *bz = 0;
+    if (face == 1) {
+        *ny = 1; *ax = 1; *bz = 1;
+        corner_a[0] = -1; corner_b[0] = -1;
+        corner_a[1] =  1; corner_b[1] = -1;
+        corner_a[2] =  1; corner_b[2] =  1;
+        corner_a[3] = -1; corner_b[3] =  1;
+    } else if (face == 0) {
+        *ny = -1; *ax = 1; *bz = 1;
+        corner_a[0] = -1; corner_b[0] =  1;
+        corner_a[1] =  1; corner_b[1] =  1;
+        corner_a[2] =  1; corner_b[2] = -1;
+        corner_a[3] = -1; corner_b[3] = -1;
+    } else if (face == 2) {
+        *nz = -1; *ax = 1; *by = 1;
+        corner_a[0] =  1; corner_b[0] =  1;
+        corner_a[1] = -1; corner_b[1] =  1;
+        corner_a[2] = -1; corner_b[2] = -1;
+        corner_a[3] =  1; corner_b[3] = -1;
+    } else if (face == 3) {
+        *nz = 1; *ax = 1; *by = 1;
+        corner_a[0] = -1; corner_b[0] =  1;
+        corner_a[1] =  1; corner_b[1] =  1;
+        corner_a[2] =  1; corner_b[2] = -1;
+        corner_a[3] = -1; corner_b[3] = -1;
+    } else if (face == 4) {
+        *nx = -1; *az = 1; *by = 1;
+        corner_a[0] = -1; corner_b[0] =  1;
+        corner_a[1] =  1; corner_b[1] =  1;
+        corner_a[2] =  1; corner_b[2] = -1;
+        corner_a[3] = -1; corner_b[3] = -1;
+    } else {
+        *nx = 1; *az = 1; *by = 1;
+        corner_a[0] =  1; corner_b[0] =  1;
+        corner_a[1] = -1; corner_b[1] =  1;
+        corner_a[2] = -1; corner_b[2] = -1;
+        corner_a[3] =  1; corner_b[3] = -1;
+    }
+}
+
+static void world_smooth_face_lights(int x, int y, int z, int face, float ao_out[4], uint32_t light_out[4]) {
+    int nx, ny, nz, ax, ay, az, bx, by, bz;
+    int corner_a[4], corner_b[4];
+    float ao_samples[3][3];
+    uint32_t light_samples[3][3];
+    int blocks_grass[3][3];
+    world_face_sample_frame(face, &nx, &ny, &nz, &ax, &ay, &az, &bx, &by, &bz, corner_a, corner_b);
+
+    int base_x = x + nx;
+    int base_y = y + ny;
+    int base_z = z + nz;
+    uint32_t fallback_light = world_ao_cell_mixed_brightness(base_x, base_y, base_z);
+    for (int ia = 0; ia < 3; ++ia) {
+        for (int ib = 0; ib < 3; ++ib) {
+            int da = ia - 1;
+            int db = ib - 1;
+            int sx = base_x + da * ax + db * bx;
+            int sy = base_y + da * ay + db * by;
+            int sz = base_z + da * az + db * bz;
+            ao_samples[ia][ib] = world_ao_cell_value(sx, sy, sz, &blocks_grass[ia][ib]);
+            light_samples[ia][ib] = world_ao_cell_mixed_brightness(sx, sy, sz);
+        }
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        int ia = corner_a[i] > 0 ? 2 : 0;
+        int ib = corner_b[i] > 0 ? 2 : 0;
+        /* RenderBlocks: only use the diagonal corner sample when at least one of
+           the two side cells is passable-to-grass.  If both side cells block
+           grass, reuse the side sample to avoid diagonal light leaking through
+           a solid corner. */
+        int use_side_diag = (blocks_grass[ia][1] && blocks_grass[1][ib]) ? 1 : 0;
+        float diag_ao = use_side_diag ? ao_samples[ia][1] : ao_samples[ia][ib];
+        uint32_t diag_light = use_side_diag ? light_samples[ia][1] : light_samples[ia][ib];
+        ao_out[i] = (ao_samples[1][1] + ao_samples[ia][1] + ao_samples[1][ib] + diag_ao) * 0.25f;
+        light_out[i] = world_ao_mix_brightness(diag_light, light_samples[ia][1], light_samples[1][ib], fallback_light);
+    }
+}
+
+static void world_tex_vertex_lit(float x, float y, float z, float u, float v,
+                                 int rgb, float face_shade, float ao, uint32_t packed_light) {
+    float r = ((rgb >> 16) & 255) / 255.0f;
+    float g = ((rgb >> 8) & 255) / 255.0f;
+    float b = (rgb & 255) / 255.0f;
+    float shade = face_shade * ao;
+    flat_direct_set_color_light4f(r * shade, g * shade, b * shade, 1.0f, packed_light);
+    world_tex_vertex(x, y, z, u, v);
+}
+
+static int block_texture_resolve(int block_id, int meta, int face) {
+    meta &= 15;
+    switch (block_id) {
+        case BLOCK_PLANKS:
+            switch (meta & 3) {
+                case BLOCK_META_WOOD_SPRUCE: return 198;
+                case BLOCK_META_WOOD_BIRCH: return 214;
+                case BLOCK_META_WOOD_JUNGLE: return 199;
+                default: return 4;
+            }
+        case BLOCK_LOG:
+            if (face == 0 || face == 1) return 21;
+            switch (meta & 3) {
+                case BLOCK_META_WOOD_SPRUCE: return 116;
+                case BLOCK_META_WOOD_BIRCH: return 117;
+                case BLOCK_META_WOOD_JUNGLE: return 153;
+                default: return 20;
+            }
+        case BLOCK_LEAVES: {
+            int base = flat_fancy_leaf_texture_enabled() ? 52 : 53;
+            int type = meta & 3;
+            if (type == BLOCK_META_WOOD_SPRUCE) return base + 80;
+            if (type == BLOCK_META_WOOD_JUNGLE) return base + 144;
+            return base;
+        }
+        case BLOCK_SAPLING: return cross_plant_tile_for_block_meta(block_id, meta);
+        case BLOCK_LAPIS_ORE: return 160;
+        case BLOCK_LAPIS_BLOCK: return 144;
+        case BLOCK_DISPENSER:
+            return (face == 0 || face == 1) ? 62 : (face == 3 ? 46 : 45);
+        case BLOCK_SANDSTONE:
+            if (face == 1) return 176;
+            if (face == 0) return (meta == BLOCK_META_SANDSTONE_CHISELED || meta == BLOCK_META_SANDSTONE_SMOOTH) ? 176 : 208;
+            if (meta == BLOCK_META_SANDSTONE_CHISELED) return 229;
+            if (meta == BLOCK_META_SANDSTONE_SMOOTH) return 230;
+            return 192;
+        case BLOCK_NOTE_BLOCK: return 75;
+        case BLOCK_BED:
+            if (face == 0) return 4;
+            return (meta & 8) ? 134 : 135;
+        case BLOCK_POWERED_RAIL: return ((meta & 7) >= 6) ? 163 : 179;
+        case BLOCK_DETECTOR_RAIL: return ((meta & 7) >= 6) ? 179 : 195;
+        case BLOCK_STICKY_PISTON:
+        case BLOCK_PISTON: {
+            int dir = meta & 7;
+            int front = (block_id == BLOCK_STICKY_PISTON) ? 106 : 107;
+            if (dir <= 5 && face == dir) return front;
+            if (dir <= 5 && face == (dir ^ 1)) return 109;
+            return 108;
+        }
+        case BLOCK_PISTON_EXTENSION:
+        case BLOCK_PISTON_MOVING:
+            return (face == (meta & 7)) ? (((meta & 8) != 0) ? 106 : 107) : 108;
+        case BLOCK_WEB: return 11;
+        case BLOCK_TALL_GRASS:
+        case BLOCK_DEAD_BUSH:
+        case BLOCK_NETHER_WART:
+        case BLOCK_CROPS:
+        case BLOCK_PUMPKIN_STEM:
+        case BLOCK_MELON_STEM:
+            return cross_plant_tile_for_block_meta(block_id, meta);
+        case BLOCK_WOOL: {
+            /* The release terrain atlas keeps plain white wool at tile 64
+               (column 0, the fifth row when rows are counted from one).
+               Colored cloth remains in the classic inverted dye strip. */
+            if (meta == 0) return 64;
+            int wm = (~meta) & 15;
+            return 113 + ((wm & 8) >> 3) + ((wm & 7) * 16);
+        }
+        case BLOCK_GOLD_BLOCK: return 23;
+        case BLOCK_IRON_BLOCK: return 22;
+        case BLOCK_DIAMOND_BLOCK: return 24;
+        case BLOCK_REDSTONE_WIRE: return 164;
+        case BLOCK_FARMLAND: return (face == 1) ? ((meta > 0) ? 86 : 87) : 2;
+        case BLOCK_SLAB:
+        case BLOCK_DOUBLE_SLAB: {
+            int type = meta & 7;
+            if (type == 0) return (face <= 1) ? 6 : 5;
+            if (type == 1) return (face == 0) ? 208 : (face == 1 ? 176 : 192);
+            if (type == 2) return 4;
+            if (type == 3) return 16;
+            if (type == 4) return 7;
+            if (type == 5) return 54;
+            return 6;
+        }
+        case BLOCK_CAKE:
+            return face == 1 ? 121 : (face == 0 ? 124 : ((meta > 0 && face == 4) ? 123 : 122));
+        case BLOCK_REDSTONE_REPEATER_OFF:
+            return face == 1 ? 131 : (face == 0 ? 115 : 5);
+        case BLOCK_REDSTONE_REPEATER_ON:
+            return face == 1 ? 147 : (face == 0 ? 99 : 5);
+        case BLOCK_LOCKED_CHEST:
+            return (face == 0 || face == 1) ? chest_top_tile() : (face == 3 ? chest_front_tile() : chest_side_tile());
+        case BLOCK_TRAPDOOR: return 84;
+        case BLOCK_SILVERFISH:
+            return meta == 1 ? 16 : (meta == 2 ? 54 : 1);
+        case BLOCK_STONE_BRICK:
+            if (meta == BLOCK_META_STONE_BRICK_MOSSY) return 100;
+            if (meta == BLOCK_META_STONE_BRICK_CRACKED) return 101;
+            if (meta == BLOCK_META_STONE_BRICK_CHISELED) return 213;
+            return 54;
+        case BLOCK_BROWN_MUSHROOM_CAP:
+            return (meta == 10 && face > 1) ? 141 : (meta ? 126 : 142);
+        case BLOCK_RED_MUSHROOM_CAP:
+            return (meta == 10 && face > 1) ? 141 : (meta ? 125 : 142);
+        case BLOCK_IRON_BARS: return 85;
+        case BLOCK_GLASS_PANE: return 49;
+        case BLOCK_MELON: return (face == 1 || face == 0) ? 137 : 136;
+        case BLOCK_VINE: return 143;
+        case BLOCK_FENCE_GATE: return 4;
+        case BLOCK_BRICK_STAIRS: return 7;
+        case BLOCK_STONE_BRICK_STAIRS: return 54;
+        case BLOCK_MYCELIUM: return face == 1 ? 78 : (face == 0 ? 2 : 77);
+        case BLOCK_LILY_PAD: return 76;
+        case BLOCK_NETHER_BRICK:
+        case BLOCK_NETHER_BRICK_FENCE:
+        case BLOCK_NETHER_BRICK_STAIRS: return 224;
+        case BLOCK_ENCHANTMENT_TABLE: return face == 0 ? 183 : (face == 1 ? 166 : 182);
+        case BLOCK_BREWING_STAND: return 157;
+        case BLOCK_CAULDRON: return face == 1 ? 138 : (face == 0 ? 155 : 154);
+        case BLOCK_END_PORTAL: return 15;
+        case BLOCK_END_PORTAL_FRAME: return face == 1 ? 158 : (face == 0 ? 175 : 159);
+        case BLOCK_END_STONE: return 175;
+        case BLOCK_DRAGON_EGG: return 167;
+        case BLOCK_REDSTONE_LAMP_OFF: return 211;
+        case BLOCK_REDSTONE_LAMP_ON: return 212;
+        default: return -1;
+    }
+}
+
+
+
+static void world_face_style(int id, int face, int *tile);
+
+static int stivufine_ctm_rule_metadata_matches(const StivuFineCtmRule *r, int meta) {
+    if (!r || r->metadata_count <= 0) return 1;
+    for (int i = 0; i < r->metadata_count; ++i) if (r->metadata[i] == (meta & 15)) return 1;
+    return 0;
+}
+
+static int stivufine_ctm_neighbour(const StivuFineCtmRule *r, int x, int y, int z,
+                                    int block_id, int face, int base_tile) {
+    int nid = flat_get_block(x, y, z);
+    if (r->connect == 1) return nid == block_id;
+    if (r->connect == 2) {
+        if (nid <= 0) return 0;
+        int nt = block_texture_resolve(nid, flat_get_meta(x, y, z), face);
+        if (nt < 0) {
+            int dummy = 2;
+            world_face_style(nid, face, &dummy);
+            nt = dummy;
+        }
+        return nt == base_tile;
+    }
+    return 0;
+}
+
+static int stivufine_ctm_index_cardinal(const StivuFineCtmRule *r, int x, int y, int z,
+                                         int block_id, int face, int tile, int fancy) {
+    int b[4] = {0,0,0,0};
+    if (face == 0 || face == 1) {
+        b[0] = stivufine_ctm_neighbour(r,x-1,y,z,block_id,face,tile);
+        b[1] = stivufine_ctm_neighbour(r,x+1,y,z,block_id,face,tile);
+        b[2] = stivufine_ctm_neighbour(r,x,y,z+1,block_id,face,tile);
+        b[3] = stivufine_ctm_neighbour(r,x,y,z-1,block_id,face,tile);
+    } else if (face == 2) {
+        b[0] = stivufine_ctm_neighbour(r,x+1,y,z,block_id,face,tile);
+        b[1] = stivufine_ctm_neighbour(r,x-1,y,z,block_id,face,tile);
+        b[2] = stivufine_ctm_neighbour(r,x,y-1,z,block_id,face,tile);
+        b[3] = stivufine_ctm_neighbour(r,x,y+1,z,block_id,face,tile);
+    } else if (face == 3) {
+        b[0] = stivufine_ctm_neighbour(r,x-1,y,z,block_id,face,tile);
+        b[1] = stivufine_ctm_neighbour(r,x+1,y,z,block_id,face,tile);
+        b[2] = stivufine_ctm_neighbour(r,x,y-1,z,block_id,face,tile);
+        b[3] = stivufine_ctm_neighbour(r,x,y+1,z,block_id,face,tile);
+    } else if (face == 4) {
+        b[0] = stivufine_ctm_neighbour(r,x,y,z-1,block_id,face,tile);
+        b[1] = stivufine_ctm_neighbour(r,x,y,z+1,block_id,face,tile);
+        b[2] = stivufine_ctm_neighbour(r,x,y-1,z,block_id,face,tile);
+        b[3] = stivufine_ctm_neighbour(r,x,y+1,z,block_id,face,tile);
+    } else {
+        b[0] = stivufine_ctm_neighbour(r,x,y,z+1,block_id,face,tile);
+        b[1] = stivufine_ctm_neighbour(r,x,y,z-1,block_id,face,tile);
+        b[2] = stivufine_ctm_neighbour(r,x,y-1,z,block_id,face,tile);
+        b[3] = stivufine_ctm_neighbour(r,x,y+1,z,block_id,face,tile);
+    }
+    int index = 0;
+    if (b[0] && !b[1] && !b[2] && !b[3]) index=3;
+    else if (!b[0] && b[1] && !b[2] && !b[3]) index=1;
+    else if (!b[0] && !b[1] && b[2] && !b[3]) index=12;
+    else if (!b[0] && !b[1] && !b[2] && b[3]) index=36;
+    else if (b[0] && b[1] && !b[2] && !b[3]) index=2;
+    else if (!b[0] && !b[1] && b[2] && b[3]) index=24;
+    else if (b[0] && !b[1] && b[2] && !b[3]) index=15;
+    else if (b[0] && !b[1] && !b[2] && b[3]) index=39;
+    else if (!b[0] && b[1] && b[2] && !b[3]) index=13;
+    else if (!b[0] && b[1] && !b[2] && b[3]) index=37;
+    else if (!b[0] && b[1] && b[2] && b[3]) index=25;
+    else if (b[0] && !b[1] && b[2] && b[3]) index=27;
+    else if (b[0] && b[1] && !b[2] && b[3]) index=38;
+    else if (b[0] && b[1] && b[2] && !b[3]) index=14;
+    else if (b[0] && b[1] && b[2] && b[3]) index=26;
+    if (!fancy) return index;
+
+    int e[4] = {0,0,0,0};
+    if (face==0||face==1) {
+        e[0]=!stivufine_ctm_neighbour(r,x+1,y,z+1,block_id,face,tile);
+        e[1]=!stivufine_ctm_neighbour(r,x-1,y,z+1,block_id,face,tile);
+        e[2]=!stivufine_ctm_neighbour(r,x+1,y,z-1,block_id,face,tile);
+        e[3]=!stivufine_ctm_neighbour(r,x-1,y,z-1,block_id,face,tile);
+    } else if(face==2) {
+        e[0]=!stivufine_ctm_neighbour(r,x-1,y-1,z,block_id,face,tile);
+        e[1]=!stivufine_ctm_neighbour(r,x+1,y-1,z,block_id,face,tile);
+        e[2]=!stivufine_ctm_neighbour(r,x-1,y+1,z,block_id,face,tile);
+        e[3]=!stivufine_ctm_neighbour(r,x+1,y+1,z,block_id,face,tile);
+    } else if(face==3) {
+        e[0]=!stivufine_ctm_neighbour(r,x+1,y-1,z,block_id,face,tile);
+        e[1]=!stivufine_ctm_neighbour(r,x-1,y-1,z,block_id,face,tile);
+        e[2]=!stivufine_ctm_neighbour(r,x+1,y+1,z,block_id,face,tile);
+        e[3]=!stivufine_ctm_neighbour(r,x-1,y+1,z,block_id,face,tile);
+    } else if(face==4) {
+        e[0]=!stivufine_ctm_neighbour(r,x,y-1,z+1,block_id,face,tile);
+        e[1]=!stivufine_ctm_neighbour(r,x,y-1,z-1,block_id,face,tile);
+        e[2]=!stivufine_ctm_neighbour(r,x,y+1,z+1,block_id,face,tile);
+        e[3]=!stivufine_ctm_neighbour(r,x,y+1,z-1,block_id,face,tile);
+    } else {
+        e[0]=!stivufine_ctm_neighbour(r,x,y-1,z-1,block_id,face,tile);
+        e[1]=!stivufine_ctm_neighbour(r,x,y-1,z+1,block_id,face,tile);
+        e[2]=!stivufine_ctm_neighbour(r,x,y+1,z-1,block_id,face,tile);
+        e[3]=!stivufine_ctm_neighbour(r,x,y+1,z+1,block_id,face,tile);
+    }
+    if(index==13&&e[0])index=4;if(index==15&&e[1])index=5;if(index==37&&e[2])index=16;if(index==39&&e[3])index=17;
+    if(index==14&&e[0]&&e[1])index=7;if(index==25&&e[0]&&e[2])index=6;if(index==27&&e[3]&&e[1])index=19;if(index==38&&e[3]&&e[2])index=18;
+    if(index==14&&!e[0]&&e[1])index=31;if(index==25&&e[0]&&!e[2])index=30;if(index==27&&!e[3]&&e[1])index=41;if(index==38&&e[3]&&!e[2])index=40;
+    if(index==14&&e[0]&&!e[1])index=29;if(index==25&&!e[0]&&e[2])index=28;if(index==27&&e[3]&&!e[1])index=43;if(index==38&&!e[3]&&e[2])index=42;
+    if(index==26&&e[0]&&e[1]&&e[2]&&e[3])index=46;
+    if(index==26&&!e[0]&&e[1]&&e[2]&&e[3])index=9;
+    if(index==26&&e[0]&&!e[1]&&e[2]&&e[3])index=21;
+    if(index==26&&e[0]&&e[1]&&!e[2]&&e[3])index=8;
+    if(index==26&&e[0]&&e[1]&&e[2]&&!e[3])index=20;
+    if(index==26&&e[0]&&e[1]&&!e[2]&&!e[3])index=11;
+    if(index==26&&!e[0]&&!e[1]&&e[2]&&e[3])index=22;
+    if(index==26&&!e[0]&&e[1]&&!e[2]&&e[3])index=23;
+    if(index==26&&e[0]&&!e[1]&&e[2]&&!e[3])index=10;
+    if(index==26&&e[0]&&!e[1]&&!e[2]&&e[3])index=34;
+    if(index==26&&!e[0]&&e[1]&&e[2]&&!e[3])index=35;
+    if(index==26&&e[0]&&!e[1]&&!e[2]&&!e[3])index=32;
+    if(index==26&&!e[0]&&e[1]&&!e[2]&&!e[3])index=33;
+    if(index==26&&!e[0]&&!e[1]&&!e[2]&&e[3])index=44;
+    if(index==26&&!e[0]&&!e[1]&&e[2]&&!e[3])index=45;
+    return index;
+}
+
+static int stivufine_connected_texture_tile(int block_id,int x,int y,int z,int face,int base_tile) {
+    int mode=stivufine_connected_textures_mode();
+    if(mode==SF_OFF||base_tile<0||g_force_fullbright_item_model>0)return base_tile;
+    int meta=flat_get_meta(x,y,z);
+    for(int ri=0;ri<stivufine_ctm_rule_count;++ri){
+        const StivuFineCtmRule *r=&stivufine_ctm_rules[ri];
+        if((r->faces&(1<<face))==0||!stivufine_ctm_rule_metadata_matches(r,meta))continue;
+        if(r->target_kind==1&&r->target!=block_id)continue;
+        if(r->target_kind==2&&r->target!=base_tile)continue;
+        int idx=-1;
+        if(r->method==1) idx=stivufine_ctm_index_cardinal(r,x,y,z,block_id,face,base_tile,mode==SF_FANCY);
+        else if(r->method==2||r->method==6){
+            if(face==0||face==1)continue; int a=0,b=0;
+            if(r->method==6){a=stivufine_ctm_neighbour(r,x,y-1,z,block_id,face,base_tile);b=stivufine_ctm_neighbour(r,x,y+1,z,block_id,face,base_tile);}
+            else if(face==2){a=stivufine_ctm_neighbour(r,x+1,y,z,block_id,face,base_tile);b=stivufine_ctm_neighbour(r,x-1,y,z,block_id,face,base_tile);}
+            else if(face==3){a=stivufine_ctm_neighbour(r,x-1,y,z,block_id,face,base_tile);b=stivufine_ctm_neighbour(r,x+1,y,z,block_id,face,base_tile);}
+            else if(face==4){a=stivufine_ctm_neighbour(r,x,y,z-1,block_id,face,base_tile);b=stivufine_ctm_neighbour(r,x,y,z+1,block_id,face,base_tile);}
+            else {a=stivufine_ctm_neighbour(r,x,y,z+1,block_id,face,base_tile);b=stivufine_ctm_neighbour(r,x,y,z-1,block_id,face,base_tile);}
+            idx=a?(b?1:2):(b?0:3);
+        } else if(r->method==3){if(face==0||face==1)continue;if(!stivufine_ctm_neighbour(r,x,y+1,z,block_id,face,base_tile))continue;idx=0;}
+        else if(r->method==4){/* C6 computes a symmetry-adjusted local but passes the original face to Config.getRandom. */int rr=stivufine_coord_random(x,y,z,face)&0x7fffffff;if(r->weight_count&&r->weight_sum>0){int w=rr%r->weight_sum,sum=0;for(int i=0;i<r->tile_count;++i){sum+=r->weights[i];if(w<sum){idx=i;break;}}}else idx=rr%r->tile_count;}
+        else if(r->method==5){int nx=0,ny=0;if(face<=1){nx=x;ny=z;}else if(face==2){nx=-x-1;ny=-y;}else if(face==3){nx=x;ny=-y;}else if(face==4){nx=z;ny=-y;}else{nx=-z-1;ny=-y;}nx%=r->width;ny%=r->height;if(nx<0)nx+=r->width;if(ny<0)ny+=r->height;idx=ny*r->width+nx;}
+        if(idx>=0&&idx<r->tile_count)return r->source_slot*256+r->tiles[idx];
+    }
+    return base_tile;
+}
+
+static void stivufine_natural_uv(int tile,int x,int y,int z,int face,float u0,float v0,float u1,float v1,float uv[8]) {
+    int rot=0,flip=0;
+    if(stivufine_natural_textures_enabled()&&g_force_fullbright_item_model<=0&&tile>=0){int slot=tile/256,local=tile&255;if(slot>=0&&slot<=SF_CTM_MAX_SOURCES){int n=stivufine_coord_random(x,y,z,face);int maxr=stivufine_natural_rotation[slot][local];if(maxr>1){rot=n&3;if(maxr==2)rot=(rot/2)*3;}if(stivufine_natural_flip[slot][local])flip=(n&4)!=0;}}
+    float lu[4]={0,1,1,0},lv[4]={0,0,1,1};
+    for(int i=0;i<4;++i){float a=lu[i],b=lv[i];for(int r=0;r<rot;++r){float t=a;a=1.0f-b;b=t;}if(flip)a=1.0f-a;uv[i*2]=u0+(u1-u0)*a;uv[i*2+1]=v0+(v1-v0)*b;}
+}
+
+static void world_face_style(int id, int face, int *tile) {
+    float shade = world_face_base_shade(face);
+
+    if (id == BLOCK_GRASS) {
+        if (face == 1) { *tile = 0; world_set_color_shade(java_grass_color_at(g_world_style_x, g_world_style_z), shade); return; }
+        if (face == 0) { *tile = 2; world_set_shade(shade); return; }
+        *tile = 3; world_set_shade(shade); return;
+    }
+
+    if (id == BLOCK_WATER || id == BLOCK_STILL_WATER) {
+        *tile = (face == 0 || face == 1) ? water_top_tile() : water_side_tile();
+        world_set_color_shade(java_water_color_at(g_world_style_x, g_world_style_z), shade);
+        return;
+    }
+
+    if (id == BLOCK_LAVA || id == BLOCK_STILL_LAVA) {
+        *tile = (face == 0 || face == 1) ? lava_top_tile() : lava_side_tile();
+        world_set_shade(shade);
+        return;
+    }
+
+    if (id == BLOCK_STONE) {
+        *tile = 1;
+        world_set_shade(shade);
+        return;
+    }
+
+    if (id == BLOCK_DIRT) {
+        *tile = 2;
+        world_set_shade(shade);
+        return;
+    }
+
+    if (id == BLOCK_COBBLESTONE) {
+        *tile = 16;
+        world_set_shade(shade);
+        return;
+    }
+
+    if (id == BLOCK_BEDROCK) {
+        *tile = 17;
+        world_set_shade(shade);
+        return;
+    }
+
+    if (id == BLOCK_PLANKS) {
+        *tile = 4;
+        world_set_shade(shade);
+        return;
+    }
+
+    if (id == BLOCK_LOG) {
+        /* Classic terrain layout: 20 = log side, 21 = log top/end. */
+        *tile = (face == 0 || face == 1) ? 21 : 20;
+        world_set_shade(shade);
+        return;
+    }
+
+    if (id == BLOCK_CRAFTING_TABLE) {
+        /* 43 = top, 60 = front-ish side, 59 = other sides, 4 = bottom/planks. */
+        if (face == 1) *tile = 43;
+        else if (face == 0) *tile = 4;
+        else if (face == 2 || face == 4) *tile = 60;
+        else *tile = 59;
+        world_set_shade(shade);
+        return;
+    }
+
+    if (id == BLOCK_CHEST) {
+        if (face == 1 || face == 0) *tile = chest_top_tile();
+        else if (face == 3) *tile = chest_front_tile();
+        else *tile = chest_side_tile();
+        world_set_shade(shade);
+        return;
+    }
+
+    if (id == BLOCK_FURNACE || id == BLOCK_FURNACE_LIT) {
+        if (face == 1 || face == 0) *tile = furnace_top_tile();
+        else if (face == 3) *tile = (id == BLOCK_FURNACE_LIT) ? furnace_front_lit_tile() : furnace_front_tile();
+        else *tile = furnace_side_tile();
+        world_set_shade(shade);
+        return;
+    }
+
+
+    if (id == BLOCK_SAND) { *tile = 18; world_set_shade(shade); return; }
+    if (id == BLOCK_GRAVEL) { *tile = 19; world_set_shade(shade); return; }
+    if (id == BLOCK_GOLD_ORE) { *tile = 32; world_set_shade(shade); return; }
+    if (id == BLOCK_IRON_ORE) { *tile = 33; world_set_shade(shade); return; }
+    if (id == BLOCK_COAL_ORE) { *tile = 34; world_set_shade(shade); return; }
+    if (id == BLOCK_OBSIDIAN) { *tile = 37; world_set_shade(shade); return; }
+    if (id == BLOCK_DIAMOND_ORE) { *tile = 50; world_set_shade(shade); return; }
+    if (id == BLOCK_REDSTONE_ORE || id == BLOCK_REDSTONE_ORE_GLOWING) { *tile = 51; world_set_shade(shade); return; }
+    if (id == BLOCK_LAPIS_ORE) { *tile = 38; world_set_shade(shade); return; }
+    if (id == BLOCK_LAPIS_BLOCK) { *tile = 39; world_set_shade(shade); return; }
+    if (id == BLOCK_GOLD_BLOCK) { *tile = 39; world_set_shade(shade); return; }
+    if (id == BLOCK_IRON_BLOCK) { *tile = 38; world_set_shade(shade); return; }
+    if (id == BLOCK_DIAMOND_BLOCK) { *tile = 40; world_set_shade(shade); return; }
+    if (id == BLOCK_BRICK) { *tile = 7; world_set_shade(shade); return; }
+    if (id == BLOCK_TNT) { *tile = (face == 0 ? 10 : (face == 1 ? 9 : 8)); world_set_shade(shade); return; }
+    if (id == BLOCK_GLASS) { *tile = 49; world_set_shade(shade); return; }
+    if (id == BLOCK_BOOKSHELF) { *tile = 35; world_set_shade(shade); return; }
+    if (id == BLOCK_MOSSY_COBBLESTONE) { *tile = 36; world_set_shade(shade); return; }
+    if (id == BLOCK_LEAVES) {
+        /* BlockLeaves.setGraphicsLevel(): Fancy/minimal-Fancy terrain uses base
+           texture 52; the legacy opaque Fast path uses texture 53. */
+        *tile = flat_fancy_leaf_texture_enabled() ? 52 : 53;
+        world_set_color_shade(java_foliage_color_for_meta_at(g_world_style_x, g_world_style_z, flat_get_meta(g_world_style_x, g_world_style_y, g_world_style_z)), shade);
+        return;
+    }
+    if (id == BLOCK_SPONGE) { *tile = 48; world_set_shade(shade); return; }
+    if (id == BLOCK_WOOL) { *tile = 64; world_set_shade(shade); return; }
+    if (id == BLOCK_SNOW_BLOCK) { *tile = 66; world_set_shade(shade); return; }
+    if (id == BLOCK_ICE) { *tile = 67; world_set_shade(shade); return; }
+    if (id == BLOCK_CLAY) { *tile = 72; world_set_shade(shade); return; }
+    if (id == BLOCK_NETHERRACK) { *tile = 103; world_set_shade(shade); return; }
+    if (id == BLOCK_SOUL_SAND) { *tile = 104; world_set_shade(shade); return; }
+    if (id == BLOCK_GLOWSTONE) { *tile = 105; world_set_shade(shade); return; }
+    if (id == BLOCK_SANDSTONE) { *tile = (face == 1 ? 176 : (face == 0 ? 208 : 192)); world_set_shade(shade); return; }
+    if (id == BLOCK_STONE_BRICK || id == BLOCK_STONE_BRICK_STAIRS) { *tile = 54; world_set_shade(shade); return; }
+    if (id == BLOCK_NETHER_BRICK || id == BLOCK_NETHER_BRICK_FENCE || id == BLOCK_NETHER_BRICK_STAIRS) { *tile = 224; world_set_shade(shade); return; }
+    if (id == BLOCK_END_STONE) { *tile = 175; world_set_shade(shade); return; }
+    if (id == BLOCK_SAPLING) { *tile = 15; world_set_shade(shade); return; }
+    if (id == BLOCK_FARMLAND) { *tile = (face == 1) ? 87 : 2; world_set_shade(shade); return; }
+    if (id == BLOCK_CROPS) { *tile = 88; world_set_shade(shade); return; }
+    if (id == BLOCK_SNOW_LAYER) { *tile = 66; world_set_shade(shade); return; }
+    if (id == BLOCK_SIGN_POST || id == BLOCK_WALL_SIGN) { *tile = 4; world_set_shade(shade); return; }
+    if (id == BLOCK_DOUBLE_SLAB || id == BLOCK_SLAB) { *tile = (face == 0 || face == 1) ? 6 : 5; world_set_shade(shade); return; }
+    if (id == BLOCK_TORCH) { *tile = 80; world_set_shade(shade); return; }
+    if (id == BLOCK_FIRE) { *tile = 31; world_set_shade(shade); return; }
+    if (id == BLOCK_MOB_SPAWNER) { *tile = 65; world_set_shade(shade); return; }
+    if (id == BLOCK_REDSTONE_WIRE) { *tile = 84; world_set_shade(shade); return; }
+    if (id == BLOCK_WOOD_STAIRS || id == BLOCK_WOOD_PRESSURE_PLATE || id == BLOCK_FENCE_GATE) { *tile = 4; world_set_shade(shade); return; }
+    if (id == BLOCK_BRICK_STAIRS) { *tile = 7; world_set_shade(shade); return; }
+    if (id == BLOCK_RAILS) { *tile = 128; world_set_shade(shade); return; }
+    if (id == BLOCK_COBBLE_STAIRS) { *tile = 16; world_set_shade(shade); return; }
+    if (id == BLOCK_LADDER) { *tile = 83; world_set_shade(shade); return; }
+    if (id == BLOCK_LEVER) { *tile = 96; world_set_shade(shade); return; }
+    if (id == BLOCK_STONE_PRESSURE_PLATE || id == BLOCK_STONE_BUTTON) { *tile = 1; world_set_shade(shade); return; }
+    if (id == BLOCK_WOOD_DOOR) { *tile = 97; world_set_shade(shade); return; }
+    if (id == BLOCK_IRON_DOOR) { *tile = 98; world_set_shade(shade); return; }
+    if (id == BLOCK_REDSTONE_TORCH_OFF) { *tile = 115; world_set_shade(shade); return; }
+    if (id == BLOCK_REDSTONE_TORCH_ON) { *tile = 99; world_set_shade(shade); return; }
+    if (id == BLOCK_CACTUS) { *tile = (face == 1 ? 69 : (face == 0 ? 71 : 70)); world_set_shade(shade); return; }
+    if (id == BLOCK_REEDS) { *tile = 73; world_set_shade(shade); return; }
+    if (id == BLOCK_JUKEBOX) { *tile = (face == 1 ? 75 : 74); world_set_shade(shade); return; }
+    if (id == BLOCK_FENCE) { *tile = 4; world_set_shade(shade); return; }
+    if (id == BLOCK_PUMPKIN || id == BLOCK_JACK_O_LANTERN) { *tile = (face == 1 || face == 0) ? 102 : (face == 3 ? 119 : 118); world_set_shade(shade); return; }
+    if (id == BLOCK_PORTAL) { *tile = 14; world_set_shade(shade); return; }
+
+    *tile = 2;
+    world_set_shade(shade);
+}
+
+static int stivufine_side_grass_texture(int x, int y, int z, int face, int tile_num);
+static int stivufine_side_snow_grass_texture(int x, int y, int z, int face);
+
+static void world_face_style_at(int id, int x, int y, int z, int face, int *tile) {
+    world_style_set_pos(x, y, z);
+    world_light_set_pos_for_face(x, y, z, face);
+    /* BlockGrass.getBlockTexture(): when snow/snow block is above grass, side
+       faces use tile 68 instead of the normal grass-side tile 3.  This is only
+       a visual overlay choice; the block underneath remains grass. */
+    if (id == BLOCK_GRASS && face >= 2 && face <= 5) {
+        int above = flat_get_block(x, y + 1, z);
+        float shade = (face == 2 || face == 3) ? 0.80f : 0.60f;
+        if (above == BLOCK_SNOW_LAYER || above == BLOCK_SNOW_BLOCK) {
+            *tile = stivufine_side_snow_grass_texture(x, y, z, face);
+            world_set_shade(shade);
+            return;
+        } else {
+            *tile = stivufine_side_grass_texture(x, y, z, face, 3);
+            if (*tile == 0) world_set_color_shade(java_grass_color_at(x, z), shade);
+            else world_set_shade(shade);
+            return;
+        }
+    }
+    if (id == BLOCK_MYCELIUM && face >= 2 && face <= 5) {
+        float shade = (face == 2 || face == 3) ? 0.80f : 0.60f;
+        *tile = stivufine_side_grass_texture(x, y, z, face, 77);
+        world_set_shade(shade);
+        return;
+    }
+    {
+        int meta = flat_get_meta(x, y, z);
+        int tile_idx = block_texture_resolve(id, meta, face);
+        if (tile_idx >= 0) {
+            float shade = world_face_base_shade(face);
+            *tile = tile_idx;
+            if (id == BLOCK_LEAVES) world_set_color_shade(java_foliage_color_for_meta_at(x, z, meta), shade);
+            else if (id == BLOCK_VINE) world_set_color_shade(java_foliage_color_at(x, z), shade);
+            else if (id == BLOCK_TALL_GRASS || id == BLOCK_MYCELIUM) world_set_color_shade(java_grass_color_at(x, z), shade);
+            else world_set_shade(shade);
+            return;
+        }
+    }
+    world_face_style(id, face, tile);
+}
+
+static int snow_layer_face_exposed(int x, int y, int z, int face) {
+    if (face == 0) return 0;
+    if (face == 1) return 1;
+    int n = neighbor_for_face(x, y, z, face);
+    if (n == BLOCK_SNOW_LAYER || n == BLOCK_SNOW_BLOCK) return 0;
+    return !block_occludes_render_face(n);
+}
+
+static void emit_snow_layer_face_float(float x, float y, float z, int face) {
+    const float h = 2.0f / 16.0f;
+    float x0 = x, x1 = x + 1.0f;
+    float y0 = y, y1 = y + h;
+    float z0 = z, z1 = z + 1.0f;
+    float u0, v0, u1, v1;
+    terrain_tile_uv(66, &u0, &v0, &u1, &v1);
+    if (face != 1) {
+        float th = tex_terrain.h ? (float)tex_terrain.h : 256.0f;
+        v1 = v0 + (2.0f / th);
+    }
+
+    if (face == 1) {
+        world_set_shade(1.0f);
+        world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y1, z1, u1, v1); world_tex_vertex(x0, y1, z1, u0, v1);
+    } else if (face == 2) {
+        world_set_shade(0.80f);
+        world_tex_vertex(x1, y1, z0, u0, v0); world_tex_vertex(x0, y1, z0, u1, v0); world_tex_vertex(x0, y0, z0, u1, v1); world_tex_vertex(x1, y0, z0, u0, v1);
+    } else if (face == 3) {
+        world_set_shade(0.80f);
+        world_tex_vertex(x0, y1, z1, u0, v0); world_tex_vertex(x1, y1, z1, u1, v0); world_tex_vertex(x1, y0, z1, u1, v1); world_tex_vertex(x0, y0, z1, u0, v1);
+    } else if (face == 4) {
+        world_set_shade(0.60f);
+        world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x0, y1, z1, u1, v0); world_tex_vertex(x0, y0, z1, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    } else if (face == 5) {
+        world_set_shade(0.60f);
+        world_tex_vertex(x1, y1, z1, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x1, y0, z1, u0, v1);
+    }
+}
+
+static void emit_snow_layer_block(int x, int y, int z) {
+    for (int face = 0; face < 6; face++) {
+        if (snow_layer_face_exposed(x, y, z, face)) emit_snow_layer_face_float((float)x, (float)y, (float)z, face);
+    }
+}
+
+static void draw_snow_layer_block(float x, float y, float z) {
+    glBegin(GL_QUADS);
+    for (int face = 1; face < 6; face++) emit_snow_layer_face_float(x, y, z, face);
+    glEnd();
+    glColor4f(1, 1, 1, 1);
+}
+
+
+/* StivuFine 1.2.5 Better Snow: visual-only fake Block.snow rendering around
+   selected non-cube render types.  The trigger is exactly the HD C6 rule:
+   one horizontal neighbour must be the snow layer block (ID 78), and the block
+   below must be an opaque cube.  Snow blocks (ID 80) do not trigger it. */
+static int stivufine_has_snow_neighbours(int x, int y, int z) {
+    if (!stivufine_better_snow_enabled()) return 0;
+    if (flat_get_block(x - 1, y, z) != BLOCK_SNOW_LAYER &&
+        flat_get_block(x + 1, y, z) != BLOCK_SNOW_LAYER &&
+        flat_get_block(x, y, z - 1) != BLOCK_SNOW_LAYER &&
+        flat_get_block(x, y, z + 1) != BLOCK_SNOW_LAYER) return 0;
+    return java_block_normal_cube_at(x, y - 1, z);
+}
+
+static int stivufine_better_snow_cross_target(int id) {
+    return id == BLOCK_SAPLING || id == BLOCK_YELLOW_FLOWER || id == BLOCK_RED_ROSE ||
+           id == BLOCK_BROWN_MUSHROOM || id == BLOCK_RED_MUSHROOM ||
+           id == BLOCK_REEDS || id == BLOCK_TALL_GRASS || id == BLOCK_DEAD_BUSH;
+}
+
+static int stivufine_better_snow_side_exposed(int x, int y, int z, int face) {
+    if (face == 1) return 1;
+    if (face == 0) return 0;
+    return !block_occludes_render_face(neighbor_for_face(x, y, z, face));
+}
+
+static void emit_better_snow_face_float(int x, int y, int z, float h, int face) {
+    float x0 = (float)x, x1 = (float)x + 1.0f;
+    float y0 = (float)y, y1 = (float)y + h;
+    float z0 = (float)z, z1 = (float)z + 1.0f;
+    float u0, v0, u1, v1;
+    terrain_tile_uv(66, &u0, &v0, &u1, &v1);
+    if (face != 1) {
+        float th = tex_terrain.h ? (float)tex_terrain.h : 256.0f;
+        v1 = v0 + (h * 16.0f / th);
+    }
+    world_style_set_pos(x, y, z);
+    world_light_set_pos_for_face(x, y, z, face);
+
+    if (face == 1) {
+        world_set_shade(1.0f);
+        world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y1, z1, u1, v1); world_tex_vertex(x0, y1, z1, u0, v1);
+    } else if (face == 2) {
+        world_set_shade(0.80f);
+        world_tex_vertex(x1, y1, z0, u0, v0); world_tex_vertex(x0, y1, z0, u1, v0); world_tex_vertex(x0, y0, z0, u1, v1); world_tex_vertex(x1, y0, z0, u0, v1);
+    } else if (face == 3) {
+        world_set_shade(0.80f);
+        world_tex_vertex(x0, y1, z1, u0, v0); world_tex_vertex(x1, y1, z1, u1, v0); world_tex_vertex(x1, y0, z1, u1, v1); world_tex_vertex(x0, y0, z1, u0, v1);
+    } else if (face == 4) {
+        world_set_shade(0.60f);
+        world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x0, y1, z1, u1, v0); world_tex_vertex(x0, y0, z1, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    } else if (face == 5) {
+        world_set_shade(0.60f);
+        world_tex_vertex(x1, y1, z1, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x1, y0, z1, u0, v1);
+    }
+}
+
+static void emit_better_snow_overlay_if(int x, int y, int z, float h) {
+    if (!stivufine_has_snow_neighbours(x, y, z)) return;
+    for (int face = 1; face < 6; ++face) {
+        if (stivufine_better_snow_side_exposed(x, y, z, face)) emit_better_snow_face_float(x, y, z, h, face);
+    }
+}
+
+static void draw_better_snow_overlay_if(int x, int y, int z, float h) {
+    if (!stivufine_has_snow_neighbours(x, y, z)) return;
+    glBegin(GL_QUADS);
+    emit_better_snow_overlay_if(x, y, z, h);
+    glEnd();
+    glColor4f(1, 1, 1, 1);
+}
+
+static void stivufine_side_offset_for_face(int face, int *dx, int *dz) {
+    *dx = 0; *dz = 0;
+    if (face == 2) *dz = -1;
+    else if (face == 3) *dz = 1;
+    else if (face == 4) *dx = -1;
+    else if (face == 5) *dx = 1;
+}
+
+static int stivufine_side_grass_texture(int x, int y, int z, int face, int tile_num) {
+    int full_tile = 0;
+    int dest_block = BLOCK_GRASS;
+    if (!stivufine_better_grass_enabled()) return tile_num;
+    if (tile_num == 77) { full_tile = 78; dest_block = BLOCK_MYCELIUM; }
+    if (stivufine_better_grass_fancy_enabled()) {
+        int dx, dz;
+        stivufine_side_offset_for_face(face, &dx, &dz);
+        if (flat_get_block(x + dx, y - 1, z + dz) != dest_block) return tile_num;
+    }
+    return full_tile;
+}
+
+static int stivufine_side_snow_grass_texture(int x, int y, int z, int face) {
+    if (!stivufine_better_grass_enabled()) return 68;
+    if (stivufine_better_grass_fancy_enabled()) {
+        int dx, dz, id;
+        stivufine_side_offset_for_face(face, &dx, &dz);
+        id = flat_get_block(x + dx, y, z + dz);
+        if (id != BLOCK_SNOW_LAYER && id != BLOCK_SNOW_BLOCK) return 68;
+    }
+    return 66;
+}
+
+static int grass_side_overlay_face_needed(int x, int y, int z, int face) {
+    if (!flat_fancy_grass_overlay_enabled()) return 0;
+    if (face < 2 || face > 5) return 0;
+    int above = flat_get_block(x, y + 1, z);
+    if (above == BLOCK_SNOW_LAYER || above == BLOCK_SNOW_BLOCK) return 0;
+    if (stivufine_side_grass_texture(x, y, z, face, 3) != 3) return 0;
+    return flat_face_exposed_for_block(BLOCK_GRASS, x, y, z, face);
+}
+
+static void emit_grass_side_overlay_face(int x, int y, int z, int face) {
+    float x0 = (float)x, x1 = (float)x + 1.0f;
+    float y0 = (float)y, y1 = (float)y + 1.0f;
+    float z0 = (float)z, z1 = (float)z + 1.0f;
+    float u0, v0, u1, v1;
+    int rgb = java_grass_color_at(x, z);
+    float shade = world_face_base_shade(face);
+    terrain_tile_uv(38, &u0, &v0, &u1, &v1);
+
+    if (smooth_block_lighting_enabled(BLOCK_GRASS)) {
+        float ao[4];
+        uint32_t light[4];
+        world_smooth_face_lights(x, y, z, face, ao, light);
+        if (face == 2) {
+            world_tex_vertex_lit(x1, y1, z0, u0, v0, rgb, shade, ao[0], light[0]);
+            world_tex_vertex_lit(x0, y1, z0, u1, v0, rgb, shade, ao[1], light[1]);
+            world_tex_vertex_lit(x0, y0, z0, u1, v1, rgb, shade, ao[2], light[2]);
+            world_tex_vertex_lit(x1, y0, z0, u0, v1, rgb, shade, ao[3], light[3]);
+        } else if (face == 3) {
+            world_tex_vertex_lit(x0, y1, z1, u0, v0, rgb, shade, ao[0], light[0]);
+            world_tex_vertex_lit(x1, y1, z1, u1, v0, rgb, shade, ao[1], light[1]);
+            world_tex_vertex_lit(x1, y0, z1, u1, v1, rgb, shade, ao[2], light[2]);
+            world_tex_vertex_lit(x0, y0, z1, u0, v1, rgb, shade, ao[3], light[3]);
+        } else if (face == 4) {
+            world_tex_vertex_lit(x0, y1, z0, u0, v0, rgb, shade, ao[0], light[0]);
+            world_tex_vertex_lit(x0, y1, z1, u1, v0, rgb, shade, ao[1], light[1]);
+            world_tex_vertex_lit(x0, y0, z1, u1, v1, rgb, shade, ao[2], light[2]);
+            world_tex_vertex_lit(x0, y0, z0, u0, v1, rgb, shade, ao[3], light[3]);
+        } else if (face == 5) {
+            world_tex_vertex_lit(x1, y1, z1, u0, v0, rgb, shade, ao[0], light[0]);
+            world_tex_vertex_lit(x1, y1, z0, u1, v0, rgb, shade, ao[1], light[1]);
+            world_tex_vertex_lit(x1, y0, z0, u1, v1, rgb, shade, ao[2], light[2]);
+            world_tex_vertex_lit(x1, y0, z1, u0, v1, rgb, shade, ao[3], light[3]);
+        }
+        return;
+    }
+
+    world_style_set_pos(x, y, z);
+    world_light_set_pos_for_face(x, y, z, face);
+    world_set_color_shade(rgb, shade);
+    if (face == 2) {
+        world_tex_vertex(x1, y1, z0, u0, v0); world_tex_vertex(x0, y1, z0, u1, v0); world_tex_vertex(x0, y0, z0, u1, v1); world_tex_vertex(x1, y0, z0, u0, v1);
+    } else if (face == 3) {
+        world_tex_vertex(x0, y1, z1, u0, v0); world_tex_vertex(x1, y1, z1, u1, v0); world_tex_vertex(x1, y0, z1, u1, v1); world_tex_vertex(x0, y0, z1, u0, v1);
+    } else if (face == 4) {
+        world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x0, y1, z1, u1, v0); world_tex_vertex(x0, y0, z1, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    } else if (face == 5) {
+        world_tex_vertex(x1, y1, z1, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x1, y0, z1, u0, v1);
+    }
+}
+
+static void emit_world_block_face_at(int id, int x, int y, int z, int face) {
+    float x0 = (float)x, x1 = (float)x + 1.0f;
+    float y0 = (float)y, y1 = (float)y + 1.0f;
+    float z0 = (float)z, z1 = (float)z + 1.0f;
+    float u0,v0,u1,v1;
+    int tile = 2;
+    if (id == BLOCK_LEAVES && flat_fancy_cutout_terrain_enabled() && neighbor_for_face(x, y, z, face) == BLOCK_LEAVES) {
+        /* For the single canonical fancy-leaf interior quad, keep the local
+           block light sample instead of sampling from the neighboring leaf.
+           That keeps connected leaf faces the same color/brightness family as
+           the exterior foliage instead of turning them into darker seams. */
+        world_light_set_pos(x, y, z);
+    }
+    world_face_style_at(id, x, y, z, face, &tile);
+    int base_tile = tile;
+    tile = stivufine_connected_texture_tile(id, x, y, z, face, tile);
+    terrain_tile_uv(tile, &u0, &v0, &u1, &v1);
+    float sfuv[8]; stivufine_natural_uv(tile, x, y, z, face, u0, v0, u1, v1, sfuv);
+    if (smooth_block_lighting_enabled(id)) {
+        float ao[4];
+        uint32_t light[4];
+        int rgb = world_face_tint_rgb(id, x, y, z, face, base_tile);
+        float shade = world_face_base_shade(face);
+        world_smooth_face_lights(x, y, z, face, ao, light);
+        if (face == 1) {
+            world_tex_vertex_lit(x0, y1, z0, sfuv[0], sfuv[1], rgb, shade, ao[0], light[0]);
+            world_tex_vertex_lit(x1, y1, z0, sfuv[2], sfuv[3], rgb, shade, ao[1], light[1]);
+            world_tex_vertex_lit(x1, y1, z1, sfuv[4], sfuv[5], rgb, shade, ao[2], light[2]);
+            world_tex_vertex_lit(x0, y1, z1, sfuv[6], sfuv[7], rgb, shade, ao[3], light[3]);
+        } else if (face == 0) {
+            world_tex_vertex_lit(x0, y0, z1, sfuv[0], sfuv[1], rgb, shade, ao[0], light[0]);
+            world_tex_vertex_lit(x1, y0, z1, sfuv[2], sfuv[3], rgb, shade, ao[1], light[1]);
+            world_tex_vertex_lit(x1, y0, z0, sfuv[4], sfuv[5], rgb, shade, ao[2], light[2]);
+            world_tex_vertex_lit(x0, y0, z0, sfuv[6], sfuv[7], rgb, shade, ao[3], light[3]);
+        } else if (face == 2) {
+            world_tex_vertex_lit(x1, y1, z0, sfuv[0], sfuv[1], rgb, shade, ao[0], light[0]);
+            world_tex_vertex_lit(x0, y1, z0, sfuv[2], sfuv[3], rgb, shade, ao[1], light[1]);
+            world_tex_vertex_lit(x0, y0, z0, sfuv[4], sfuv[5], rgb, shade, ao[2], light[2]);
+            world_tex_vertex_lit(x1, y0, z0, sfuv[6], sfuv[7], rgb, shade, ao[3], light[3]);
+        } else if (face == 3) {
+            world_tex_vertex_lit(x0, y1, z1, sfuv[0], sfuv[1], rgb, shade, ao[0], light[0]);
+            world_tex_vertex_lit(x1, y1, z1, sfuv[2], sfuv[3], rgb, shade, ao[1], light[1]);
+            world_tex_vertex_lit(x1, y0, z1, sfuv[4], sfuv[5], rgb, shade, ao[2], light[2]);
+            world_tex_vertex_lit(x0, y0, z1, sfuv[6], sfuv[7], rgb, shade, ao[3], light[3]);
+        } else if (face == 4) {
+            world_tex_vertex_lit(x0, y1, z0, sfuv[0], sfuv[1], rgb, shade, ao[0], light[0]);
+            world_tex_vertex_lit(x0, y1, z1, sfuv[2], sfuv[3], rgb, shade, ao[1], light[1]);
+            world_tex_vertex_lit(x0, y0, z1, sfuv[4], sfuv[5], rgb, shade, ao[2], light[2]);
+            world_tex_vertex_lit(x0, y0, z0, sfuv[6], sfuv[7], rgb, shade, ao[3], light[3]);
+        } else if (face == 5) {
+            world_tex_vertex_lit(x1, y1, z1, sfuv[0], sfuv[1], rgb, shade, ao[0], light[0]);
+            world_tex_vertex_lit(x1, y1, z0, sfuv[2], sfuv[3], rgb, shade, ao[1], light[1]);
+            world_tex_vertex_lit(x1, y0, z0, sfuv[4], sfuv[5], rgb, shade, ao[2], light[2]);
+            world_tex_vertex_lit(x1, y0, z1, sfuv[6], sfuv[7], rgb, shade, ao[3], light[3]);
+        }
+        return;
+    }
+    if (face == 1) {
+        world_tex_vertex(x0, y1, z0, sfuv[0], sfuv[1]); world_tex_vertex(x1, y1, z0, sfuv[2], sfuv[3]); world_tex_vertex(x1, y1, z1, sfuv[4], sfuv[5]); world_tex_vertex(x0, y1, z1, sfuv[6], sfuv[7]);
+    } else if (face == 0) {
+        world_tex_vertex(x0, y0, z1, sfuv[0], sfuv[1]); world_tex_vertex(x1, y0, z1, sfuv[2], sfuv[3]); world_tex_vertex(x1, y0, z0, sfuv[4], sfuv[5]); world_tex_vertex(x0, y0, z0, sfuv[6], sfuv[7]);
+    } else if (face == 2) {
+        world_tex_vertex(x1, y1, z0, sfuv[0], sfuv[1]); world_tex_vertex(x0, y1, z0, sfuv[2], sfuv[3]); world_tex_vertex(x0, y0, z0, sfuv[4], sfuv[5]); world_tex_vertex(x1, y0, z0, sfuv[6], sfuv[7]);
+    } else if (face == 3) {
+        world_tex_vertex(x0, y1, z1, sfuv[0], sfuv[1]); world_tex_vertex(x1, y1, z1, sfuv[2], sfuv[3]); world_tex_vertex(x1, y0, z1, sfuv[4], sfuv[5]); world_tex_vertex(x0, y0, z1, sfuv[6], sfuv[7]);
+    } else if (face == 4) {
+        world_tex_vertex(x0, y1, z0, sfuv[0], sfuv[1]); world_tex_vertex(x0, y1, z1, sfuv[2], sfuv[3]); world_tex_vertex(x0, y0, z1, sfuv[4], sfuv[5]); world_tex_vertex(x0, y0, z0, sfuv[6], sfuv[7]);
+    } else if (face == 5) {
+        world_tex_vertex(x1, y1, z1, sfuv[0], sfuv[1]); world_tex_vertex(x1, y1, z0, sfuv[2], sfuv[3]); world_tex_vertex(x1, y0, z0, sfuv[4], sfuv[5]); world_tex_vertex(x1, y0, z1, sfuv[6], sfuv[7]);
+    }
+}
+
+static void emit_world_block_face_float(int id, float x, float y, float z, int face) {
+    float x0 = x, x1 = x + 1.0f;
+    float y0 = y, y1 = y + 1.0f;
+    float z0 = z, z1 = z + 1.0f;
+    float u0,v0,u1,v1;
+    int tile = 2;
+    int bx = (int)floorf(x), by = (int)floorf(y), bz = (int)floorf(z);
+    world_style_set_pos(bx, by, bz);
+    world_light_set_pos_for_face(bx, by, bz, face);
+    world_face_style_at(id, bx, by, bz, face, &tile);
+    tile = stivufine_connected_texture_tile(id, bx, by, bz, face, tile);
+    terrain_tile_uv(tile, &u0, &v0, &u1, &v1);
+    float sfuv[8]; stivufine_natural_uv(tile, bx, by, bz, face, u0, v0, u1, v1, sfuv);
+    if (face == 1) { /* top */
+        world_tex_vertex(x0, y1, z0, sfuv[0], sfuv[1]); world_tex_vertex(x1, y1, z0, sfuv[2], sfuv[3]); world_tex_vertex(x1, y1, z1, sfuv[4], sfuv[5]); world_tex_vertex(x0, y1, z1, sfuv[6], sfuv[7]);
+    } else if (face == 0) { /* bottom */
+        world_tex_vertex(x0, y0, z1, sfuv[0], sfuv[1]); world_tex_vertex(x1, y0, z1, sfuv[2], sfuv[3]); world_tex_vertex(x1, y0, z0, sfuv[4], sfuv[5]); world_tex_vertex(x0, y0, z0, sfuv[6], sfuv[7]);
+    } else if (face == 2) { /* north z- */
+        world_tex_vertex(x1, y1, z0, sfuv[0], sfuv[1]); world_tex_vertex(x0, y1, z0, sfuv[2], sfuv[3]); world_tex_vertex(x0, y0, z0, sfuv[4], sfuv[5]); world_tex_vertex(x1, y0, z0, sfuv[6], sfuv[7]);
+    } else if (face == 3) { /* south z+ */
+        world_tex_vertex(x0, y1, z1, sfuv[0], sfuv[1]); world_tex_vertex(x1, y1, z1, sfuv[2], sfuv[3]); world_tex_vertex(x1, y0, z1, sfuv[4], sfuv[5]); world_tex_vertex(x0, y0, z1, sfuv[6], sfuv[7]);
+    } else if (face == 4) { /* west x- */
+        world_tex_vertex(x0, y1, z0, sfuv[0], sfuv[1]); world_tex_vertex(x0, y1, z1, sfuv[2], sfuv[3]); world_tex_vertex(x0, y0, z1, sfuv[4], sfuv[5]); world_tex_vertex(x0, y0, z0, sfuv[6], sfuv[7]);
+    } else if (face == 5) { /* east x+ */
+        world_tex_vertex(x1, y1, z1, sfuv[0], sfuv[1]); world_tex_vertex(x1, y1, z0, sfuv[2], sfuv[3]); world_tex_vertex(x1, y0, z0, sfuv[4], sfuv[5]); world_tex_vertex(x1, y0, z1, sfuv[6], sfuv[7]);
+    }
+}
+
+static void emit_world_block_face(int id, int x, int y, int z, int face) {
+    emit_world_block_face_at(id, x, y, z, face);
+}
+
+static void draw_world_block_face(int id, int x, int y, int z, int face) {
+    glBegin(GL_QUADS);
+    emit_world_block_face(id, x, y, z, face);
+    glEnd();
+}
+
+static void draw_world_block_face_float(int id, float x, float y, float z, int face) {
+    glBegin(GL_QUADS);
+    emit_world_block_face_float(id, x, y, z, face);
+    glEnd();
+}
+
+static void draw_generic_world_block_model(int id, float x, float y, float z) {
+    for (int face = 0; face < 6; face++) draw_world_block_face_float(id, x, y, z, face);
+}
+
+static float clamp_tex01(float v) {
+    if (v < 0.0f) return 0.0f;
+    if (v > 1.0f) return 1.0f;
+    return v;
+}
+
+static void terrain_tile_uv_subrect(int tile, float su0, float sv0, float su1, float sv1,
+                                    float *u0, float *v0, float *u1, float *v1) {
+    float tu0, tv0, tu1, tv1;
+    terrain_tile_uv(tile, &tu0, &tv0, &tu1, &tv1);
+    su0 = clamp_tex01(su0); sv0 = clamp_tex01(sv0);
+    su1 = clamp_tex01(su1); sv1 = clamp_tex01(sv1);
+    *u0 = tu0 + (tu1 - tu0) * su0;
+    *v0 = tv0 + (tv1 - tv0) * sv0;
+    *u1 = tu0 + (tu1 - tu0) * su1;
+    *v1 = tv0 + (tv1 - tv0) * sv1;
+}
+
+static int g_render_flip_texture_once = 0;
+
+static void emit_cuboid_face_tile(float x0, float y0, float z0, float x1, float y1, float z1,
+                                  float lx0, float ly0, float lz0, float lx1, float ly1, float lz1,
+                                  int face, int tile) {
+    float u0, v0, u1, v1;
+    /* Java RenderBlocks does not stretch each partial cuboid face over a full
+       terrain tile.  It crops the source 16x16 tile by the block bounds: a
+       4x16 button face uses only 4 pixels of the texture, slab sides use the
+       lower 8 pixels, etc. */
+    if (face == 1 || face == 0) {
+        terrain_tile_uv_subrect(tile, lx0, lz0, lx1, lz1, &u0, &v0, &u1, &v1);
+    } else if (face == 2 || face == 3) {
+        terrain_tile_uv_subrect(tile, lx0, 1.0f - ly1, lx1, 1.0f - ly0, &u0, &v0, &u1, &v1);
+    } else {
+        terrain_tile_uv_subrect(tile, lz0, 1.0f - ly1, lz1, 1.0f - ly0, &u0, &v0, &u1, &v1);
+    }
+    if (g_render_flip_texture_once) { float tu = u0; u0 = u1; u1 = tu; }
+
+    int sfx=(int)floorf(x0), sfy=(int)floorf(y0), sfz=(int)floorf(z0);
+    float sfuv[8]; stivufine_natural_uv(tile, sfx, sfy, sfz, face, u0, v0, u1, v1, sfuv);
+
+    if (face == 1) {
+        world_set_shade(1.0f);
+        world_tex_vertex(x0, y1, z0, sfuv[0], sfuv[1]); world_tex_vertex(x1, y1, z0, sfuv[2], sfuv[3]); world_tex_vertex(x1, y1, z1, sfuv[4], sfuv[5]); world_tex_vertex(x0, y1, z1, sfuv[6], sfuv[7]);
+    } else if (face == 0) {
+        world_set_shade(0.50f);
+        world_tex_vertex(x0, y0, z1, sfuv[0], sfuv[1]); world_tex_vertex(x1, y0, z1, sfuv[2], sfuv[3]); world_tex_vertex(x1, y0, z0, sfuv[4], sfuv[5]); world_tex_vertex(x0, y0, z0, sfuv[6], sfuv[7]);
+    } else if (face == 2) {
+        world_set_shade(0.80f);
+        world_tex_vertex(x1, y1, z0, sfuv[0], sfuv[1]); world_tex_vertex(x0, y1, z0, sfuv[2], sfuv[3]); world_tex_vertex(x0, y0, z0, sfuv[4], sfuv[5]); world_tex_vertex(x1, y0, z0, sfuv[6], sfuv[7]);
+    } else if (face == 3) {
+        world_set_shade(0.80f);
+        world_tex_vertex(x0, y1, z1, sfuv[0], sfuv[1]); world_tex_vertex(x1, y1, z1, sfuv[2], sfuv[3]); world_tex_vertex(x1, y0, z1, sfuv[4], sfuv[5]); world_tex_vertex(x0, y0, z1, sfuv[6], sfuv[7]);
+    } else if (face == 4) {
+        world_set_shade(0.60f);
+        world_tex_vertex(x0, y1, z0, sfuv[0], sfuv[1]); world_tex_vertex(x0, y1, z1, sfuv[2], sfuv[3]); world_tex_vertex(x0, y0, z1, sfuv[4], sfuv[5]); world_tex_vertex(x0, y0, z0, sfuv[6], sfuv[7]);
+    } else if (face == 5) {
+        world_set_shade(0.60f);
+        world_tex_vertex(x1, y1, z1, sfuv[0], sfuv[1]); world_tex_vertex(x1, y1, z0, sfuv[2], sfuv[3]); world_tex_vertex(x1, y0, z0, sfuv[4], sfuv[5]); world_tex_vertex(x1, y0, z1, sfuv[6], sfuv[7]);
+    }
+}
+
+static void emit_cuboid_face_tile_auto(float x0, float y0, float z0, float x1, float y1, float z1, int face, int tile) {
+    float bx = floorf(x0), by = floorf(y0), bz = floorf(z0);
+    emit_cuboid_face_tile(x0, y0, z0, x1, y1, z1,
+                          x0 - bx, y0 - by, z0 - bz, x1 - bx, y1 - by, z1 - bz, face, tile);
+}
+
+static void emit_cuboid_block_faces_lit(int id, float x0, float y0, float z0, float x1, float y1, float z1,
+                                          float lx0, float ly0, float lz0, float lx1, float ly1, float lz1) {
+    for (int face = 0; face < 6; face++) {
+        int tile = 2;
+        int meta = 0;
+        int tile_idx = block_texture_resolve(id, meta, face);
+        world_style_set_pos((int)floorf(x0), (int)floorf(y0), (int)floorf(z0));
+        if (tile_idx >= 0) {
+            float shade = world_face_base_shade(face);
+            tile = tile_idx;
+            if (id == BLOCK_LEAVES) world_set_color_shade(java_foliage_color_for_meta_at(g_world_style_x, g_world_style_z, meta), shade);
+            else if (id == BLOCK_VINE) world_set_color_shade(java_foliage_color_at(g_world_style_x, g_world_style_z), shade);
+            else if (id == BLOCK_TALL_GRASS || id == BLOCK_MYCELIUM) world_set_color_shade(java_grass_color_at(g_world_style_x, g_world_style_z), shade);
+            else world_set_shade(shade);
+        } else {
+            world_face_style(id, face, &tile);
+        }
+        tile = stivufine_connected_texture_tile(id, (int)floorf(x0), (int)floorf(y0), (int)floorf(z0), face, tile);
+        emit_cuboid_face_tile(x0, y0, z0, x1, y1, z1,
+                              lx0, ly0, lz0, lx1, ly1, lz1, face, tile);
+    }
+}
+
+static void emit_cuboid_block_faces(int id, float x0, float y0, float z0, float x1, float y1, float z1) {
+    float bx = floorf(x0), by = floorf(y0), bz = floorf(z0);
+    float lx0 = x0 - bx, ly0 = y0 - by, lz0 = z0 - bz;
+    float lx1 = x1 - bx, ly1 = y1 - by, lz1 = z1 - bz;
+    emit_cuboid_block_faces_lit(id, x0, y0, z0, x1, y1, z1, lx0, ly0, lz0, lx1, ly1, lz1);
+}
+
+static void emit_block_cuboid_faces(int id, float x, float y, float z,
+                                              float x0, float y0, float z0, float x1, float y1, float z1) {
+    emit_cuboid_block_faces_lit(id, x + x0, y + y0, z + z0, x + x1, y + y1, z + z1,
+                                x0, y0, z0, x1, y1, z1);
+}
+
+static void draw_cuboid_model_for_block(int id, float x, float y, float z, float x0, float y0, float z0, float x1, float y1, float z1) {
+    glBegin(GL_QUADS);
+    emit_block_cuboid_faces(id, x, y, z, x0, y0, z0, x1, y1, z1);
+    glEnd();
+}
+
+static void draw_cuboid_model_for_block_meta(int id, int meta, float x, float y, float z,
+                                              float x0, float y0, float z0,
+                                              float x1, float y1, float z1) {
+    glBegin(GL_QUADS);
+    for (int face = 0; face < 6; ++face) {
+        int tile = block_texture_resolve(id, meta, face);
+        if (tile < 0) {
+            world_face_style(id, face, &tile);
+        } else {
+            world_set_shade(world_face_base_shade(face));
+        }
+        emit_cuboid_face_tile(x + x0, y + y0, z + z0,
+                              x + x1, y + y1, z + z1,
+                              x0, y0, z0, x1, y1, z1, face, tile);
+    }
+    glEnd();
+}
+
+static void emit_cuboid_model_faces_tile(float x, float y, float z,
+                                         float x0, float y0, float z0, float x1, float y1, float z1,
+                                         int tile) {
+    for (int face = 0; face < 6; face++) {
+        emit_cuboid_face_tile(x + x0, y + y0, z + z0, x + x1, y + y1, z + z1,
+                              x0, y0, z0, x1, y1, z1, face, tile);
+    }
+}
+
+static void draw_cuboid_model_tile(float x, float y, float z,
+                                   float x0, float y0, float z0, float x1, float y1, float z1, int tile) {
+    glBegin(GL_QUADS);
+    emit_cuboid_model_faces_tile(x, y, z, x0, y0, z0, x1, y1, z1, tile);
+    glEnd();
+}
+
+static void draw_block_item_model_with_meta(int id, int meta, float x, float y, float z) {
+    int pushed_fullbright = 0;
+    GLint old_shade_model = pex_gl_save_shade_model();
+    if (g_force_fullbright_item_model <= 0) { g_force_fullbright_item_model++; pushed_fullbright = 1; }
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColor4f(1,1,1,1);
+    glEnable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+    pex_gl_shade_model_smooth();
+    /* Disable culling here too: the same legacy cuboid emitter is used for
+       held/dropped block items, and OpenGL culling makes their faces disappear
+       or appear inverted while D3D looks fine. */
+    glDisable(GL_CULL_FACE);
+    /* Wool is a damageable block item: its ItemStack damage is the color
+       metadata.  Rendering it as metadata zero made every held stack use the
+       port's default black wool texture. */
+    if (id == BLOCK_WOOL) {
+        draw_cuboid_model_for_block_meta(id, meta & 15, x, y, z, 0, 0, 0, 1, 1, 1);
+        goto done;
+    }
+    /* RenderItem/ItemRenderer must not turn non-full block items into solid cubes.
+       This path is used for dropped block entities and first-person held blocks. */
+    if (id == BLOCK_BED) {
+        draw_cuboid_model_for_block_meta(id, meta, x, y, z, 0, 0, 0, 1, 9.0f / 16.0f, 1);
+        goto done;
+    }
+    if (id == BLOCK_SLAB) {
+        draw_cuboid_model_for_block(id, x, y, z, 0, 0, 0, 1, 0.5f, 1);
+        goto done;
+    }
+    if (id == BLOCK_SNOW_LAYER) {
+        draw_cuboid_model_for_block(id, x, y, z, 0, 0, 0, 1, 2.0f / 16.0f, 1);
+        goto done;
+    }
+    if (id == BLOCK_STONE_PRESSURE_PLATE || id == BLOCK_WOOD_PRESSURE_PLATE) {
+        draw_cuboid_model_for_block(id, x, y, z, 1.0f/16.0f, 0, 1.0f/16.0f, 15.0f/16.0f, 1.0f/16.0f, 15.0f/16.0f);
+        goto done;
+    }
+    if (id == BLOCK_STONE_BUTTON) {
+        draw_cuboid_model_for_block(id, x, y, z, 5.0f/16.0f, 5.0f/16.0f, 7.0f/16.0f, 11.0f/16.0f, 11.0f/16.0f, 9.0f/16.0f);
+        goto done;
+    }
+    if (id == BLOCK_CACTUS) {
+        draw_cuboid_model_for_block(id, x, y, z, 1.0f/16.0f, 0, 1.0f/16.0f, 15.0f/16.0f, 1, 15.0f/16.0f);
+        goto done;
+    }
+    if (id == BLOCK_CHEST) {
+        draw_chest_block(x, y, z);
+        goto done;
+    }
+    if (id == BLOCK_FENCE) {
+        glBegin(GL_QUADS);
+        emit_block_cuboid_faces(id, x, y, z, 0.375f, 0.0f, 0.375f, 0.625f, 1.0f, 0.625f);
+        emit_block_cuboid_faces(id, x, y, z, 0.0f, 0.35f, 0.4375f, 1.0f, 0.55f, 0.5625f);
+        emit_block_cuboid_faces(id, x, y, z, 0.0f, 0.70f, 0.4375f, 1.0f, 0.90f, 0.5625f);
+        emit_block_cuboid_faces(id, x, y, z, 0.4375f, 0.35f, 0.0f, 0.5625f, 0.55f, 1.0f);
+        emit_block_cuboid_faces(id, x, y, z, 0.4375f, 0.70f, 0.0f, 0.5625f, 0.90f, 1.0f);
+        glEnd();
+        goto done;
+    }
+    if (id == BLOCK_WOOD_STAIRS || id == BLOCK_COBBLE_STAIRS) {
+        glBegin(GL_QUADS);
+        emit_block_cuboid_faces(id, x, y, z, 0.0f, 0.0f, 0.0f, 1.0f, 0.5f, 1.0f);
+        emit_block_cuboid_faces(id, x, y, z, 0.5f, 0.5f, 0.0f, 1.0f, 1.0f, 1.0f);
+        glEnd();
+        goto done;
+    }
+    draw_world_block_id(id, x, y, z);
+    goto done;
+done:
+    if (pushed_fullbright) g_force_fullbright_item_model--;
+    pex_gl_restore_shade_model(old_shade_model);
+    glDisable(GL_CULL_FACE);
+    glColor4f(1,1,1,1);
+}
+
+static void draw_block_item_model(int id, float x, float y, float z) {
+    draw_block_item_model_with_meta(id, 0, x, y, z);
+}
+
+
+static void entity_texture_uv(Texture *tex, int px, int py, float *u, float *v) {
+    float tw = tex && tex->w ? (float)tex->w : 64.0f;
+    float th = tex && tex->h ? (float)tex->h : 32.0f;
+    *u = (float)px / tw;
+    *v = (float)py / th;
+}
+
+static void entity_tex_vertex(Texture *tex, float x, float y, float z, int px, int py) {
+    float u, v;
+    entity_texture_uv(tex, px, py, &u, &v);
+    world_tex_vertex(x, y, z, u, v);
+}
+
+static void draw_entity_chest_box(Texture *tex, float x0, float y0, float z0, float x1, float y1, float z1,
+                                  int model_w, int model_h, int model_d, int off_x, int off_y, int axis_x) {
+    int u_side0 = off_x;
+    int u_front = off_x + model_d;
+    int u_side1 = off_x + model_d + model_w;
+    int u_back  = off_x + model_d + model_w + model_d;
+    int v_top = off_y;
+    int v_side = off_y + model_d;
+    int v_bot = off_y + model_d + model_h;
+
+    world_set_shade(1.0f);
+    if (axis_x) {
+        entity_tex_vertex(tex, x0,y1,z0, u_front, v_top); entity_tex_vertex(tex, x1,y1,z0, u_front+model_w, v_top); entity_tex_vertex(tex, x1,y1,z1, u_front+model_w, v_top+model_d); entity_tex_vertex(tex, x0,y1,z1, u_front, v_top+model_d);
+        world_set_shade(0.50f);
+        entity_tex_vertex(tex, x0,y0,z1, u_side1, v_top); entity_tex_vertex(tex, x1,y0,z1, u_side1+model_w, v_top); entity_tex_vertex(tex, x1,y0,z0, u_side1+model_w, v_top+model_d); entity_tex_vertex(tex, x0,y0,z0, u_side1, v_top+model_d);
+        world_set_shade(0.80f);
+        entity_tex_vertex(tex, x0,y1,z1, u_front, v_side); entity_tex_vertex(tex, x1,y1,z1, u_front+model_w, v_side); entity_tex_vertex(tex, x1,y0,z1, u_front+model_w, v_bot); entity_tex_vertex(tex, x0,y0,z1, u_front, v_bot);
+        entity_tex_vertex(tex, x1,y1,z0, u_back, v_side); entity_tex_vertex(tex, x0,y1,z0, u_back+model_w, v_side); entity_tex_vertex(tex, x0,y0,z0, u_back+model_w, v_bot); entity_tex_vertex(tex, x1,y0,z0, u_back, v_bot);
+        world_set_shade(0.60f);
+        entity_tex_vertex(tex, x0,y1,z0, u_side0, v_side); entity_tex_vertex(tex, x0,y1,z1, u_side0+model_d, v_side); entity_tex_vertex(tex, x0,y0,z1, u_side0+model_d, v_bot); entity_tex_vertex(tex, x0,y0,z0, u_side0, v_bot);
+        entity_tex_vertex(tex, x1,y1,z1, u_side1, v_side); entity_tex_vertex(tex, x1,y1,z0, u_side1+model_d, v_side); entity_tex_vertex(tex, x1,y0,z0, u_side1+model_d, v_bot); entity_tex_vertex(tex, x1,y0,z1, u_side1, v_bot);
+    } else {
+        entity_tex_vertex(tex, x0,y1,z0, u_front, v_top); entity_tex_vertex(tex, x1,y1,z0, u_front, v_top+model_d); entity_tex_vertex(tex, x1,y1,z1, u_front+model_w, v_top+model_d); entity_tex_vertex(tex, x0,y1,z1, u_front+model_w, v_top);
+        world_set_shade(0.50f);
+        entity_tex_vertex(tex, x0,y0,z1, u_side1, v_top); entity_tex_vertex(tex, x1,y0,z1, u_side1, v_top+model_d); entity_tex_vertex(tex, x1,y0,z0, u_side1+model_w, v_top+model_d); entity_tex_vertex(tex, x0,y0,z0, u_side1+model_w, v_top);
+        world_set_shade(0.80f);
+        entity_tex_vertex(tex, x1,y1,z0, u_side0, v_side); entity_tex_vertex(tex, x1,y1,z1, u_side0+model_w, v_side); entity_tex_vertex(tex, x1,y0,z1, u_side0+model_w, v_bot); entity_tex_vertex(tex, x1,y0,z0, u_side0, v_bot);
+        entity_tex_vertex(tex, x0,y1,z1, u_side1, v_side); entity_tex_vertex(tex, x0,y1,z0, u_side1+model_w, v_side); entity_tex_vertex(tex, x0,y0,z0, u_side1+model_w, v_bot); entity_tex_vertex(tex, x0,y0,z1, u_side1, v_bot);
+        world_set_shade(0.60f);
+        entity_tex_vertex(tex, x0,y1,z0, u_back, v_side); entity_tex_vertex(tex, x1,y1,z0, u_back+model_d, v_side); entity_tex_vertex(tex, x1,y0,z0, u_back+model_d, v_bot); entity_tex_vertex(tex, x0,y0,z0, u_back, v_bot);
+        entity_tex_vertex(tex, x1,y1,z1, u_front, v_side); entity_tex_vertex(tex, x0,y1,z1, u_front+model_d, v_side); entity_tex_vertex(tex, x0,y0,z1, u_front+model_d, v_bot); entity_tex_vertex(tex, x1,y0,z1, u_front, v_bot);
+    }
+}
+
+static void draw_entity_chest_model(Texture *tex, float x0, float y0, float z0, float x1, float z1, int wide, int axis_x) {
+    if (!tex || !tex->id) return;
+    glBindTexture(GL_TEXTURE_2D, tex->id);
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.1f);
+    glBegin(GL_QUADS);
+    int model_w = wide ? 30 : 14;
+    int model_d = 14;
+    draw_entity_chest_box(tex, x0, y0, z0, x1, y0 + 10.0f / 16.0f, z1, model_w, 10, model_d, 0, 19, axis_x);
+    draw_entity_chest_box(tex, x0, y0 + 9.0f / 16.0f, z0, x1, y0 + 14.0f / 16.0f, z1, model_w, 5, model_d, 0, 0, axis_x);
+    float cx0 = (x0 + x1) * 0.5f - 1.0f / 16.0f;
+    float cx1 = (x0 + x1) * 0.5f + 1.0f / 16.0f;
+    float kz0 = axis_x ? (z1 - 1.0f / 16.0f) : ((z0 + z1) * 0.5f - 1.0f / 32.0f);
+    float kz1 = axis_x ? z1 : ((z0 + z1) * 0.5f + 1.0f / 32.0f);
+    float kx0 = axis_x ? cx0 : (x1 - 1.0f / 16.0f);
+    float kx1 = axis_x ? cx1 : x1;
+    draw_entity_chest_box(tex, kx0, y0 + 7.0f / 16.0f, kz0, kx1, y0 + 11.0f / 16.0f, kz1, 2, 4, 1, 0, 0, axis_x);
+    glEnd();
+    glDisable(GL_ALPHA_TEST);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glColor4f(1,1,1,1);
+}
+
+static void emit_chest_face_tile_world(float x0, float y0, float z0, float x1, float y1, float z1, int face, int tile) {
+    float u0, v0, u1, v1;
+    terrain_tile_uv(tile, &u0, &v0, &u1, &v1);
+    if (face == 1) {
+        world_set_shade(1.0f);
+        world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y1, z1, u1, v1); world_tex_vertex(x0, y1, z1, u0, v1);
+    } else if (face == 0) {
+        world_set_shade(0.50f);
+        world_tex_vertex(x0, y0, z1, u0, v0); world_tex_vertex(x1, y0, z1, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    } else if (face == 2) {
+        world_set_shade(0.80f);
+        world_tex_vertex(x1, y1, z0, u0, v0); world_tex_vertex(x0, y1, z0, u1, v0); world_tex_vertex(x0, y0, z0, u1, v1); world_tex_vertex(x1, y0, z0, u0, v1);
+    } else if (face == 3) {
+        world_set_shade(0.80f);
+        world_tex_vertex(x0, y1, z1, u0, v0); world_tex_vertex(x1, y1, z1, u1, v0); world_tex_vertex(x1, y0, z1, u1, v1); world_tex_vertex(x0, y0, z1, u0, v1);
+    } else if (face == 4) {
+        world_set_shade(0.60f);
+        world_tex_vertex(x0, y1, z0, u0, v0); world_tex_vertex(x0, y1, z1, u1, v0); world_tex_vertex(x0, y0, z1, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+    } else if (face == 5) {
+        world_set_shade(0.60f);
+        world_tex_vertex(x1, y1, z1, u0, v0); world_tex_vertex(x1, y1, z0, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x1, y0, z1, u0, v1);
+    }
+}
+
+static void draw_large_chest_terrain_span(float x0, float y0, float z0, float x1, float y1, float z1, int axis_x) {
+    int lt = large_chest_left_tile();   /* terrain.png tile 41 in classic atlas */
+    int rt = large_chest_right_tile();  /* terrain.png tile 42 in classic atlas */
+    int top = chest_top_tile();
+    int side = chest_side_tile();
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glBegin(GL_QUADS);
+
+    if (axis_x) {
+        float xm = (x0 + x1) * 0.5f;
+        /* Keep the 41->42 strip in atlas order on the front face only.  The
+           previous pass mirrored the large-front strip onto the rear face too,
+           which made the chest read as flipped from one side. */
+        emit_chest_face_tile_world(x0, y0, z0, xm, y1, z1, 1, top);
+        emit_chest_face_tile_world(xm, y0, z0, x1, y1, z1, 1, top);
+        emit_chest_face_tile_world(x0, y0, z0, xm, y1, z1, 0, top);
+        emit_chest_face_tile_world(xm, y0, z0, x1, y1, z1, 0, top);
+        emit_chest_face_tile_world(x0, y0, z1, xm, y1, z1, 3, lt);
+        emit_chest_face_tile_world(xm, y0, z1, x1, y1, z1, 3, rt);
+        /* The opposite face is UV-mirrored by the face-2 vertex order, so swap
+           the two terrain tiles to keep the large-chest latch at the center
+           instead of the outside edges. */
+        emit_chest_face_tile_world(x0, y0, z0, xm, y1, z0, 2, rt);
+        emit_chest_face_tile_world(xm, y0, z0, x1, y1, z0, 2, lt);
+        emit_chest_face_tile_world(x0, y0, z0, x0, y1, z1, 4, side);
+        emit_chest_face_tile_world(x1, y0, z0, x1, y1, z1, 5, side);
+    } else {
+        float zm = (z0 + z1) * 0.5f;
+        emit_chest_face_tile_world(x0, y0, z0, x1, y1, zm, 1, top);
+        emit_chest_face_tile_world(x0, y0, zm, x1, y1, z1, 1, top);
+        emit_chest_face_tile_world(x0, y0, z0, x1, y1, zm, 0, top);
+        emit_chest_face_tile_world(x0, y0, zm, x1, y1, z1, 0, top);
+        /* Face 5 is UV-mirrored along Z, so use 42 then 41 there.  Face 4
+           keeps the natural atlas order. */
+        emit_chest_face_tile_world(x1, y0, z0, x1, y1, zm, 5, rt);
+        emit_chest_face_tile_world(x1, y0, zm, x1, y1, z1, 5, lt);
+        emit_chest_face_tile_world(x0, y0, z0, x0, y1, zm, 4, lt);
+        emit_chest_face_tile_world(x0, y0, zm, x0, y1, z1, 4, rt);
+        emit_chest_face_tile_world(x0, y0, z0, x1, y1, z0, 2, side);
+        emit_chest_face_tile_world(x0, y0, z1, x1, y1, z1, 3, side);
+    }
+    glEnd();
+}
+
+static void draw_connected_chest_span(float x0, float y0, float z0, float x1, float y1, float z1, int axis) {
+    /* Single chests still use the normal single chest terrain tiles.  Large chests
+       use the terrain.png large chest strip below the single chest texture strip. */
+    if ((axis && (x1 - x0) > 1.2f) || (!axis && (z1 - z0) > 1.2f)) {
+        draw_large_chest_terrain_span(x0, y0, z0, x1, y1, z1, axis);
+        return;
+    }
+    draw_chest_block(x0 - 1.0f / 16.0f, y0, z0 - 1.0f / 16.0f);
+}
+
+static void draw_connected_chest_block(int x, int y, int z) {
+    /* Render double chests once, as one connected model, and never stretch a single
+       terrain tile across the whole pair.  Each half gets its own 16x16 tile span. */
+    int east = flat_get_block(x + 1, y, z) == BLOCK_CHEST;
+    int west = flat_get_block(x - 1, y, z) == BLOCK_CHEST;
+    int south = flat_get_block(x, y, z + 1) == BLOCK_CHEST;
+    int north = flat_get_block(x, y, z - 1) == BLOCK_CHEST;
+    if (west || north) return;
+
+    float inset = 1.0f / 16.0f;
+    float x0 = (float)x + inset, x1 = (float)x + 1.0f - inset;
+    float z0 = (float)z + inset, z1 = (float)z + 1.0f - inset;
+    int axis_x = 0;
+    if (east) { x1 = (float)x + 2.0f - inset; axis_x = 1; }
+    else if (south) { z1 = (float)z + 2.0f - inset; axis_x = 0; }
+    float y0 = (float)y, y1 = (float)y + 14.0f / 16.0f;
+    draw_connected_chest_span(x0, y0, z0, x1, y1, z1, axis_x);
+}
+static void emit_flat_quad_tile(float x0, float y, float z0, float x1, float z1, int tile) {
+    float u0, v0, u1, v1;
+    terrain_tile_uv(tile, &u0, &v0, &u1, &v1);
+    world_set_shade(1.0f);
+    world_tex_vertex(x0, y, z0, u0, v0); world_tex_vertex(x1, y, z0, u1, v0); world_tex_vertex(x1, y, z1, u1, v1); world_tex_vertex(x0, y, z1, u0, v1);
+}
+
+static void emit_flat_quad_tile_tinted(float x0, float y, float z0, float x1, float z1, int tile, int rgb) {
+    float u0, v0, u1, v1;
+    terrain_tile_uv(tile, &u0, &v0, &u1, &v1);
+    world_set_color_shade(rgb, 1.0f);
+    world_tex_vertex(x0, y, z0, u0, v0); world_tex_vertex(x1, y, z0, u1, v0); world_tex_vertex(x1, y, z1, u1, v1); world_tex_vertex(x0, y, z1, u0, v1);
+}
+
+static void rot_x(float *y, float *z, float a) {
+    float cy = cosf(a), sy = sinf(a);
+    float oy = *y, oz = *z;
+    *y = oy * cy - oz * sy;
+    *z = oy * sy + oz * cy;
+}
+
+static void rot_y(float *x, float *z, float a) {
+    float cy = cosf(a), sy = sinf(a);
+    float ox = *x, oz = *z;
+    *x = ox * cy + oz * sy;
+    *z = -ox * sy + oz * cy;
+}
+
+static void emit_textured_quad_pts(float p[8][3], int a, int b, int c, int d, int tile,
+                                   float su0, float sv0, float su1, float sv1) {
+    float u0, v0, u1, v1;
+    terrain_tile_uv_subrect(tile, su0, sv0, su1, sv1, &u0, &v0, &u1, &v1);
+    world_tex_vertex(p[a][0], p[a][1], p[a][2], u0, v1);
+    world_tex_vertex(p[b][0], p[b][1], p[b][2], u1, v1);
+    world_tex_vertex(p[c][0], p[c][1], p[c][2], u1, v0);
+    world_tex_vertex(p[d][0], p[d][1], p[d][2], u0, v0);
+}
+
+static float vec3_len(float x, float y, float z) {
+    return sqrtf(x * x + y * y + z * z);
+}
+
+static void emit_lever_prism(float ax, float ay, float az, float bx, float by, float bz, float half, int tile) {
+    float dx = bx - ax, dy = by - ay, dz = bz - az;
+    float dl = vec3_len(dx, dy, dz);
+    if (dl < 0.0001f) return;
+    dx /= dl; dy /= dl; dz /= dl;
+
+    float rx = 0.0f, ry = 1.0f, rz = 0.0f;
+    if (fabsf(dy) > 0.9f) { rx = 1.0f; ry = 0.0f; rz = 0.0f; }
+
+    float ux = dy * rz - dz * ry;
+    float uy = dz * rx - dx * rz;
+    float uz = dx * ry - dy * rx;
+    float ul = vec3_len(ux, uy, uz);
+    if (ul < 0.0001f) return;
+    ux = ux / ul * half; uy = uy / ul * half; uz = uz / ul * half;
+
+    float vx = dy * uz - dz * uy;
+    float vy = dz * ux - dx * uz;
+    float vz = dx * uy - dy * ux;
+    float vl = vec3_len(vx, vy, vz);
+    if (vl < 0.0001f) return;
+    vx = vx / vl * half; vy = vy / vl * half; vz = vz / vl * half;
+
+    float pts[8][3] = {
+        {ax - ux - vx, ay - uy - vy, az - uz - vz},
+        {ax + ux - vx, ay + uy - vy, az + uz - vz},
+        {ax + ux + vx, ay + uy + vy, az + uz + vz},
+        {ax - ux + vx, ay - uy + vy, az - uz + vz},
+        {bx - ux - vx, by - uy - vy, bz - uz - vz},
+        {bx + ux - vx, by + uy - vy, bz + uz - vz},
+        {bx + ux + vx, by + uy + vy, bz + uz + vz},
+        {bx - ux + vx, by - uy + vy, bz - uz + vz}
+    };
+
+    world_set_shade(1.0f);
+    emit_textured_quad_pts(pts, 0,1,2,3, tile, 7.0f/16.0f, 6.0f/16.0f, 9.0f/16.0f, 8.0f/16.0f);
+    emit_textured_quad_pts(pts, 7,6,5,4, tile, 7.0f/16.0f, 6.0f/16.0f, 9.0f/16.0f, 8.0f/16.0f);
+    emit_textured_quad_pts(pts, 1,0,4,5, tile, 7.0f/16.0f, 6.0f/16.0f, 9.0f/16.0f, 15.0f/16.0f);
+    emit_textured_quad_pts(pts, 2,1,5,6, tile, 7.0f/16.0f, 6.0f/16.0f, 9.0f/16.0f, 15.0f/16.0f);
+    emit_textured_quad_pts(pts, 3,2,6,7, tile, 7.0f/16.0f, 6.0f/16.0f, 9.0f/16.0f, 15.0f/16.0f);
+    emit_textured_quad_pts(pts, 0,3,7,4, tile, 7.0f/16.0f, 6.0f/16.0f, 9.0f/16.0f, 15.0f/16.0f);
+}
+
+static void emit_lever_handle_model(int x, int y, int z, int meta) {
+    int side = meta & 7;
+    int powered = (meta & 8) != 0;
+    int tile = 96;
+    float h = 1.0f / 16.0f;
+    float ax = (float)x + 0.5f;
+    float ay = (float)y + 0.5f;
+    float az = (float)z + 0.5f;
+    float bx = ax, by = ay, bz = az;
+
+    if (side == 5 || side == 6) {
+        /* Floor lever: small 2x2px stick anchored on the cobblestone plate.
+           Metadata 5/6 chooses which horizontal axis the handle leans along;
+           power flips the lean direction. */
+        float dir = powered ? 1.0f : -1.0f;
+        ax = (float)x + 0.5f;
+        ay = (float)y + 3.0f / 16.0f;
+        az = (float)z + 0.5f;
+        bx = ax;
+        by = (float)y + 11.0f / 16.0f;
+        bz = az;
+        if (side == 6) bx += dir * 4.0f / 16.0f;
+        else bz += dir * 4.0f / 16.0f;
+    } else {
+        float nx = 0.0f, nz = 0.0f;
+        if (side == 1) { nx =  1.0f; ax = (float)x + 3.0f / 16.0f; }
+        else if (side == 2) { nx = -1.0f; ax = (float)x + 13.0f / 16.0f; }
+        else if (side == 3) { nz =  1.0f; az = (float)z + 3.0f / 16.0f; }
+        else { nz = -1.0f; az = (float)z + 13.0f / 16.0f; }
+        ay = (float)y + 0.5f;
+        bx = ax + nx * 6.0f / 16.0f;
+        bz = az + nz * 6.0f / 16.0f;
+        by = ay + (powered ? -4.0f : 4.0f) / 16.0f;
+    }
+
+    emit_lever_prism(ax, ay, az, bx, by, bz, h, tile);
+}
+
+static void draw_lever_block_model(int x, int y, int z) {
+    int meta = flat_get_meta(x, y, z);
+    int side = meta & 7;
+    /* Base plate uses cobblestone exactly like RenderBlocks.renderBlockLever's override texture. */
+    if (side == 5) draw_cuboid_model_tile((float)x,(float)y,(float)z, 0.5f-3.0f/16.0f,0.0f,0.5f-0.25f, 0.5f+3.0f/16.0f,3.0f/16.0f,0.5f+0.25f, 16);
+    else if (side == 6) draw_cuboid_model_tile((float)x,(float)y,(float)z, 0.5f-0.25f,0.0f,0.5f-3.0f/16.0f, 0.5f+0.25f,3.0f/16.0f,0.5f+3.0f/16.0f, 16);
+    else if (side == 4) draw_cuboid_model_tile((float)x,(float)y,(float)z, 0.5f-3.0f/16.0f,0.5f-0.25f,1.0f-3.0f/16.0f, 0.5f+3.0f/16.0f,0.5f+0.25f,1.0f, 16);
+    else if (side == 3) draw_cuboid_model_tile((float)x,(float)y,(float)z, 0.5f-3.0f/16.0f,0.5f-0.25f,0.0f, 0.5f+3.0f/16.0f,0.5f+0.25f,3.0f/16.0f, 16);
+    else if (side == 2) draw_cuboid_model_tile((float)x,(float)y,(float)z, 1.0f-3.0f/16.0f,0.5f-0.25f,0.5f-3.0f/16.0f, 1.0f,0.5f+0.25f,0.5f+3.0f/16.0f, 16);
+    else draw_cuboid_model_tile((float)x,(float)y,(float)z, 0.0f,0.5f-0.25f,0.5f-3.0f/16.0f, 3.0f/16.0f,0.5f+0.25f,0.5f+3.0f/16.0f, 16);
+    glBegin(GL_QUADS);
+    emit_lever_handle_model(x, y, z, meta);
+    glEnd();
+}
+
+static int torch_tile_for_id(int id) {
+    if (id == BLOCK_REDSTONE_TORCH_OFF) return 115;
+    if (id == BLOCK_REDSTONE_TORCH_ON) return 99;
+    return 80;
+}
+
+static void emit_torch_at_angle(int id, double x, double y, double z, double ax, double az) {
+    int tile = torch_tile_for_id(id);
+    float tw = tex_terrain.w ? (float)tex_terrain.w : 256.0f;
+    float th = tex_terrain.h ? (float)tex_terrain.h : 256.0f;
+    float u0 = (float)((tile & 15) << 4) / tw;
+    float v0 = (float)(tile & 240) / th;
+    float u1 = (float)(((tile & 15) << 4) + 15.99f) / tw;
+    float v1 = (float)((tile & 240) + 15.99f) / th;
+    float cu0 = u0 + 7.0f / tw;
+    float cv0 = v0 + 6.0f / th;
+    float cu1 = u0 + 9.0f / tw;
+    float cv1 = v0 + 8.0f / th;
+
+    x += 0.5;
+    z += 0.5;
+    double x0 = x - 0.5;
+    double x1 = x + 0.5;
+    double z0 = z - 0.5;
+    double z1 = z + 0.5;
+    double r = 1.0 / 16.0;
+    double cap_y = 0.625;
+
+    world_set_shade(1.0f);
+    world_tex_vertex((float)(x + ax * (1.0 - cap_y) - r), (float)(y + cap_y), (float)(z + az * (1.0 - cap_y) - r), cu0, cv0);
+    world_tex_vertex((float)(x + ax * (1.0 - cap_y) - r), (float)(y + cap_y), (float)(z + az * (1.0 - cap_y) + r), cu0, cv1);
+    world_tex_vertex((float)(x + ax * (1.0 - cap_y) + r), (float)(y + cap_y), (float)(z + az * (1.0 - cap_y) + r), cu1, cv1);
+    world_tex_vertex((float)(x + ax * (1.0 - cap_y) + r), (float)(y + cap_y), (float)(z + az * (1.0 - cap_y) - r), cu1, cv0);
+
+    world_tex_vertex((float)(x - r),       (float)(y + 1.0), (float)z0,        u0, v0);
+    world_tex_vertex((float)(x - r + ax),  (float)y,         (float)(z0 + az), u0, v1);
+    world_tex_vertex((float)(x - r + ax),  (float)y,         (float)(z1 + az), u1, v1);
+    world_tex_vertex((float)(x - r),       (float)(y + 1.0), (float)z1,        u1, v0);
+
+    world_tex_vertex((float)(x + r),       (float)(y + 1.0), (float)z1,        u0, v0);
+    world_tex_vertex((float)(x + r + ax),  (float)y,         (float)(z1 + az), u0, v1);
+    world_tex_vertex((float)(x + r + ax),  (float)y,         (float)(z0 + az), u1, v1);
+    world_tex_vertex((float)(x + r),       (float)(y + 1.0), (float)z0,        u1, v0);
+
+    world_tex_vertex((float)x0,       (float)(y + 1.0), (float)(z + r),      u0, v0);
+    world_tex_vertex((float)(x0 + ax),(float)y,         (float)(z + r + az),u0, v1);
+    world_tex_vertex((float)(x1 + ax),(float)y,         (float)(z + r + az),u1, v1);
+    world_tex_vertex((float)x1,       (float)(y + 1.0), (float)(z + r),      u1, v0);
+
+    world_tex_vertex((float)x1,       (float)(y + 1.0), (float)(z - r),      u0, v0);
+    world_tex_vertex((float)(x1 + ax),(float)y,         (float)(z - r + az),u0, v1);
+    world_tex_vertex((float)(x0 + ax),(float)y,         (float)(z - r + az),u1, v1);
+    world_tex_vertex((float)x0,       (float)(y + 1.0), (float)(z - r),      u1, v0);
+}
+
+static void draw_torch_block_model(int id, int x, int y, int z) {
+    int meta = flat_get_meta(x, y, z) & 7;
+    int pushed_fullbright = 0;
+    if (flat_block_light_value_for_id(id) > 0) { g_force_fullbright_item_model++; pushed_fullbright = 1; }
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.5f);
+    glBegin(GL_QUADS);
+    if (meta == 1) emit_torch_at_angle(id, (double)x - 0.1, (double)y + 0.2, (double)z, -0.4, 0.0);
+    else if (meta == 2) emit_torch_at_angle(id, (double)x + 0.1, (double)y + 0.2, (double)z, 0.4, 0.0);
+    else if (meta == 3) emit_torch_at_angle(id, (double)x, (double)y + 0.2, (double)z - 0.1, 0.0, -0.4);
+    else if (meta == 4) emit_torch_at_angle(id, (double)x, (double)y + 0.2, (double)z + 0.1, 0.0, 0.4);
+    else emit_torch_at_angle(id, (double)x, (double)y, (double)z, 0.0, 0.0);
+    glEnd();
+    glDisable(GL_ALPHA_TEST);
+    if (pushed_fullbright) g_force_fullbright_item_model--;
+}
+
+static void draw_ladder_block_model(int x, int y, int z) {
+    int meta = flat_get_meta(x, y, z);
+    if (meta < 2 || meta > 5) meta = 3;
+    float u0, v0, u1, v1; terrain_tile_uv(83, &u0, &v0, &u1, &v1);
+    float e = 1.0f / 16.0f;
+    glEnable(GL_ALPHA_TEST); glAlphaFunc(GL_GREATER, 0.5f);
+    glBegin(GL_QUADS); world_set_shade(1.0f);
+    if (meta == 2) { float zz = (float)z + 1.0f - e; world_tex_vertex(x+1,y+1,zz,u0,v0); world_tex_vertex(x,y+1,zz,u1,v0); world_tex_vertex(x,y,zz,u1,v1); world_tex_vertex(x+1,y,zz,u0,v1); }
+    else if (meta == 3) { float zz = (float)z + e; world_tex_vertex(x,y+1,zz,u0,v0); world_tex_vertex(x+1,y+1,zz,u1,v0); world_tex_vertex(x+1,y,zz,u1,v1); world_tex_vertex(x,y,zz,u0,v1); }
+    else if (meta == 4) { float xx = (float)x + 1.0f - e; world_tex_vertex(xx,y+1,z,u0,v0); world_tex_vertex(xx,y+1,z+1,u1,v0); world_tex_vertex(xx,y,z+1,u1,v1); world_tex_vertex(xx,y,z,u0,v1); }
+    else { float xx = (float)x + e; world_tex_vertex(xx,y+1,z+1,u0,v0); world_tex_vertex(xx,y+1,z,u1,v0); world_tex_vertex(xx,y,z,u1,v1); world_tex_vertex(xx,y,z+1,u0,v1); }
+    glEnd(); glDisable(GL_ALPHA_TEST);
+}
+
+static int door_java_state(int meta) {
+    return (meta & 4) == 0 ? ((meta - 1) & 3) : (meta & 3);
+}
+
+static int door_java_texture_for_face(int id, int meta, int face, int *flip) {
+    int base = (id == BLOCK_IRON_DOOR) ? 98 : 97;
+    if (flip) *flip = 0;
+    if (face == 0 || face == 1) return base;
+    int state = door_java_state(meta);
+    if (((state == 0 || state == 2) ? 1 : 0) ^ (face <= 3)) return base;
+    int v = state / 2 + ((face & 1) ^ state);
+    v += (meta & 4) / 4;
+    int tile = base - (meta & 8) * 2;
+    if (v & 1) { if (flip) *flip = 1; }
+    return tile;
+}
+
+static void draw_door_block_model(int id, int x, int y, int z) {
+    int meta = flat_get_meta(x, y, z);
+    int upper = door_meta_is_upper(meta);
+    int ly = upper ? y - 1 : y;
+    int lower_meta = flat_get_meta(x, ly, z);
+    int state = door_java_state(lower_meta);
+    float t = 3.0f / 16.0f;
+    float x0 = (float)x, x1 = (float)x + 1.0f;
+    float y0 = (float)y, y1 = (float)y + 1.0f;
+    float z0 = (float)z, z1 = (float)z + 1.0f;
+
+    if (state == 0) z1 = z0 + t;
+    else if (state == 1) x0 = x1 - t;
+    else if (state == 2) z0 = z1 - t;
+    else x1 = x0 + t;
+
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.5f);
+    glBegin(GL_QUADS);
+    world_style_set_pos(x, y, z);
+    for (int face = 0; face < 6; face++) {
+        if (!upper && face == 1 && flat_get_block(x, y + 1, z) == id) continue;
+        if (upper && face == 0 && flat_get_block(x, y - 1, z) == id) continue;
+        int flip = 0;
+        int tile = door_java_texture_for_face(id, meta, face, &flip);
+        if (tile < 0) { tile = -tile; flip = 1; }
+        g_render_flip_texture_once = flip;
+        emit_cuboid_face_tile_auto(x0, y0, z0, x1, y1, z1, face, tile);
+        g_render_flip_texture_once = 0;
+    }
+    glEnd();
+    glDisable(GL_ALPHA_TEST);
+}
+
+
+static void draw_furnace_block_model(int id, int x, int y, int z) {
+    int front = flat_get_meta(x, y, z);
+    if (front < 2 || front > 5) front = 3;
+    float x0 = (float)x, x1 = (float)x + 1.0f;
+    float y0 = (float)y, y1 = (float)y + 1.0f;
+    float z0 = (float)z, z1 = (float)z + 1.0f;
+    glBegin(GL_QUADS);
+    for (int face = 0; face < 6; face++) {
+        if (!flat_face_exposed_for_block(id, x, y, z, face)) continue;
+        int tile;
+        if (face == 0 || face == 1) tile = furnace_top_tile();
+        else if (face == front) tile = (id == BLOCK_FURNACE_LIT) ? furnace_front_lit_tile() : furnace_front_tile();
+        else tile = furnace_side_tile();
+        emit_cuboid_face_tile_auto(x0, y0, z0, x1, y1, z1, face, tile);
+    }
+    glEnd();
+}
+
+static void draw_stairs_block_model(int id, int x, int y, int z) {
+    int dir = flat_get_meta(x, y, z) & 3;
+    glBegin(GL_QUADS);
+    emit_block_cuboid_faces(id, (float)x, (float)y, (float)z, 0.0f, 0.0f, 0.0f, 1.0f, 0.5f, 1.0f);
+    if (dir == 0) emit_block_cuboid_faces(id, (float)x, (float)y, (float)z, 0.5f, 0.5f, 0.0f, 1.0f, 1.0f, 1.0f);
+    else if (dir == 1) emit_block_cuboid_faces(id, (float)x, (float)y, (float)z, 0.0f, 0.5f, 0.0f, 0.5f, 1.0f, 1.0f);
+    else if (dir == 2) emit_block_cuboid_faces(id, (float)x, (float)y, (float)z, 0.0f, 0.5f, 0.5f, 1.0f, 1.0f, 1.0f);
+    else emit_block_cuboid_faces(id, (float)x, (float)y, (float)z, 0.0f, 0.5f, 0.0f, 1.0f, 1.0f, 0.5f);
+    glEnd();
+}
+
+static void draw_fence_block_model(int id, int x, int y, int z) {
+    glBegin(GL_QUADS);
+    emit_block_cuboid_faces(id, x, y, z, 0.375f, 0.0f, 0.375f, 0.625f, 1.0f, 0.625f);
+    if ((flat_get_block(x-1,y,z) == id || flat_get_block(x-1,y,z) == BLOCK_FENCE || flat_get_block(x-1,y,z) == BLOCK_NETHER_BRICK_FENCE) || block_occludes_render_face(flat_get_block(x-1,y,z))) {
+        emit_cuboid_block_faces(id, x, y+0.35f, z+0.4375f, x+0.5f, y+0.55f, z+0.5625f);
+        emit_cuboid_block_faces(id, x, y+0.70f, z+0.4375f, x+0.5f, y+0.90f, z+0.5625f);
+    }
+    if ((flat_get_block(x+1,y,z) == id || flat_get_block(x+1,y,z) == BLOCK_FENCE || flat_get_block(x+1,y,z) == BLOCK_NETHER_BRICK_FENCE) || block_occludes_render_face(flat_get_block(x+1,y,z))) {
+        emit_cuboid_block_faces(id, x+0.5f, y+0.35f, z+0.4375f, x+1.0f, y+0.55f, z+0.5625f);
+        emit_cuboid_block_faces(id, x+0.5f, y+0.70f, z+0.4375f, x+1.0f, y+0.90f, z+0.5625f);
+    }
+    if ((flat_get_block(x,y,z-1) == id || flat_get_block(x,y,z-1) == BLOCK_FENCE || flat_get_block(x,y,z-1) == BLOCK_NETHER_BRICK_FENCE) || block_occludes_render_face(flat_get_block(x,y,z-1))) {
+        emit_cuboid_block_faces(id, x+0.4375f, y+0.35f, z, x+0.5625f, y+0.55f, z+0.5f);
+        emit_cuboid_block_faces(id, x+0.4375f, y+0.70f, z, x+0.5625f, y+0.90f, z+0.5f);
+    }
+    if ((flat_get_block(x,y,z+1) == id || flat_get_block(x,y,z+1) == BLOCK_FENCE || flat_get_block(x,y,z+1) == BLOCK_NETHER_BRICK_FENCE) || block_occludes_render_face(flat_get_block(x,y,z+1))) {
+        emit_cuboid_block_faces(id, x+0.4375f, y+0.35f, z+0.5f, x+0.5625f, y+0.55f, z+1.0f);
+        emit_cuboid_block_faces(id, x+0.4375f, y+0.70f, z+0.5f, x+0.5625f, y+0.90f, z+1.0f);
+    }
+    glEnd();
+}
+
+static int block_uses_special_model(int id) {
+    return id == BLOCK_CHEST || id == BLOCK_FURNACE || id == BLOCK_FURNACE_LIT || block_is_door_id(id) || id == BLOCK_LADDER || id == BLOCK_BED || id == BLOCK_SNOW_LAYER ||
+           id == BLOCK_SLAB || id == BLOCK_WOOD_STAIRS || id == BLOCK_COBBLE_STAIRS ||
+           id == BLOCK_BRICK_STAIRS || id == BLOCK_STONE_BRICK_STAIRS || id == BLOCK_NETHER_BRICK_STAIRS ||
+           id == BLOCK_FENCE || id == BLOCK_NETHER_BRICK_FENCE || id == BLOCK_GLASS_PANE || id == BLOCK_IRON_BARS ||
+           id == BLOCK_LILY_PAD || id == BLOCK_END_PORTAL_FRAME || id == BLOCK_END_PORTAL || id == BLOCK_PORTAL ||
+           id == BLOCK_CACTUS || id == BLOCK_RAILS || id == BLOCK_POWERED_RAIL || id == BLOCK_DETECTOR_RAIL || id == BLOCK_REDSTONE_WIRE ||
+           id == BLOCK_STONE_PRESSURE_PLATE || id == BLOCK_WOOD_PRESSURE_PLATE || id == BLOCK_STONE_BUTTON ||
+           id == BLOCK_SIGN_POST || id == BLOCK_WALL_SIGN ||
+           id == BLOCK_LEVER || id == BLOCK_TORCH || id == BLOCK_REDSTONE_TORCH_OFF || id == BLOCK_REDSTONE_TORCH_ON ||
+           id == BLOCK_VINE;
+}
+
+static void emit_vine_side_quad(int x, int y, int z, int side, float u0, float v0, float u1, float v1) {
+    const float e = 0.05f;
+    if (side == 2) {
+        float xx = (float)x + e;
+        world_tex_vertex(xx, (float)y + 1.0f, (float)z + 1.0f, u0, v0);
+        world_tex_vertex(xx, (float)y,        (float)z + 1.0f, u0, v1);
+        world_tex_vertex(xx, (float)y,        (float)z,        u1, v1);
+        world_tex_vertex(xx, (float)y + 1.0f, (float)z,        u1, v0);
+        world_tex_vertex(xx, (float)y + 1.0f, (float)z,        u1, v0);
+        world_tex_vertex(xx, (float)y,        (float)z,        u1, v1);
+        world_tex_vertex(xx, (float)y,        (float)z + 1.0f, u0, v1);
+        world_tex_vertex(xx, (float)y + 1.0f, (float)z + 1.0f, u0, v0);
+    } else if (side == 8) {
+        float xx = (float)x + 1.0f - e;
+        world_tex_vertex(xx, (float)y,        (float)z + 1.0f, u1, v1);
+        world_tex_vertex(xx, (float)y + 1.0f, (float)z + 1.0f, u1, v0);
+        world_tex_vertex(xx, (float)y + 1.0f, (float)z,        u0, v0);
+        world_tex_vertex(xx, (float)y,        (float)z,        u0, v1);
+        world_tex_vertex(xx, (float)y,        (float)z,        u0, v1);
+        world_tex_vertex(xx, (float)y + 1.0f, (float)z,        u0, v0);
+        world_tex_vertex(xx, (float)y + 1.0f, (float)z + 1.0f, u1, v0);
+        world_tex_vertex(xx, (float)y,        (float)z + 1.0f, u1, v1);
+    } else if (side == 4) {
+        float zz = (float)z + e;
+        world_tex_vertex((float)x + 1.0f, (float)y,        zz, u1, v1);
+        world_tex_vertex((float)x + 1.0f, (float)y + 1.0f, zz, u1, v0);
+        world_tex_vertex((float)x,        (float)y + 1.0f, zz, u0, v0);
+        world_tex_vertex((float)x,        (float)y,        zz, u0, v1);
+        world_tex_vertex((float)x,        (float)y,        zz, u0, v1);
+        world_tex_vertex((float)x,        (float)y + 1.0f, zz, u0, v0);
+        world_tex_vertex((float)x + 1.0f, (float)y + 1.0f, zz, u1, v0);
+        world_tex_vertex((float)x + 1.0f, (float)y,        zz, u1, v1);
+    } else if (side == 1) {
+        float zz = (float)z + 1.0f - e;
+        world_tex_vertex((float)x + 1.0f, (float)y + 1.0f, zz, u0, v0);
+        world_tex_vertex((float)x + 1.0f, (float)y,        zz, u0, v1);
+        world_tex_vertex((float)x,        (float)y,        zz, u1, v1);
+        world_tex_vertex((float)x,        (float)y + 1.0f, zz, u1, v0);
+        world_tex_vertex((float)x,        (float)y + 1.0f, zz, u1, v0);
+        world_tex_vertex((float)x,        (float)y,        zz, u1, v1);
+        world_tex_vertex((float)x + 1.0f, (float)y,        zz, u0, v1);
+        world_tex_vertex((float)x + 1.0f, (float)y + 1.0f, zz, u0, v0);
+    }
+}
+
+static void emit_vine_top_quad(int x, int y, int z, float u0, float v0, float u1, float v1) {
+    const float e = 0.05f;
+    float yy = (float)y + 1.0f - e;
+    world_tex_vertex((float)x + 1.0f, yy, (float)z,        u0, v0);
+    world_tex_vertex((float)x + 1.0f, yy, (float)z + 1.0f, u0, v1);
+    world_tex_vertex((float)x,        yy, (float)z + 1.0f, u1, v1);
+    world_tex_vertex((float)x,        yy, (float)z,        u1, v0);
+}
+
+static void emit_vine_block_model(int x, int y, int z) {
+    int meta = flat_get_meta(x, y, z) & 15;
+    int sides = meta & 15;
+    float u0, v0, u1, v1;
+    terrain_tile_uv(143, &u0, &v0, &u1, &v1);
+    world_style_set_pos(x, y, z);
+    world_light_set_pos(x, y, z);
+    world_set_color_shade(java_foliage_color_at(x, z), 1.0f);
+
+    if (sides & 2) emit_vine_side_quad(x, y, z, 2, u0, v0, u1, v1);
+    if (sides & 8) emit_vine_side_quad(x, y, z, 8, u0, v0, u1, v1);
+    if (sides & 4) emit_vine_side_quad(x, y, z, 4, u0, v0, u1, v1);
+    if (sides & 1) emit_vine_side_quad(x, y, z, 1, u0, v0, u1, v1);
+    if (java_block_normal_cube_at(x, y + 1, z)) emit_vine_top_quad(x, y, z, u0, v0, u1, v1);
+}
+
+static void draw_vine_block_model(int x, int y, int z) {
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.5f);
+    glBegin(GL_QUADS);
+    emit_vine_block_model(x, y, z);
+    glEnd();
+    glDisable(GL_ALPHA_TEST);
+    glColor4f(1, 1, 1, 1);
+}
+
+static void draw_special_block_model(int id, int x, int y, int z) {
+    if (id == BLOCK_CHEST) { draw_connected_chest_block(x, y, z); return; }
+    if (id == BLOCK_BED) {
+        /* BlockBed.setBedBounds(): both head and foot are 9/16 block high.
+           Keep all six faces (including the bottom) so the model has no gaps
+           when viewed from below or from an unloaded neighbouring section. */
+        draw_cuboid_model_for_block_meta(id, flat_get_meta(x, y, z),
+                                         (float)x, (float)y, (float)z,
+                                         0.0f, 0.0f, 0.0f, 1.0f, 9.0f / 16.0f, 1.0f);
+        return;
+    }
+    if (id == BLOCK_FURNACE || id == BLOCK_FURNACE_LIT) { draw_furnace_block_model(id, x, y, z); return; }
+    if (id == BLOCK_SNOW_LAYER) { glBegin(GL_QUADS); emit_snow_layer_block(x, y, z); glEnd(); glColor4f(1,1,1,1); return; }
+    if (block_is_door_id(id)) { draw_door_block_model(id, x, y, z); return; }
+    if (id == BLOCK_LADDER) { draw_ladder_block_model(x, y, z); return; }
+    if (id == BLOCK_VINE) { draw_vine_block_model(x, y, z); return; }
+    if (id == BLOCK_SLAB) { draw_cuboid_model_for_block(id, (float)x, (float)y, (float)z, 0,0,0,1,0.5f,1); return; }
+    if (id == BLOCK_WOOD_STAIRS || id == BLOCK_COBBLE_STAIRS || id == BLOCK_BRICK_STAIRS || id == BLOCK_STONE_BRICK_STAIRS || id == BLOCK_NETHER_BRICK_STAIRS) { draw_stairs_block_model(id, x, y, z); return; }
+    if (id == BLOCK_FENCE || id == BLOCK_NETHER_BRICK_FENCE) { draw_fence_block_model(id, x, y, z); draw_better_snow_overlay_if(x, y, z, 2.0f / 16.0f); return; }
+    if (id == BLOCK_GLASS_PANE || id == BLOCK_IRON_BARS) { draw_cuboid_model_for_block(id, (float)x, (float)y, (float)z, 0.4375f,0,0,0.5625f,1,1); draw_cuboid_model_for_block(id, (float)x, (float)y, (float)z, 0,0,0.4375f,1,1,0.5625f); draw_better_snow_overlay_if(x, y, z, 2.0f / 16.0f); return; }
+    if (id == BLOCK_LILY_PAD) {
+        world_style_set_pos(x, y, z);
+        world_light_set_pos(x, y, z);
+        glBegin(GL_QUADS);
+        emit_flat_quad_tile_tinted((float)x, (float)y + 0.01f, (float)z, (float)x+1, (float)z+1,
+                                   block_texture_resolve(id, flat_get_meta(x,y,z), 1), stivufine_lily_pad_color());
+        glEnd();
+        glColor4f(1,1,1,1);
+        return;
+    }
+    if (id == BLOCK_PORTAL) {
+        float u0, v0, u1, v1;
+        terrain_tile_uv(14, &u0, &v0, &u1, &v1);
+        int portal_meta = flat_get_meta(x, y, z) & 3;
+        int runs_along_x;
+        /* Protocol 47 stores portal axis directly: 1 = X, 2 = Z.  Prefer that
+           authoritative state.  Only old/local worlds with metadata 0 fall
+           back to frame-neighbour inference. */
+        if (portal_meta == 1) runs_along_x = 1;
+        else if (portal_meta == 2) runs_along_x = 0;
+        else {
+            runs_along_x = 1;
+            if (flat_get_block(x, y, z - 1) == BLOCK_PORTAL || flat_get_block(x, y, z + 1) == BLOCK_PORTAL ||
+                flat_get_block(x, y, z - 1) == BLOCK_OBSIDIAN || flat_get_block(x, y, z + 1) == BLOCK_OBSIDIAN) {
+                runs_along_x = 0;
+            }
+        }
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+        /* The desktop OpenGL terrain pass is explicitly two-sided.  Emitting
+           both sides of a 1/4-block slab therefore drew four blended layers
+           through each other (each quad is visible from both directions),
+           causing the dark/flickering portal seen on Linux.  A single centered
+           two-sided sheet has the same silhouette, halves portal overdraw, and
+           uses a compensated alpha to retain the intended opacity. */
+        flat_direct_set_color_light4f(1.0f, 1.0f, 1.0f, 0.8f, flat_fullbright_packed_light());
+        glBegin(GL_QUADS);
+        if (runs_along_x) {
+            world_tex_vertex((float)x,   (float)y,        (float)z + 0.5f, u0, v1);
+            world_tex_vertex((float)x+1, (float)y,        (float)z + 0.5f, u1, v1);
+            world_tex_vertex((float)x+1, (float)y + 1.0f, (float)z + 0.5f, u1, v0);
+            world_tex_vertex((float)x,   (float)y + 1.0f, (float)z + 0.5f, u0, v0);
+        } else {
+            world_tex_vertex((float)x + 0.5f, (float)y,        (float)z,   u0, v1);
+            world_tex_vertex((float)x + 0.5f, (float)y,        (float)z+1, u1, v1);
+            world_tex_vertex((float)x + 0.5f, (float)y + 1.0f, (float)z+1, u1, v0);
+            world_tex_vertex((float)x + 0.5f, (float)y + 1.0f, (float)z,   u0, v0);
+        }
+        glEnd();
+#else
+        flat_direct_set_color_light4f(1.0f, 1.0f, 1.0f, 0.5f, flat_fullbright_packed_light());
+        glBegin(GL_QUADS);
+        if (runs_along_x) {
+            // South face
+            world_tex_vertex((float)x,   (float)y,        (float)z + 0.625f, u0, v1);
+            world_tex_vertex((float)x+1, (float)y,        (float)z + 0.625f, u1, v1);
+            world_tex_vertex((float)x+1, (float)y + 1.0f, (float)z + 0.625f, u1, v0);
+            world_tex_vertex((float)x,   (float)y + 1.0f, (float)z + 0.625f, u0, v0);
+            // North face
+            world_tex_vertex((float)x,   (float)y,        (float)z + 0.375f, u1, v1);
+            world_tex_vertex((float)x,   (float)y + 1.0f, (float)z + 0.375f, u1, v0);
+            world_tex_vertex((float)x+1, (float)y + 1.0f, (float)z + 0.375f, u0, v0);
+            world_tex_vertex((float)x+1, (float)y,        (float)z + 0.375f, u0, v1);
+        } else {
+            // East face
+            world_tex_vertex((float)x + 0.625f, (float)y,        (float)z,   u0, v1);
+            world_tex_vertex((float)x + 0.625f, (float)y,        (float)z+1, u1, v1);
+            world_tex_vertex((float)x + 0.625f, (float)y + 1.0f, (float)z+1, u1, v0);
+            world_tex_vertex((float)x + 0.625f, (float)y + 1.0f, (float)z,   u0, v0);
+            // West face
+            world_tex_vertex((float)x + 0.375f, (float)y,        (float)z,   u1, v1);
+            world_tex_vertex((float)x + 0.375f, (float)y + 1.0f, (float)z,   u1, v0);
+            world_tex_vertex((float)x + 0.375f, (float)y + 1.0f, (float)z+1, u0, v0);
+            world_tex_vertex((float)x + 0.375f, (float)y,        (float)z+1, u0, v1);
+        }
+        glEnd();
+#endif
+        flat_direct_set_color_light4f(1.0f, 1.0f, 1.0f, 1.0f, flat_fullbright_packed_light());
+        return;
+    }
+    if (id == BLOCK_END_PORTAL) {
+        float u0, v0, u1, v1;
+        terrain_tile_uv(15, &u0, &v0, &u1, &v1);
+        // Solid black background layer (layer 0)
+        flat_direct_set_color_light4f(0.0f, 0.0f, 0.0f, 1.0f, flat_fullbright_packed_light());
+        glBegin(GL_QUADS);
+        world_tex_vertex((float)x,   (float)y + 0.01f, (float)z,   u0, v0);
+        world_tex_vertex((float)x+1, (float)y + 0.01f, (float)z,   u1, v0);
+        world_tex_vertex((float)x+1, (float)y + 0.01f, (float)z+1, u1, v1);
+        world_tex_vertex((float)x,   (float)y + 0.01f, (float)z+1, u0, v1);
+        glEnd();
+        int layers = 8;
+        for (int layer = 1; layer <= layers; ++layer) {
+            float t = (float)layer / (float)(layers + 1);
+            float depth = (float)y + 0.01f - t * 0.25f;
+            float cr = t * 0.01f;
+            float cg = t * 0.05f;
+            float cb = 0.15f + t * 0.20f;
+            float alpha = 0.20f * (1.0f - t * 0.5f);
+            flat_direct_set_color_light4f(cr, cg, cb, alpha, flat_fullbright_packed_light());
+            glBegin(GL_QUADS);
+            world_tex_vertex((float)x,   depth, (float)z,   u0, v0);
+            world_tex_vertex((float)x+1, depth, (float)z,   u1, v0);
+            world_tex_vertex((float)x+1, depth, (float)z+1, u1, v1);
+            world_tex_vertex((float)x,   depth, (float)z+1, u0, v1);
+            glEnd();
+        }
+        flat_direct_set_color_light4f(1.0f, 1.0f, 1.0f, 1.0f, flat_fullbright_packed_light());
+        return;
+    }
+    if (id == BLOCK_END_PORTAL_FRAME) { draw_cuboid_model_for_block(id, (float)x, (float)y, (float)z, 0,0,0,1,13.0f/16.0f,1); return; }
+    if (id == BLOCK_CACTUS) { draw_cuboid_model_for_block(id, (float)x, (float)y, (float)z, 0.0625f,0,0.0625f,0.9375f,1,0.9375f); return; }
+    if (id == BLOCK_STONE_PRESSURE_PLATE || id == BLOCK_WOOD_PRESSURE_PLATE) { float h = (flat_get_meta(x,y,z) & 1) ? (1.0f/32.0f) : (1.0f/16.0f); draw_cuboid_model_for_block(id, (float)x, (float)y, (float)z, 0.0625f,0,0.0625f,0.9375f,h,0.9375f); return; }
+    if (id == BLOCK_RAILS || id == BLOCK_POWERED_RAIL || id == BLOCK_DETECTOR_RAIL || id == BLOCK_REDSTONE_WIRE) { glBegin(GL_QUADS); emit_flat_quad_tile((float)x, (float)y + 0.01f, (float)z, (float)x+1, (float)z+1, (id == BLOCK_RAILS) ? 128 : (id == BLOCK_POWERED_RAIL ? 179 : (id == BLOCK_DETECTOR_RAIL ? 195 : 84))); glEnd(); draw_better_snow_overlay_if(x, y, z, id == BLOCK_REDSTONE_WIRE ? 0.01f : 0.05f); return; }
+    if (id == BLOCK_SIGN_POST) { draw_better_snow_overlay_if(x, y, z, 2.0f / 16.0f); draw_cuboid_model_for_block(id, (float)x, (float)y, (float)z, 0.25f,0.55f,0.4375f,0.75f,1.0f,0.5625f); draw_cuboid_model_for_block(id, (float)x, (float)y, (float)z, 0.46875f,0.0f,0.46875f,0.53125f,0.55f,0.53125f); return; }
+    if (id == BLOCK_WALL_SIGN) { draw_cuboid_model_for_block(id, (float)x, (float)y, (float)z, 0.25f,0.35f,0.02f,0.75f,0.85f,0.10f); return; }
+    if (id == BLOCK_STONE_BUTTON) {
+        BlockBounds bb = block_bounds_for_selection(id, x, y, z);
+        draw_cuboid_model_for_block(id, (float)x, (float)y, (float)z,
+                                    bb.x0 - (float)x, bb.y0 - (float)y, bb.z0 - (float)z,
+                                    bb.x1 - (float)x, bb.y1 - (float)y, bb.z1 - (float)z);
+        return;
+    }
+    if (id == BLOCK_LEVER) { draw_lever_block_model(x, y, z); draw_better_snow_overlay_if(x, y, z, 2.0f / 16.0f); return; }
+    if (id == BLOCK_TORCH || id == BLOCK_REDSTONE_TORCH_OFF || id == BLOCK_REDSTONE_TORCH_ON) { draw_torch_block_model(id, x, y, z); if (id != BLOCK_TORCH) { int side = flat_get_meta(x, y, z) & 7; if (side < 1 || side > 4) draw_better_snow_overlay_if(x, y, z, 2.0f / 16.0f); } return; }
+}
+
+
+static int liquid_same_family_at(int x, int y, int z, int is_water) {
+    int id = flat_get_block(x, y, z);
+    return is_water ? block_is_water(id) : block_is_lava(id);
+}
+
+/* RenderBlocks.func_1224_a style weighted height for Beta liquid corners. */
+static float liquid_corner_height(int x, int y, int z, int is_water) {
+    int count = 0;
+    float sum = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        int sx = x - (i & 1);
+        int sz = z - ((i >> 1) & 1);
+        if (liquid_same_family_at(sx, y + 1, sz, is_water)) return 1.0f;
+        if (!liquid_same_family_at(sx, y, sz, is_water)) {
+            if (!block_material_blocks_liquid(flat_get_block(sx, y, sz))) {
+                sum += 1.0f;
+                count++;
+            }
+        } else {
+            int level = flat_get_level(sx, y, sz);
+            if (level >= 8 || level == 0) {
+                sum += fluid_decay_height(level) * 10.0f;
+                count += 10;
+            }
+            sum += fluid_decay_height(level);
+            count++;
+        }
+    }
+    if (count <= 0) return 0.0f;
+    return 1.0f - sum / (float)count;
+}
+
+
+static float liquid_flow_angle_at(int x, int y, int z, int is_water) {
+    float vx = 0.0f, vy = 0.0f, vz = 0.0f;
+    (void)vy;
+    fluid_flow_vector_at(x, y, z, is_water, &vx, &vy, &vz);
+    if (vx == 0.0f && vz == 0.0f) return -1000.0f;
+    return atan2f(vz, vx) - (float)M_PI * 0.5f;
+}
+
+static void liquid_top_uvs_source(int tile, float angle,
+                                  float *u00, float *v00, float *u01, float *v01,
+                                  float *u11, float *v11, float *u10, float *v10) {
+    float aw = tex_terrain.w ? (float)tex_terrain.w : 256.0f;
+    float ah = tex_terrain.h ? (float)tex_terrain.h : 256.0f;
+    int tx, ty, tile_w, tile_h;
+    stivufine_terrain_tile_pixel_rect(tile, &tx, &ty, &tile_w, &tile_h);
+    if (tile_w <= 0) tile_w = 16;
+    if (tile_h <= 0) tile_h = 16;
+
+    int flowing = angle > -999.0f;
+    float cu = ((float)tx + (flowing ? (float)tile_w : (float)tile_w * 0.5f)) / aw;
+    float cv = ((float)ty + (flowing ? (float)tile_h : (float)tile_h * 0.5f)) / ah;
+    if (!flowing) angle = 0.0f;
+
+    float sx = sinf(angle) * ((float)tile_w * 0.5f) / aw;
+    float cz_u = cosf(angle) * ((float)tile_w * 0.5f) / aw;
+    float sx_v = sinf(angle) * ((float)tile_h * 0.5f) / ah;
+    float cz_v = cosf(angle) * ((float)tile_h * 0.5f) / ah;
+    *u00 = cu - cz_u - sx; *v00 = cv - cz_v + sx_v;
+    *u01 = cu - cz_u + sx; *v01 = cv + cz_v + sx_v;
+    *u11 = cu + cz_u + sx; *v11 = cv + cz_v - sx_v;
+    *u10 = cu + cz_u - sx; *v10 = cv - cz_v - sx_v;
+}
+
+
+static void liquid_side_uvs_source(int tile, float h_a, float h_b,
+                                   float *u0, float *u1, float *v_a, float *v_b, float *v_bottom) {
+    float aw = tex_terrain.w ? (float)tex_terrain.w : 256.0f;
+    float ah = tex_terrain.h ? (float)tex_terrain.h : 256.0f;
+    int tx, ty, tile_w, tile_h;
+    stivufine_terrain_tile_pixel_rect(tile, &tx, &ty, &tile_w, &tile_h);
+    if (tile_w <= 0) tile_w = 16;
+    if (tile_h <= 0) tile_h = 16;
+    *u0 = ((float)tx + 0.01f) / aw;
+    *u1 = ((float)tx + (float)tile_w - 0.01f) / aw;
+    *v_a = ((float)ty + (1.0f - h_a) * (float)tile_h) / ah;
+    *v_b = ((float)ty + (1.0f - h_b) * (float)tile_h) / ah;
+    *v_bottom = ((float)ty + (float)tile_h - 0.01f) / ah;
+}
+
+static void emit_liquid_block_faces(int id, int x, int y, int z) {
+    int is_water = (id == BLOCK_WATER || id == BLOCK_STILL_WATER);
+    int top_tile = liquid_top_tile_for_block(id);
+    int side_tile = liquid_side_tile_for_block(id);
+    float h00 = liquid_corner_height(x, y, z, is_water);
+    float h01 = liquid_corner_height(x, y, z + 1, is_water);
+    float h11 = liquid_corner_height(x + 1, y, z + 1, is_water);
+    float h10 = liquid_corner_height(x + 1, y, z, is_water);
+    float x0 = (float)x, x1 = (float)x + 1.0f;
+    float y0 = (float)y;
+    float z0 = (float)z, z1 = (float)z + 1.0f;
+    float u0, v0, u1, v1;
+
+    world_style_set_pos(x, y, z);
+
+    if (liquid_face_exposed(x, y, z, 1)) {
+        world_light_set_pos_for_face(x, y, z, 1);
+        world_set_liquid_shade(is_water, x, z, 1.0f);
+        float u00, v00, u01, v01, u11, v11, u10, v10;
+        float flow_angle = liquid_flow_angle_at(x, y, z, is_water);
+        int surface_tile = flow_angle > -999.0f ? side_tile : top_tile;
+        liquid_top_uvs_source(surface_tile, flow_angle,
+                              &u00, &v00, &u01, &v01, &u11, &v11, &u10, &v10);
+        world_tex_vertex(x0, (float)y + h00, z0, u00, v00);
+        world_tex_vertex(x0, (float)y + h01, z1, u01, v01);
+        world_tex_vertex(x1, (float)y + h11, z1, u11, v11);
+        world_tex_vertex(x1, (float)y + h10, z0, u10, v10);
+    }
+
+    if (liquid_face_exposed(x, y, z, 0)) {
+        world_light_set_pos_for_face(x, y, z, 0);
+        world_set_liquid_shade(is_water, x, z, 0.5f);
+        terrain_tile_uv(top_tile, &u0, &v0, &u1, &v1);
+        world_tex_vertex(x0, y0, z1, u0, v0);
+        world_tex_vertex(x1, y0, z1, u1, v0);
+        world_tex_vertex(x1, y0, z0, u1, v1);
+        world_tex_vertex(x0, y0, z0, u0, v1);
+    }
+
+    if (liquid_face_exposed(x, y, z, 2)) {
+        float vu0, vu1, va, vb, vbot;
+        liquid_side_uvs_source(side_tile, h10, h00, &vu0, &vu1, &va, &vb, &vbot);
+        world_light_set_pos_for_face(x, y, z, 2);
+        world_set_liquid_shade(is_water, x, z, 0.8f);
+        world_tex_vertex(x1, (float)y + h10, z0, vu0, va);
+        world_tex_vertex(x0, (float)y + h00, z0, vu1, vb);
+        world_tex_vertex(x0, y0, z0, vu1, vbot);
+        world_tex_vertex(x1, y0, z0, vu0, vbot);
+    }
+    if (liquid_face_exposed(x, y, z, 3)) {
+        float vu0, vu1, va, vb, vbot;
+        liquid_side_uvs_source(side_tile, h01, h11, &vu0, &vu1, &va, &vb, &vbot);
+        world_light_set_pos_for_face(x, y, z, 3);
+        world_set_liquid_shade(is_water, x, z, 0.8f);
+        world_tex_vertex(x0, (float)y + h01, z1, vu0, va);
+        world_tex_vertex(x1, (float)y + h11, z1, vu1, vb);
+        world_tex_vertex(x1, y0, z1, vu1, vbot);
+        world_tex_vertex(x0, y0, z1, vu0, vbot);
+    }
+    if (liquid_face_exposed(x, y, z, 4)) {
+        float vu0, vu1, va, vb, vbot;
+        liquid_side_uvs_source(side_tile, h00, h01, &vu0, &vu1, &va, &vb, &vbot);
+        world_light_set_pos_for_face(x, y, z, 4);
+        world_set_liquid_shade(is_water, x, z, 0.6f);
+        world_tex_vertex(x0, (float)y + h00, z0, vu0, va);
+        world_tex_vertex(x0, (float)y + h01, z1, vu1, vb);
+        world_tex_vertex(x0, y0, z1, vu1, vbot);
+        world_tex_vertex(x0, y0, z0, vu0, vbot);
+    }
+    if (liquid_face_exposed(x, y, z, 5)) {
+        float vu0, vu1, va, vb, vbot;
+        liquid_side_uvs_source(side_tile, h11, h10, &vu0, &vu1, &va, &vb, &vbot);
+        world_light_set_pos_for_face(x, y, z, 5);
+        world_set_liquid_shade(is_water, x, z, 0.6f);
+        world_tex_vertex(x1, (float)y + h11, z1, vu0, va);
+        world_tex_vertex(x1, (float)y + h10, z0, vu1, vb);
+        world_tex_vertex(x1, y0, z0, vu1, vbot);
+        world_tex_vertex(x1, y0, z1, vu0, vbot);
+    }
+}
+
+static void draw_liquid_block(int id, float x, float y, float z) {
+    int is_water = (id == BLOCK_WATER || id == BLOCK_STILL_WATER);
+    int top_tile = liquid_top_tile_for_block(id);
+    int side_tile = liquid_side_tile_for_block(id);
+    int ix = (int)x, iy = (int)y, iz = (int)z;
+    float h00 = liquid_corner_height(ix, iy, iz, is_water);
+    float h01 = liquid_corner_height(ix, iy, iz + 1, is_water);
+    float h11 = liquid_corner_height(ix + 1, iy, iz + 1, is_water);
+    float h10 = liquid_corner_height(ix + 1, iy, iz, is_water);
+    float x0 = x, x1 = x + 1.0f;
+    float y0 = y;
+    float z0 = z, z1 = z + 1.0f;
+    float u0, v0, u1, v1;
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    world_style_set_pos(ix, iy, iz);
+
+    if (liquid_face_exposed(ix, iy, iz, 1)) {
+        world_set_liquid_shade(is_water, ix, iz, 1.0f);
+        float u00, v00, u01, v01, u11, v11, u10, v10;
+        float flow_angle = liquid_flow_angle_at(ix, iy, iz, is_water);
+        int surface_tile = flow_angle > -999.0f ? side_tile : top_tile;
+        liquid_top_uvs_source(surface_tile, flow_angle,
+                              &u00, &v00, &u01, &v01, &u11, &v11, &u10, &v10);
+        glBegin(GL_QUADS);
+        world_tex_vertex(x0, y + h00, z0, u00, v00);
+        world_tex_vertex(x0, y + h01, z1, u01, v01);
+        world_tex_vertex(x1, y + h11, z1, u11, v11);
+        world_tex_vertex(x1, y + h10, z0, u10, v10);
+        glEnd();
+    }
+
+    if (liquid_face_exposed(ix, iy, iz, 0)) {
+        world_set_liquid_shade(is_water, ix, iz, 0.5f);
+        terrain_tile_uv(top_tile, &u0, &v0, &u1, &v1);
+        glBegin(GL_QUADS);
+        world_tex_vertex(x0, y0, z1, u0, v0); world_tex_vertex(x1, y0, z1, u1, v0); world_tex_vertex(x1, y0, z0, u1, v1); world_tex_vertex(x0, y0, z0, u0, v1);
+        glEnd();
+    }
+
+    glBegin(GL_QUADS);
+    world_set_liquid_shade(is_water, ix, iz, 0.8f);
+    if (liquid_face_exposed(ix, iy, iz, 2)) {
+        float vu0, vu1, va, vb, vbot;
+        liquid_side_uvs_source(side_tile, h10, h00, &vu0, &vu1, &va, &vb, &vbot);
+        world_tex_vertex(x1,y+h10,z0,vu0,va); world_tex_vertex(x0,y+h00,z0,vu1,vb); world_tex_vertex(x0,y0,z0,vu1,vbot); world_tex_vertex(x1,y0,z0,vu0,vbot);
+    }
+    if (liquid_face_exposed(ix, iy, iz, 3)) {
+        float vu0, vu1, va, vb, vbot;
+        liquid_side_uvs_source(side_tile, h01, h11, &vu0, &vu1, &va, &vb, &vbot);
+        world_tex_vertex(x0,y+h01,z1,vu0,va); world_tex_vertex(x1,y+h11,z1,vu1,vb); world_tex_vertex(x1,y0,z1,vu1,vbot); world_tex_vertex(x0,y0,z1,vu0,vbot);
+    }
+    if (liquid_face_exposed(ix, iy, iz, 4)) {
+        float vu0, vu1, va, vb, vbot;
+        liquid_side_uvs_source(side_tile, h00, h01, &vu0, &vu1, &va, &vb, &vbot);
+        world_set_liquid_shade(is_water, ix, iz, 0.6f);
+        world_tex_vertex(x0,y+h00,z0,vu0,va); world_tex_vertex(x0,y+h01,z1,vu1,vb); world_tex_vertex(x0,y0,z1,vu1,vbot); world_tex_vertex(x0,y0,z0,vu0,vbot);
+    }
+    if (liquid_face_exposed(ix, iy, iz, 5)) {
+        float vu0, vu1, va, vb, vbot;
+        liquid_side_uvs_source(side_tile, h11, h10, &vu0, &vu1, &va, &vb, &vbot);
+        world_set_liquid_shade(is_water, ix, iz, 0.6f);
+        world_tex_vertex(x1,y+h11,z1,vu0,va); world_tex_vertex(x1,y+h10,z0,vu1,vb); world_tex_vertex(x1,y0,z0,vu1,vbot); world_tex_vertex(x1,y0,z1,vu0,vbot);
+    }
+    glEnd();
+
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glColor4f(1,1,1,1);
+}
+
+static void draw_world_block_exposed(int id, int x, int y, int z) {
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+    pex_shaders_set_mesh_entity((float)id);
+#endif
+    if (id == 0) return;
+    if (id == BLOCK_SNOW_LAYER) { glBegin(GL_QUADS); emit_snow_layer_block(x, y, z); glEnd(); glColor4f(1,1,1,1); return; }
+    if (block_is_liquid(id) && flat_separate_liquid_pass_enabled()) { draw_liquid_block(id, (float)x, (float)y, (float)z); return; }
+    if (block_uses_special_model(id)) { draw_special_block_model(id, x, y, z); return; }
+    if (block_uses_cross_plant_model(id)) { draw_cross_plant_block(id, (float)x, (float)y, (float)z); if (stivufine_better_snow_cross_target(id)) draw_better_snow_overlay_if(x, y, z, 2.0f / 16.0f); return; }
+    for (int face = 0; face < 6; face++) {
+        if (flat_face_exposed_for_block(id, x, y, z, face)) draw_world_block_face(id, x, y, z, face);
+    }
+}
+
+static void rebuild_flat_chunk_list(int cx, int cz) {
+    if (!tex_terrain.id) return;
+    if (cx < 0 || cx >= FLAT_RENDER_CHUNKS || cz < 0 || cz >= FLAT_RENDER_CHUNKS) return;
+
+    if (g_flat_world_chunk_lists[cz][cx] == 0) {
+        g_flat_world_chunk_lists[cz][cx] = glGenLists(1);
+    }
+    if (g_flat_world_chunk_liquid_lists[cz][cx] == 0) {
+        g_flat_world_chunk_liquid_lists[cz][cx] = glGenLists(1);
+    }
+    if (g_flat_world_chunk_lists[cz][cx] == 0 || g_flat_world_chunk_liquid_lists[cz][cx] == 0) return;
+
+    int origin_x = g_async_mesh_origin_override ? g_async_mesh_origin_x : g_flat_world_origin_x;
+    int origin_z = g_async_mesh_origin_override ? g_async_mesh_origin_z : g_flat_world_origin_z;
+    int x0 = origin_x + cx * FLAT_RENDER_CHUNK;
+    int z0 = origin_z + cz * FLAT_RENDER_CHUNK;
+    int x1 = x0 + FLAT_RENDER_CHUNK - 1;
+    int z1 = z0 + FLAT_RENDER_CHUNK - 1;
+    if (x1 >= origin_x + FLAT_WORLD_SIZE) x1 = origin_x + FLAT_WORLD_SIZE - 1;
+    if (z1 >= origin_z + FLAT_WORLD_SIZE) z1 = origin_z + FLAT_WORLD_SIZE - 1;
+
+    int chunk_ymax = FLAT_WORLD_Y_MIN;
+    for (int y = FLAT_WORLD_Y_MAX; y >= FLAT_WORLD_Y_MIN; y--) {
+        int found = 0;
+        for (int z = z0; z <= z1 && !found; z++) for (int x = x0; x <= x1; x++) {
+            if (flat_get_block(x, y, z) != 0) { found = 1; break; }
+        }
+        if (found) { chunk_ymax = y + 1; break; }
+    }
+    if (chunk_ymax > FLAT_WORLD_Y_MAX) chunk_ymax = FLAT_WORLD_Y_MAX;
+
+    int chunk_has_liquid = 0;
+    int chunk_has_cutout = 0;
+    int chunk_has_special = 0;
+
+    glNewList(g_flat_world_chunk_lists[cz][cx], GL_COMPILE);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+
+    /* Solid opaque pass.  Fast and Fancy now share the same terrain topology.
+       Fast visuals still use opaque leaf textures/no grass overlay, but liquids
+       and cutouts are no longer merged into the legacy Fast solid mesh. */
+    glDisable(GL_ALPHA_TEST);
+    glBegin(GL_QUADS);
+    for (int y = FLAT_WORLD_Y_MIN; y <= chunk_ymax; y++) {
+        for (int z = z0; z <= z1; z++) {
+            for (int x = x0; x <= x1; x++) {
+                int id = flat_get_block(x, y, z);
+                if (!id) continue;
+                if (id == BLOCK_SNOW_LAYER) {
+                    emit_snow_layer_block(x, y, z);
+                    continue;
+                }
+                if (block_is_liquid(id)) {
+                    if (flat_separate_liquid_pass_enabled()) { chunk_has_liquid = 1; continue; }
+                    /* Non-Android Fast: opaque full-cube water/lava. */
+                }
+                if (block_uses_special_model(id)) { chunk_has_special = 1; continue; }
+                if (block_uses_cross_plant_model(id)) { chunk_has_cutout = 1; continue; }
+                if (id == BLOCK_LEAVES && flat_fancy_cutout_terrain_enabled()) { chunk_has_cutout = 1; continue; }
+                if (id == BLOCK_GRASS && flat_fancy_grass_overlay_enabled()) {
+                    for (int face = 2; face <= 5; face++) {
+                        if (grass_side_overlay_face_needed(x, y, z, face)) { chunk_has_cutout = 1; break; }
+                    }
+                }
+                for (int face = 0; face < 6; face++) {
+                    if (flat_face_exposed_for_block(id, x, y, z, face)) emit_world_block_face(id, x, y, z, face);
+                }
+            }
+        }
+    }
+    glEnd();
+
+    if (chunk_has_special) {
+        for (int y = FLAT_WORLD_Y_MIN; y <= chunk_ymax; y++) {
+            for (int z = z0; z <= z1; z++) {
+                for (int x = x0; x <= x1; x++) {
+                    int id = flat_get_block(x, y, z);
+                    if (block_uses_special_model(id)) draw_special_block_model(id, x, y, z);
+                }
+            }
+        }
+    }
+
+    if (chunk_has_cutout) {
+        glDisable(GL_BLEND);
+        glDepthMask(GL_TRUE);
+        glEnable(GL_ALPHA_TEST);
+        glAlphaFunc(GL_GREATER, 0.5f);
+        glBegin(GL_QUADS);
+        for (int y = FLAT_WORLD_Y_MIN; y <= chunk_ymax; y++) {
+            for (int z = z0; z <= z1; z++) {
+                for (int x = x0; x <= x1; x++) {
+                    int id = flat_get_block(x, y, z);
+                    if (!id) continue;
+                    if (block_uses_cross_plant_model(id)) {
+                        emit_cross_plant_block(id, x, y, z);
+                        if (stivufine_better_snow_cross_target(id)) emit_better_snow_overlay_if(x, y, z, 2.0f / 16.0f);
+                        continue;
+                    }
+                    if (id == BLOCK_LEAVES && flat_fancy_cutout_terrain_enabled()) {
+                        for (int face = 0; face < 6; face++) {
+                            if (flat_face_exposed_for_block(id, x, y, z, face)) emit_world_block_face(id, x, y, z, face);
+                        }
+                    }
+                    if (id == BLOCK_GRASS && flat_fancy_grass_overlay_enabled()) {
+                        for (int face = 2; face <= 5; face++) {
+                            if (grass_side_overlay_face_needed(x, y, z, face)) emit_grass_side_overlay_face(x, y, z, face);
+                        }
+                    }
+                }
+            }
+        }
+        glEnd();
+        glDisable(GL_ALPHA_TEST);
+    }
+    glColor4f(1,1,1,1);
+    glEndList();
+
+    glNewList(g_flat_world_chunk_liquid_lists[cz][cx], GL_COMPILE);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    if (chunk_has_liquid && flat_separate_liquid_pass_enabled()) {
+        glBegin(GL_QUADS);
+        for (int y = FLAT_WORLD_Y_MIN; y <= chunk_ymax; y++) {
+            for (int z = z0; z <= z1; z++) {
+                for (int x = x0; x <= x1; x++) {
+                    int id = flat_get_block(x, y, z);
+                    if (block_is_liquid(id)) emit_liquid_block_faces(id, x, y, z);
+                }
+            }
+        }
+        glEnd();
+    }
+    glColor4f(1,1,1,1);
+    glEndList();
+
+    g_flat_world_chunk_dirty[cz][cx] = 0;
+    g_flat_world_chunk_valid[cz][cx] = 1;
+    g_flat_world_chunk_has_liquid[cz][cx] = chunk_has_liquid && flat_separate_liquid_pass_enabled();
+}
+
+
+
+/* Java-style 16x16x16 render sections -------------------------------------------------
+   The legacy C renderer cached one full 16x256x16 column per display list.  A
+   single flower/snow/door/water edit dirtied the whole column and rebuilding it
+   scanned up to 65k block positions.  Beta Java used 16x16x16 WorldRenderer
+   sections instead; this is the same idea ported to the C renderer. */
+typedef struct FlatRenderSectionRef {
+    int cx, cz, sy;
+    float dist2;
+} FlatRenderSectionRef;
+
+#define FLAT_MAX_VISIBLE_SECTIONS (FLAT_RENDER_CHUNKS * FLAT_RENDER_CHUNKS * FLAT_RENDER_SECTIONS_Y)
+static FlatRenderSectionRef g_flat_visible_sections[FLAT_MAX_VISIBLE_SECTIONS];
+static FlatRenderSectionRef g_flat_visible_sorted_sections[FLAT_MAX_VISIBLE_SECTIONS];
+static int g_flat_visible_sorted_count = 0;
+static int g_flat_section_sort_valid = 0;
+static int g_flat_section_sort_last_count = -1;
+static float g_flat_section_sort_x = 0.0f, g_flat_section_sort_y = 0.0f, g_flat_section_sort_z = 0.0f;
+static float g_flat_section_sort_yaw = 0.0f, g_flat_section_sort_pitch = 0.0f;
+
+typedef struct FlatFrustum { float p[6][4]; } FlatFrustum;
+
+static void flat_frustum_normalize(float p[4]) {
+    float l = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+    if (l <= 0.000001f) return;
+    p[0] /= l; p[1] /= l; p[2] /= l; p[3] /= l;
+}
+
+static void flat_frustum_build(FlatFrustum *fr) {
+    float proj[16], modl[16], clip[16];
+    glGetFloatv(GL_PROJECTION_MATRIX, proj);
+    glGetFloatv(GL_MODELVIEW_MATRIX, modl);
+
+    clip[ 0] = modl[ 0] * proj[ 0] + modl[ 1] * proj[ 4] + modl[ 2] * proj[ 8] + modl[ 3] * proj[12];
+    clip[ 1] = modl[ 0] * proj[ 1] + modl[ 1] * proj[ 5] + modl[ 2] * proj[ 9] + modl[ 3] * proj[13];
+    clip[ 2] = modl[ 0] * proj[ 2] + modl[ 1] * proj[ 6] + modl[ 2] * proj[10] + modl[ 3] * proj[14];
+    clip[ 3] = modl[ 0] * proj[ 3] + modl[ 1] * proj[ 7] + modl[ 2] * proj[11] + modl[ 3] * proj[15];
+    clip[ 4] = modl[ 4] * proj[ 0] + modl[ 5] * proj[ 4] + modl[ 6] * proj[ 8] + modl[ 7] * proj[12];
+    clip[ 5] = modl[ 4] * proj[ 1] + modl[ 5] * proj[ 5] + modl[ 6] * proj[ 9] + modl[ 7] * proj[13];
+    clip[ 6] = modl[ 4] * proj[ 2] + modl[ 5] * proj[ 6] + modl[ 6] * proj[10] + modl[ 7] * proj[14];
+    clip[ 7] = modl[ 4] * proj[ 3] + modl[ 5] * proj[ 7] + modl[ 6] * proj[11] + modl[ 7] * proj[15];
+    clip[ 8] = modl[ 8] * proj[ 0] + modl[ 9] * proj[ 4] + modl[10] * proj[ 8] + modl[11] * proj[12];
+    clip[ 9] = modl[ 8] * proj[ 1] + modl[ 9] * proj[ 5] + modl[10] * proj[ 9] + modl[11] * proj[13];
+    clip[10] = modl[ 8] * proj[ 2] + modl[ 9] * proj[ 6] + modl[10] * proj[10] + modl[11] * proj[14];
+    clip[11] = modl[ 8] * proj[ 3] + modl[ 9] * proj[ 7] + modl[10] * proj[11] + modl[11] * proj[15];
+    clip[12] = modl[12] * proj[ 0] + modl[13] * proj[ 4] + modl[14] * proj[ 8] + modl[15] * proj[12];
+    clip[13] = modl[12] * proj[ 1] + modl[13] * proj[ 5] + modl[14] * proj[ 9] + modl[15] * proj[13];
+    clip[14] = modl[12] * proj[ 2] + modl[13] * proj[ 6] + modl[14] * proj[10] + modl[15] * proj[14];
+    clip[15] = modl[12] * proj[ 3] + modl[13] * proj[ 7] + modl[14] * proj[11] + modl[15] * proj[15];
+
+    /* right, left, bottom, top, far, near */
+    fr->p[0][0] = clip[ 3] - clip[ 0]; fr->p[0][1] = clip[ 7] - clip[ 4]; fr->p[0][2] = clip[11] - clip[ 8]; fr->p[0][3] = clip[15] - clip[12];
+    fr->p[1][0] = clip[ 3] + clip[ 0]; fr->p[1][1] = clip[ 7] + clip[ 4]; fr->p[1][2] = clip[11] + clip[ 8]; fr->p[1][3] = clip[15] + clip[12];
+    fr->p[2][0] = clip[ 3] + clip[ 1]; fr->p[2][1] = clip[ 7] + clip[ 5]; fr->p[2][2] = clip[11] + clip[ 9]; fr->p[2][3] = clip[15] + clip[13];
+    fr->p[3][0] = clip[ 3] - clip[ 1]; fr->p[3][1] = clip[ 7] - clip[ 5]; fr->p[3][2] = clip[11] - clip[ 9]; fr->p[3][3] = clip[15] - clip[13];
+    fr->p[4][0] = clip[ 3] - clip[ 2]; fr->p[4][1] = clip[ 7] - clip[ 6]; fr->p[4][2] = clip[11] - clip[10]; fr->p[4][3] = clip[15] - clip[14];
+    fr->p[5][0] = clip[ 3] + clip[ 2]; fr->p[5][1] = clip[ 7] + clip[ 6]; fr->p[5][2] = clip[11] + clip[10]; fr->p[5][3] = clip[15] + clip[14];
+    for (int i = 0; i < 6; i++) flat_frustum_normalize(fr->p[i]);
+}
+
+static int flat_aabb_in_frustum(const FlatFrustum *fr, float x0, float y0, float z0, float x1, float y1, float z1) {
+    for (int i = 0; i < 6; i++) {
+        const float *p = fr->p[i];
+        float x = (p[0] >= 0.0f) ? x1 : x0;
+        float y = (p[1] >= 0.0f) ? y1 : y0;
+        float z = (p[2] >= 0.0f) ? z1 : z0;
+        if (p[0] * x + p[1] * y + p[2] * z + p[3] < 0.0f) return 0;
+    }
+    return 1;
+}
+
+static int flat_section_ref_cmp_near(const void *a, const void *b) {
+    const FlatRenderSectionRef *ra = (const FlatRenderSectionRef*)a;
+    const FlatRenderSectionRef *rb = (const FlatRenderSectionRef*)b;
+    if (ra->dist2 < rb->dist2) return -1;
+    if (ra->dist2 > rb->dist2) return 1;
+    return 0;
+}
+
+static float flat_angle_delta_abs(float a, float b) {
+    float d = a - b;
+    while (d < -180.0f) d += 360.0f;
+    while (d >= 180.0f) d -= 360.0f;
+    if (d < 0.0f) d = -d;
+    return d;
+}
+
+static int flat_renderer_sort_needed(float px, float py, float pz, int count) {
+    if (g_flat_renderer_sort_dirty) return 1;
+    if (!g_flat_section_sort_valid || count != g_flat_section_sort_last_count) return 1;
+    float dx = px - g_flat_section_sort_x;
+    float dy = py - g_flat_section_sort_y;
+    float dz = pz - g_flat_section_sort_z;
+    /* RenderGlobal.sortAndRender in 1.5.2 only pays the sort/recenter cost
+       after the camera has moved several blocks.  Also refresh occasionally on
+       large view-angle changes so translucent water remains acceptable. */
+    if (dx * dx + dy * dy + dz * dz > 16.0f) return 1;
+    if (flat_angle_delta_abs(g_player_render_frame.yaw, g_flat_section_sort_yaw) > 12.0f) return 1;
+    if (fabsf(g_player_render_frame.pitch - g_flat_section_sort_pitch) > 12.0f) return 1;
+    return 0;
+}
+
+static void flat_note_renderer_sorted(float px, float py, float pz, int count) {
+    g_flat_section_sort_valid = 1;
+    g_flat_section_sort_last_count = count;
+    g_flat_section_sort_x = px;
+    g_flat_section_sort_y = py;
+    g_flat_section_sort_z = pz;
+    g_flat_section_sort_yaw = g_player_render_frame.yaw;
+    g_flat_section_sort_pitch = g_player_render_frame.pitch;
+    g_flat_renderer_sort_dirty = 0;
+}
+
+static void ensure_flat_section_lists(int sy, int cz, int cx) {
+    if (g_flat_section_lists[sy][cz][cx][0] == 0 || g_flat_section_lists[sy][cz][cx][1] == 0) {
+        GLuint base = glGenLists(2);
+        if (base != 0) {
+            g_flat_section_lists[sy][cz][cx][0] = base;
+            g_flat_section_lists[sy][cz][cx][1] = base + 1;
+        }
+    }
+}
+
+
+static void async_mesh_android_cooperate(int layer_y) {
+#if defined(PEX_PLATFORM_ANDROID_TV)
+    (void)layer_y;
+    if (g_flat_direct_capture_only) SDL_Delay(1);
+#elif defined(PEX_PLATFORM_ANDROID)
+    if (g_flat_direct_capture_only && (layer_y & 1)) SDL_Delay(1);
+#else
+    (void)layer_y;
+#endif
+}
+
+static void rebuild_flat_section_mesh(int sy, int cx, int cz) {
+    PexRendererBackend *rb = flat_direct_backend();
+    if (!tex_terrain.rgba) return;
+    if (!g_flat_direct_capture_only && !rb) return;
+    if (cx < 0 || cx >= FLAT_RENDER_CHUNKS || cz < 0 || cz >= FLAT_RENDER_CHUNKS || sy < 0 || sy >= FLAT_RENDER_SECTIONS_Y) return;
+
+    int origin_x = g_async_mesh_origin_override ? g_async_mesh_origin_x : g_flat_world_origin_x;
+    int origin_z = g_async_mesh_origin_override ? g_async_mesh_origin_z : g_flat_world_origin_z;
+    int x0 = origin_x + cx * FLAT_RENDER_CHUNK;
+    int z0 = origin_z + cz * FLAT_RENDER_CHUNK;
+    int x1 = x0 + FLAT_RENDER_CHUNK - 1;
+    int z1 = z0 + FLAT_RENDER_CHUNK - 1;
+    int y0 = FLAT_WORLD_Y_MIN + sy * FLAT_RENDER_SECTION;
+    int y1 = y0 + FLAT_RENDER_SECTION - 1;
+    if (x1 >= origin_x + FLAT_WORLD_SIZE) x1 = origin_x + FLAT_WORLD_SIZE - 1;
+    if (z1 >= origin_z + FLAT_WORLD_SIZE) z1 = origin_z + FLAT_WORLD_SIZE - 1;
+    if (y1 > FLAT_WORLD_Y_MAX) y1 = FLAT_WORLD_Y_MAX;
+
+    int has0 = 0, has1 = 0, has_special = 0, has_cutout = 0, has_alpha_texture = 0;
+    int cancelled = 0;
+    FlatDirectMeshBuilder mb0, mb1;
+    memset(&mb0, 0, sizeof(mb0));
+    memset(&mb1, 0, sizeof(mb1));
+
+    flat_direct_begin(&mb0);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glDisable(GL_BLEND);
+    glDisable(GL_ALPHA_TEST);
+
+    /* Layer 0: genuinely opaque, one-sided geometry. This is the dominant world
+       surface and must retain early depth rejection/back-face culling on GLES. */
+    for (int y = y0; y <= y1 && !cancelled; y++) {
+        for (int z = z0; z <= z1; z++) {
+            if (async_section_mesh_cancel_requested()) { cancelled = 1; break; }
+            for (int x = x0; x <= x1; x++) {
+                if (((x - x0) & 3) == 0 && async_section_mesh_cancel_requested()) { cancelled = 1; break; }
+                int id = flat_get_block(x, y, z);
+                if (!id) continue;
+                if (id == BLOCK_PORTAL || id == BLOCK_END_PORTAL) { has1 = 1; continue; }
+                if (block_is_liquid(id)) { if (flat_separate_liquid_pass_enabled()) { has1 = 1; continue; } }
+                if (id == BLOCK_GLASS || id == BLOCK_ICE || id == BLOCK_SNOW_LAYER) { has_alpha_texture = 1; continue; }
+                if (block_uses_special_model(id)) { has_special = 1; continue; }
+                if (block_uses_cross_plant_model(id)) { has_cutout = 1; continue; }
+                if (id == BLOCK_LEAVES && flat_fancy_cutout_terrain_enabled()) { has_cutout = 1; continue; }
+                if (id == BLOCK_GRASS && flat_fancy_grass_overlay_enabled()) {
+                    for (int face = 2; face <= 5; face++) {
+                        if (grass_side_overlay_face_needed(x, y, z, face)) { has_cutout = 1; break; }
+                    }
+                }
+                for (int face = 0; face < 6; face++) {
+                    if (flat_face_exposed_for_block(id, x, y, z, face)) { emit_world_block_face(id, x, y, z, face); has0 = 1; }
+                }
+            }
+        }
+        async_mesh_android_cooperate(y);
+    }
+    mb0.opaque_icount_end = mb0.icount;
+
+    /* Layer 1: alpha-tested but still one-sided geometry. Glass, leaves, snow
+       and grass overlays need discard, but not double-sided rasterization. */
+    if (!cancelled && (has_alpha_texture || has_cutout)) {
+        glEnable(GL_ALPHA_TEST);
+        glAlphaFunc(GL_GREATER, 0.5f);
+        for (int y = y0; y <= y1 && !cancelled; y++) {
+            for (int z = z0; z <= z1; z++) {
+                if (async_section_mesh_cancel_requested()) { cancelled = 1; break; }
+                for (int x = x0; x <= x1; x++) {
+                    if (((x - x0) & 3) == 0 && async_section_mesh_cancel_requested()) { cancelled = 1; break; }
+                    int id = flat_get_block(x, y, z);
+                    if (!id) continue;
+                    if (id == BLOCK_SNOW_LAYER) { emit_snow_layer_block(x, y, z); has0 = 1; continue; }
+                    if (id == BLOCK_GLASS || id == BLOCK_ICE) {
+                        for (int face = 0; face < 6; face++) {
+                            if (flat_face_exposed_for_block(id, x, y, z, face)) { emit_world_block_face(id, x, y, z, face); has0 = 1; }
+                        }
+                        continue;
+                    }
+                    if (id == BLOCK_LEAVES && flat_fancy_cutout_terrain_enabled()) {
+                        for (int face = 0; face < 6; face++) {
+                            if (flat_face_exposed_for_block(id, x, y, z, face)) { emit_world_block_face(id, x, y, z, face); has0 = 1; }
+                        }
+                    }
+                    if (id == BLOCK_GRASS && flat_fancy_grass_overlay_enabled()) {
+                        for (int face = 2; face <= 5; face++) {
+                            if (grass_side_overlay_face_needed(x, y, z, face)) { emit_grass_side_overlay_face(x, y, z, face); has0 = 1; }
+                        }
+                    }
+                }
+            }
+            async_mesh_android_cooperate(y);
+        }
+        glDisable(GL_ALPHA_TEST);
+    }
+    mb0.alpha_one_sided_icount_end = mb0.icount;
+
+    /* Layer 2: truly two-sided cutout/special models. Crossed plants and the
+       legacy special emitters stay visually identical without penalizing the
+       opaque stone/ground portion of the section. */
+    if (!cancelled && (has_special || has_cutout)) {
+        glEnable(GL_ALPHA_TEST);
+        glAlphaFunc(GL_GREATER, 0.5f);
+        for (int y = y0; y <= y1 && !cancelled; y++) {
+            for (int z = z0; z <= z1; z++) {
+                if (async_section_mesh_cancel_requested()) { cancelled = 1; break; }
+                for (int x = x0; x <= x1; x++) {
+                    if (((x - x0) & 3) == 0 && async_section_mesh_cancel_requested()) { cancelled = 1; break; }
+                    int id = flat_get_block(x, y, z);
+                    if (!id) continue;
+                    if (block_uses_special_model(id) && id != BLOCK_PORTAL && id != BLOCK_END_PORTAL) {
+                        draw_special_block_model(id, x, y, z); has0 = 1; continue;
+                    }
+                    if (block_uses_cross_plant_model(id)) {
+                        emit_cross_plant_block(id, x, y, z);
+                        if (stivufine_better_snow_cross_target(id)) emit_better_snow_overlay_if(x, y, z, 2.0f / 16.0f);
+                        has0 = 1;
+                    }
+                }
+            }
+            async_mesh_android_cooperate(y);
+        }
+        glDisable(GL_ALPHA_TEST);
+    }
+
+    /* Non-Android backends still consume the combined builder, so retain the
+       conservative aggregate flags there. Android uses the real index ranges. */
+    if (has_cutout || has_special || has_alpha_texture) mb0.uses_alpha_test = 1;
+    if (has_cutout || has_special) mb0.two_sided = 1;
+    glColor4f(1,1,1,1);
+    flat_direct_end();
+    if (cancelled || async_section_mesh_cancel_requested()) {
+        flat_direct_free_builder(&mb0);
+        return;
+    }
+
+    flat_direct_begin(&mb1);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    if (has1) {
+        for (int y = y0; y <= y1 && !cancelled; y++) {
+            for (int z = z0; z <= z1; z++) {
+                if (async_section_mesh_cancel_requested()) { cancelled = 1; break; }
+                for (int x = x0; x <= x1; x++) {
+                    if (((x - x0) & 3) == 0 && async_section_mesh_cancel_requested()) { cancelled = 1; break; }
+                    int id = flat_get_block(x, y, z);
+                    if (block_is_liquid(id)) {
+                        if (flat_separate_liquid_pass_enabled()) emit_liquid_block_faces(id, x, y, z);
+                    } else if (id == BLOCK_PORTAL || id == BLOCK_END_PORTAL) {
+                        draw_special_block_model(id, x, y, z);
+                    }
+                }
+            }
+            async_mesh_android_cooperate(y);
+        }
+    }
+    mb1.two_sided = 1;
+    glColor4f(1,1,1,1);
+    flat_direct_end();
+    if (cancelled || async_section_mesh_cancel_requested()) {
+        flat_direct_free_builder(&mb0);
+        flat_direct_free_builder(&mb1);
+        return;
+    }
+
+    if (g_flat_direct_capture_only) {
+        if (g_flat_direct_capture_out0) *g_flat_direct_capture_out0 = mb0;
+        if (g_flat_direct_capture_out1) *g_flat_direct_capture_out1 = mb1;
+        if (g_flat_direct_capture_skip0) *g_flat_direct_capture_skip0 = !has0;
+        if (g_flat_direct_capture_skip1) *g_flat_direct_capture_skip1 = !has1;
+        g_flat_direct_capture_success = 1;
+        return;
+    }
+
+    flat_direct_upload_builder(sy, cz, cx, 0, &mb0);
+    flat_direct_upload_builder(sy, cz, cx, 1, &mb1);
+    flat_direct_free_builder(&mb0);
+    flat_direct_free_builder(&mb1);
+
+    g_flat_section_mesh_building[sy][cz][cx] = 0;
+    g_flat_section_building_mesh_version[sy][cz][cx] = 0;
+    g_flat_section_building_light_version[sy][cz][cx] = 0;
+    g_flat_section_dirty[sy][cz][cx] = 0;
+    g_flat_section_valid[sy][cz][cx] = 1;
+    g_flat_section_skip_pass[sy][cz][cx][0] = !has0;
+    g_flat_section_skip_pass[sy][cz][cx][1] = !has1;
+    g_flat_section_mesh_light_version[sy][cz][cx] = g_flat_chunk_light_version[cz][cx];
+}
+
+static void rebuild_flat_section_list(int sy, int cx, int cz) {
+    if (flat_direct_backend()) { rebuild_flat_section_mesh(sy, cx, cz); return; }
+    if (!tex_terrain.id) return;
+    if (cx < 0 || cx >= FLAT_RENDER_CHUNKS || cz < 0 || cz >= FLAT_RENDER_CHUNKS || sy < 0 || sy >= FLAT_RENDER_SECTIONS_Y) return;
+    ensure_flat_section_lists(sy, cz, cx);
+    if (g_flat_section_lists[sy][cz][cx][0] == 0 || g_flat_section_lists[sy][cz][cx][1] == 0) return;
+
+    int x0 = g_flat_world_origin_x + cx * FLAT_RENDER_CHUNK;
+    int z0 = g_flat_world_origin_z + cz * FLAT_RENDER_CHUNK;
+    int x1 = x0 + FLAT_RENDER_CHUNK - 1;
+    int z1 = z0 + FLAT_RENDER_CHUNK - 1;
+    int y0 = FLAT_WORLD_Y_MIN + sy * FLAT_RENDER_SECTION;
+    int y1 = y0 + FLAT_RENDER_SECTION - 1;
+    if (x1 >= g_flat_world_origin_x + FLAT_WORLD_SIZE) x1 = g_flat_world_origin_x + FLAT_WORLD_SIZE - 1;
+    if (z1 >= g_flat_world_origin_z + FLAT_WORLD_SIZE) z1 = g_flat_world_origin_z + FLAT_WORLD_SIZE - 1;
+    if (y1 > FLAT_WORLD_Y_MAX) y1 = FLAT_WORLD_Y_MAX;
+
+    int has0 = 0, has1 = 0, has_special = 0, has_cutout = 0;
+
+    glNewList(g_flat_section_lists[sy][cz][cx][0], GL_COMPILE);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glDisable(GL_BLEND);
+    glDisable(GL_ALPHA_TEST);
+
+    glBegin(GL_QUADS);
+    for (int y = y0; y <= y1; y++) {
+        for (int z = z0; z <= z1; z++) {
+            for (int x = x0; x <= x1; x++) {
+                int id = flat_get_block(x, y, z);
+                if (!id) continue;
+                if (id == BLOCK_PORTAL || id == BLOCK_END_PORTAL) { has1 = 1; continue; }
+                if (id == BLOCK_SNOW_LAYER) {
+                    emit_snow_layer_block(x, y, z);
+                    has0 = 1;
+                    continue;
+                }
+                if (block_is_liquid(id)) {
+                    if (flat_separate_liquid_pass_enabled()) { has1 = 1; continue; }
+                }
+                if (block_uses_special_model(id)) { has_special = 1; continue; }
+                if (block_uses_cross_plant_model(id)) { has_cutout = 1; continue; }
+                if (id == BLOCK_LEAVES && flat_fancy_cutout_terrain_enabled()) { has_cutout = 1; continue; }
+                if (id == BLOCK_GRASS && flat_fancy_grass_overlay_enabled()) {
+                    for (int face = 2; face <= 5; face++) {
+                        if (grass_side_overlay_face_needed(x, y, z, face)) { has_cutout = 1; break; }
+                    }
+                }
+                for (int face = 0; face < 6; face++) {
+                    if (flat_face_exposed_for_block(id, x, y, z, face)) { emit_world_block_face(id, x, y, z, face); has0 = 1; }
+                }
+            }
+        }
+    }
+    glEnd();
+
+    if (has_special) {
+        for (int y = y0; y <= y1; y++) {
+            for (int z = z0; z <= z1; z++) {
+                for (int x = x0; x <= x1; x++) {
+                    int id = flat_get_block(x, y, z);
+                    if (block_uses_special_model(id) && id != BLOCK_PORTAL && id != BLOCK_END_PORTAL) { draw_special_block_model(id, x, y, z); has0 = 1; }
+                }
+            }
+        }
+    }
+
+    if (has_cutout) {
+        glDisable(GL_BLEND);
+        glDepthMask(GL_TRUE);
+        glEnable(GL_ALPHA_TEST);
+        glAlphaFunc(GL_GREATER, 0.5f);
+        glBegin(GL_QUADS);
+        for (int y = y0; y <= y1; y++) {
+            for (int z = z0; z <= z1; z++) {
+                for (int x = x0; x <= x1; x++) {
+                    int id = flat_get_block(x, y, z);
+                    if (!id) continue;
+                    if (block_uses_cross_plant_model(id)) { emit_cross_plant_block(id, x, y, z); if (stivufine_better_snow_cross_target(id)) emit_better_snow_overlay_if(x, y, z, 2.0f / 16.0f); has0 = 1; continue; }
+                    if (id == BLOCK_LEAVES && flat_fancy_cutout_terrain_enabled()) {
+                        for (int face = 0; face < 6; face++) {
+                            if (flat_face_exposed_for_block(id, x, y, z, face)) { emit_world_block_face(id, x, y, z, face); has0 = 1; }
+                        }
+                    }
+                    if (id == BLOCK_GRASS && flat_fancy_grass_overlay_enabled()) {
+                        for (int face = 2; face <= 5; face++) {
+                            if (grass_side_overlay_face_needed(x, y, z, face)) { emit_grass_side_overlay_face(x, y, z, face); has0 = 1; }
+                        }
+                    }
+                }
+            }
+        }
+        glEnd();
+        glDisable(GL_ALPHA_TEST);
+    }
+    glColor4f(1,1,1,1);
+    glEndList();
+
+    glNewList(g_flat_section_lists[sy][cz][cx][1], GL_COMPILE);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    if (has1) {
+        int liquid_active = 0;
+        for (int y = y0; y <= y1; y++) {
+            for (int z = z0; z <= z1; z++) {
+                for (int x = x0; x <= x1; x++) {
+                    int id = flat_get_block(x, y, z);
+                    if (block_is_liquid(id) && flat_separate_liquid_pass_enabled()) {
+                        if (!liquid_active) {
+                            glBegin(GL_QUADS);
+                            liquid_active = 1;
+                        }
+                        emit_liquid_block_faces(id, x, y, z);
+                    } else if (id == BLOCK_PORTAL || id == BLOCK_END_PORTAL) {
+                        if (liquid_active) {
+                            glEnd();
+                            liquid_active = 0;
+                        }
+                        draw_special_block_model(id, x, y, z);
+                    }
+                }
+            }
+        }
+        if (liquid_active) {
+            glEnd();
+        }
+    }
+    glColor4f(1,1,1,1);
+    glEndList();
+
+    g_flat_section_mesh_building[sy][cz][cx] = 0;
+    g_flat_section_building_mesh_version[sy][cz][cx] = 0;
+    g_flat_section_building_light_version[sy][cz][cx] = 0;
+    g_flat_section_dirty[sy][cz][cx] = 0;
+    g_flat_section_valid[sy][cz][cx] = 1;
+    g_flat_section_skip_pass[sy][cz][cx][0] = !has0;
+    g_flat_section_skip_pass[sy][cz][cx][1] = !has1;
+    g_flat_section_mesh_light_version[sy][cz][cx] = g_flat_chunk_light_version[cz][cx];
+}
+
+
+
+/* Async D3D section-mesh build ------------------------------------------------------
+   The GPU upload and live mesh-handle swap still happen on the render thread, but
+   the expensive 16^3 block scan / face emission / CPU vertex+index allocation now
+   runs on a Win32 worker using a tiny copied snapshot of the section plus a
+   one-block neighbor border. */
+#define ASYNC_SECTION_MESH_W (FLAT_RENDER_CHUNK + 2)
+#define ASYNC_SECTION_MESH_H (FLAT_RENDER_SECTION + 2)
+#define ASYNC_SECTION_MESH_D (FLAT_RENDER_CHUNK + 2)
+#define ASYNC_SECTION_MESH_BYTES (ASYNC_SECTION_MESH_W * ASYNC_SECTION_MESH_H * ASYNC_SECTION_MESH_D)
+
+static uint64_t flat_compute_snapshot_visibility(const unsigned char *blocks);
+static void flat_store_section_visibility(int cx, int cz, int sy, unsigned int version,
+                                          int world_cx, int world_cz, uint64_t mask);
+
+typedef struct AsyncSectionMeshJob {
+    int cx, cz, sy;
+    int world_cx, world_cz;
+    int origin_x, origin_z;
+    unsigned int version;
+    unsigned int light_version;
+    int priority;
+    unsigned char blocks[ASYNC_SECTION_MESH_BYTES];
+    unsigned char meta[ASYNC_SECTION_MESH_BYTES];
+    unsigned char levels[ASYNC_SECTION_MESH_BYTES];
+    unsigned char sky_light[ASYNC_SECTION_MESH_BYTES];
+    unsigned char block_light[ASYNC_SECTION_MESH_BYTES];
+} AsyncSectionMeshJob;
+
+typedef struct AsyncSectionMeshResult {
+    int ready;
+    int cx, cz, sy;
+    int world_cx, world_cz;
+    int origin_x, origin_z;
+    unsigned int version;
+    unsigned int light_version;
+    int priority;
+    uint64_t visibility_mask;
+    FlatDirectMeshBuilder mb0, mb1;
+    int skip0, skip1;
+    /* Legacy prebuilt-buffer fields are retained for queue compatibility.
+       Safe shutdown mode leaves them empty because all GPU object creation and
+       release now stays on the render thread. */
+    int d3d11_prebuilt;
+    PexD3D11Mesh d3d11_mesh0, d3d11_mesh1;
+} AsyncSectionMeshResult;
+
+static int async_mesh_current_local(int world_cx, int world_cz, int *out_cx, int *out_cz) {
+    int cx = world_cx - floor_div16(g_flat_world_origin_x);
+    int cz = world_cz - floor_div16(g_flat_world_origin_z);
+    if (!flat_local_chunk_valid(cx, cz)) return 0;
+    if (!g_flat_world_chunk_generated[cz][cx]) return 0;
+    if (g_flat_chunk_world_cx[cz][cx] != world_cx || g_flat_chunk_world_cz[cz][cx] != world_cz) return 0;
+    if (out_cx) *out_cx = cx;
+    if (out_cz) *out_cz = cz;
+    return 1;
+}
+
+static void async_section_mesh_free_result(AsyncSectionMeshResult *r) {
+    if (!r) return;
+    flat_direct_free_builder(&r->mb0);
+    flat_direct_free_builder(&r->mb1);
+    if (r->d3d11_prebuilt) {
+        d3d11_discard_mesh(&r->d3d11_mesh0);
+        d3d11_discard_mesh(&r->d3d11_mesh1);
+    }
+    memset(r, 0, sizeof(*r));
+}
+
+static CRITICAL_SECTION g_async_section_mesh_cs;
+static HANDLE g_async_section_mesh_event = NULL;
+static HANDLE g_async_section_mesh_upload_event = NULL;
+static HANDLE g_async_section_mesh_threads[4] = { NULL, NULL, NULL, NULL };
+static int g_async_section_mesh_worker_count = 0;
+static HANDLE g_async_section_mesh_upload_thread = NULL;
+static int g_async_section_mesh_initialized = 0;
+static int g_async_section_mesh_busy = 0;
+static int g_async_section_mesh_upload_busy = 0;
+
+enum {
+    ASYNC_MESH_WORKER_UNUSED = 0,
+    ASYNC_MESH_WORKER_WAITING = 1,
+    ASYNC_MESH_WORKER_BUILDING = 2,
+    ASYNC_MESH_WORKER_PUBLISHING = 3,
+    ASYNC_MESH_WORKER_EXITED = 4
+};
+static volatile LONG g_async_section_mesh_worker_state[4] = { 0, 0, 0, 0 };
+static volatile LONG g_async_section_mesh_upload_state = ASYNC_MESH_WORKER_UNUSED;
+
+/* ID3D11Device::CreateBuffer can block inside a vendor driver while the render
+   thread presents the quit-progress screen.  Keep every GPU create/release on
+   the render thread; workers now publish CPU builders for all backends. */
+static int async_mesh_worker_gpu_prebuild_enabled(void) { return 0; }
+
+#if defined(PEX_PLATFORM_PSP)
+/* PSP has far less RAM than desktop. A single job snapshot is about 29 KiB and
+   completed sections retain vertex/index buffers until the render thread adopts
+   them. Keep only one result in flight on PSP-1000. */
+#if defined(PEX_PSP_1000_TARGET) && PEX_PSP_1000_TARGET
+#define ASYNC_SECTION_MESH_JOB_QUEUE_MAX 3
+#define ASYNC_SECTION_MESH_UPLOAD_QUEUE_MAX 1
+#define ASYNC_SECTION_MESH_RESULT_QUEUE_MAX 1
+#else
+#define ASYNC_SECTION_MESH_JOB_QUEUE_MAX 12
+#define ASYNC_SECTION_MESH_UPLOAD_QUEUE_MAX 4
+#define ASYNC_SECTION_MESH_RESULT_QUEUE_MAX 6
+#endif
+#define ASYNC_SECTION_MESH_WORKER_COUNT 1
+#elif defined(PEX_PLATFORM_ANDROID_TV)
+/* TV boxes often expose four slow cores that share thermal and memory bandwidth
+   with the GPU. One low-priority mesher and short queues keep the renderer fed
+   without evicting terrain buffers or starving the GL thread. */
+#define ASYNC_SECTION_MESH_JOB_QUEUE_MAX 6
+#define ASYNC_SECTION_MESH_UPLOAD_QUEUE_MAX 2
+#define ASYNC_SECTION_MESH_RESULT_QUEUE_MAX 2
+#define ASYNC_SECTION_MESH_WORKER_COUNT 1
+#elif defined(PEX_PLATFORM_ANDROID)
+/* Regular phones share the same native heap/GPU memory pressure as TV boxes.
+   One mesher avoids two simultaneous large section allocations on vendor
+   drivers/devices with tighter per-process native limits. */
+#define ASYNC_SECTION_MESH_JOB_QUEUE_MAX 6
+#define ASYNC_SECTION_MESH_UPLOAD_QUEUE_MAX 2
+#define ASYNC_SECTION_MESH_RESULT_QUEUE_MAX 2
+#define ASYNC_SECTION_MESH_WORKER_COUNT 1
+#else
+#define ASYNC_SECTION_MESH_JOB_QUEUE_MAX 192
+#define ASYNC_SECTION_MESH_UPLOAD_QUEUE_MAX 32
+#define ASYNC_SECTION_MESH_RESULT_QUEUE_MAX 48
+#define ASYNC_SECTION_MESH_WORKER_COUNT 4
+#endif
+
+static AsyncSectionMeshJob g_async_section_mesh_jobs[ASYNC_SECTION_MESH_JOB_QUEUE_MAX];
+static int g_async_section_mesh_job_head = 0, g_async_section_mesh_job_tail = 0, g_async_section_mesh_job_count = 0;
+static AsyncSectionMeshResult g_async_section_mesh_upload_jobs[ASYNC_SECTION_MESH_UPLOAD_QUEUE_MAX];
+static int g_async_section_mesh_upload_head = 0, g_async_section_mesh_upload_tail = 0, g_async_section_mesh_upload_count = 0;
+static AsyncSectionMeshResult g_async_section_mesh_results[ASYNC_SECTION_MESH_RESULT_QUEUE_MAX];
+static int g_async_section_mesh_result_head = 0, g_async_section_mesh_result_tail = 0, g_async_section_mesh_result_count = 0;
+
+static void async_section_mesh_clear_tls(void) {
+    g_async_mesh_blocks = NULL;
+    g_async_mesh_meta = NULL;
+    g_async_mesh_levels = NULL;
+    g_async_mesh_sky_light = NULL;
+    g_async_mesh_block_light = NULL;
+    g_async_mesh_x0 = g_async_mesh_y0 = g_async_mesh_z0 = 0;
+    g_async_mesh_w = g_async_mesh_h = g_async_mesh_d = 0;
+    g_async_mesh_origin_override = 0;
+    g_async_mesh_origin_x = g_async_mesh_origin_z = 0;
+    g_flat_direct_capture_only = 0;
+    g_flat_direct_capture_out0 = NULL;
+    g_flat_direct_capture_out1 = NULL;
+    g_flat_direct_capture_skip0 = NULL;
+    g_flat_direct_capture_skip1 = NULL;
+    g_flat_direct_capture_success = 0;
+    g_flat_direct_capture_aborted = 0;
+}
+
+static void async_mesh_clear_results(AsyncSectionMeshResult *queue, int count) {
+    for (int i = 0; i < count; i++) async_section_mesh_free_result(&queue[i]);
+}
+
+static int async_mesh_push_upload_job(AsyncSectionMeshResult *r) {
+    for (;;) {
+        EnterCriticalSection(&g_async_section_mesh_cs);
+        if (g_async_section_mesh_stop) {
+            LeaveCriticalSection(&g_async_section_mesh_cs);
+            async_section_mesh_free_result(r);
+            return 0;
+        }
+        if (g_async_section_mesh_upload_count < ASYNC_SECTION_MESH_UPLOAD_QUEUE_MAX) {
+            if (r->priority) {
+                g_async_section_mesh_upload_head = (g_async_section_mesh_upload_head - 1 + ASYNC_SECTION_MESH_UPLOAD_QUEUE_MAX) % ASYNC_SECTION_MESH_UPLOAD_QUEUE_MAX;
+                g_async_section_mesh_upload_jobs[g_async_section_mesh_upload_head] = *r;
+            } else {
+                g_async_section_mesh_upload_jobs[g_async_section_mesh_upload_tail] = *r;
+                g_async_section_mesh_upload_tail = (g_async_section_mesh_upload_tail + 1) % ASYNC_SECTION_MESH_UPLOAD_QUEUE_MAX;
+            }
+            memset(r, 0, sizeof(*r));
+            g_async_section_mesh_upload_count++;
+            LeaveCriticalSection(&g_async_section_mesh_cs);
+            if (g_async_section_mesh_upload_event) SetEvent(g_async_section_mesh_upload_event);
+            return 1;
+        }
+        LeaveCriticalSection(&g_async_section_mesh_cs);
+        #if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+        Sleep(1);
+#else
+        Sleep(0);
+#endif
+    }
+}
+
+static int async_mesh_push_result(AsyncSectionMeshResult *r) {
+    for (;;) {
+        EnterCriticalSection(&g_async_section_mesh_cs);
+        if (g_async_section_mesh_stop) {
+            LeaveCriticalSection(&g_async_section_mesh_cs);
+            async_section_mesh_free_result(r);
+            return 0;
+        }
+        if (g_async_section_mesh_result_count < ASYNC_SECTION_MESH_RESULT_QUEUE_MAX) {
+            if (r->priority) {
+                g_async_section_mesh_result_head = (g_async_section_mesh_result_head - 1 + ASYNC_SECTION_MESH_RESULT_QUEUE_MAX) % ASYNC_SECTION_MESH_RESULT_QUEUE_MAX;
+                g_async_section_mesh_results[g_async_section_mesh_result_head] = *r;
+            } else {
+                g_async_section_mesh_results[g_async_section_mesh_result_tail] = *r;
+                g_async_section_mesh_result_tail = (g_async_section_mesh_result_tail + 1) % ASYNC_SECTION_MESH_RESULT_QUEUE_MAX;
+            }
+            memset(r, 0, sizeof(*r));
+            g_async_section_mesh_result_count++;
+            LeaveCriticalSection(&g_async_section_mesh_cs);
+            return 1;
+        }
+        LeaveCriticalSection(&g_async_section_mesh_cs);
+        #if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+        Sleep(1);
+#else
+        Sleep(0);
+#endif
+    }
+}
+
+static DWORD WINAPI async_mesh_upload_worker(LPVOID unused) {
+    (void)unused;
+    g_pex_profile_thread_role = PEX_PROFILE_ROLE_ASYNC_MESH;
+    InterlockedExchange(&g_async_section_mesh_upload_state, ASYNC_MESH_WORKER_WAITING);
+    for (;;) {
+        /* A timeout guarantees the stop flag is observed even if an auto-reset
+           wake is consumed by another shutdown waiter. */
+        WaitForSingleObject(g_async_section_mesh_upload_event, 100);
+        for (;;) {
+            AsyncSectionMeshResult r;
+            memset(&r, 0, sizeof(r));
+            int have_job = 0;
+
+            EnterCriticalSection(&g_async_section_mesh_cs);
+            if (g_async_section_mesh_stop) {
+                LeaveCriticalSection(&g_async_section_mesh_cs);
+                InterlockedExchange(&g_async_section_mesh_upload_state, ASYNC_MESH_WORKER_EXITED);
+                return 0;
+            }
+            if (g_async_section_mesh_upload_count > 0) {
+                r = g_async_section_mesh_upload_jobs[g_async_section_mesh_upload_head];
+                memset(&g_async_section_mesh_upload_jobs[g_async_section_mesh_upload_head], 0, sizeof(g_async_section_mesh_upload_jobs[0]));
+                g_async_section_mesh_upload_head = (g_async_section_mesh_upload_head + 1) % ASYNC_SECTION_MESH_UPLOAD_QUEUE_MAX;
+                g_async_section_mesh_upload_count--;
+                g_async_section_mesh_upload_busy = 1;
+                have_job = 1;
+            }
+            LeaveCriticalSection(&g_async_section_mesh_cs);
+            if (!have_job) break;
+
+            InterlockedExchange(&g_async_section_mesh_upload_state, ASYNC_MESH_WORKER_BUILDING);
+            double upload_worker_start = now_seconds();
+            if (pex_using_d3d11()) {
+                int ok0 = 1, ok1 = 1;
+                flat_direct_resolve_builder_lightmap(&r.mb0);
+                flat_direct_resolve_builder_lightmap(&r.mb1);
+                if (!r.skip0 && r.mb0.vcount > 0 && r.mb0.icount > 0) {
+                    PexMesh mesh; memset(&mesh, 0, sizeof(mesh));
+                    mesh.vertices = r.mb0.v; mesh.indices = r.mb0.i;
+                    mesh.vertex_count = r.mb0.vcount; mesh.index_count = r.mb0.icount;
+                    mesh.dynamic = 0;
+                    ok0 = d3d11_prebuild_mesh(&mesh, &r.d3d11_mesh0);
+                }
+                if (!r.skip1 && r.mb1.vcount > 0 && r.mb1.icount > 0) {
+                    PexMesh mesh; memset(&mesh, 0, sizeof(mesh));
+                    mesh.vertices = r.mb1.v; mesh.indices = r.mb1.i;
+                    mesh.vertex_count = r.mb1.vcount; mesh.index_count = r.mb1.icount;
+                    mesh.dynamic = 0;
+                    ok1 = d3d11_prebuild_mesh(&mesh, &r.d3d11_mesh1);
+                }
+                if (ok0 && ok1) {
+                    r.d3d11_prebuilt = 1;
+                    flat_direct_free_builder(&r.mb0);
+                    flat_direct_free_builder(&r.mb1);
+                } else {
+                    d3d11_discard_mesh(&r.d3d11_mesh0);
+                    d3d11_discard_mesh(&r.d3d11_mesh1);
+                    r.d3d11_prebuilt = 0;
+                    /* Keep the CPU builders so the render thread can still use
+                       the existing fallback upload path instead of dropping the
+                       section if the worker-side D3D allocation fails. */
+                }
+            }
+
+            async_mesh_push_result(&r);
+            {
+                double upload_ms = (now_seconds() - upload_worker_start) * 1000.0;
+                if (upload_ms < 0.0) upload_ms = 0.0;
+                g_prof_mesh_upload_worker_last_ms = upload_ms;
+                if (g_prof_mesh_upload_worker_samples <= 0) g_prof_mesh_upload_worker_avg_ms = upload_ms;
+                else g_prof_mesh_upload_worker_avg_ms = g_prof_mesh_upload_worker_avg_ms * 0.90 + upload_ms * 0.10;
+                g_prof_mesh_upload_worker_samples++;
+            }
+
+            InterlockedExchange(&g_async_section_mesh_upload_state, ASYNC_MESH_WORKER_WAITING);
+            EnterCriticalSection(&g_async_section_mesh_cs);
+            g_async_section_mesh_upload_busy = 0;
+            LeaveCriticalSection(&g_async_section_mesh_cs);
+        }
+    }
+}
+
+static DWORD WINAPI async_section_mesh_worker_proc(LPVOID unused) {
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    /* Set priority from inside the SDL thread. The Win32 compatibility HANDLE
+       cannot change another Android thread's scheduler priority. */
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_LOW);
+#endif
+    int worker_index = (int)(intptr_t)unused - 1;
+    if (worker_index < 0 || worker_index >= (int)ARRAY_COUNT(g_async_section_mesh_worker_state)) worker_index = 0;
+    g_pex_profile_thread_role = PEX_PROFILE_ROLE_ASYNC_MESH;
+    for (;;) {
+        InterlockedExchange(&g_async_section_mesh_worker_state[worker_index], ASYNC_MESH_WORKER_WAITING);
+        /* Multiple mesh workers share an auto-reset event.  Periodically recheck
+           the stop flag so shutdown cannot strand a sleeping worker. */
+        WaitForSingleObject(g_async_section_mesh_event, 100);
+
+        AsyncSectionMeshJob job;
+        int have_job = 0;
+        EnterCriticalSection(&g_async_section_mesh_cs);
+        if (g_async_section_mesh_stop) {
+            LeaveCriticalSection(&g_async_section_mesh_cs);
+            break;
+        }
+        if (g_async_section_mesh_job_count > 0) {
+            job = g_async_section_mesh_jobs[g_async_section_mesh_job_head];
+            g_async_section_mesh_job_head = (g_async_section_mesh_job_head + 1) % ASYNC_SECTION_MESH_JOB_QUEUE_MAX;
+            g_async_section_mesh_job_count--;
+            g_async_section_mesh_busy++;
+            have_job = 1;
+        }
+        LeaveCriticalSection(&g_async_section_mesh_cs);
+        if (!have_job) continue;
+
+        InterlockedExchange(&g_async_section_mesh_worker_state[worker_index], ASYNC_MESH_WORKER_BUILDING);
+        FlatDirectMeshBuilder mb0, mb1;
+        int skip0 = 1, skip1 = 1;
+        memset(&mb0, 0, sizeof(mb0));
+        memset(&mb1, 0, sizeof(mb1));
+
+        g_async_mesh_blocks = job.blocks;
+        g_async_mesh_meta = job.meta;
+        g_async_mesh_levels = job.levels;
+        g_async_mesh_sky_light = job.sky_light;
+        g_async_mesh_block_light = job.block_light;
+        g_async_mesh_x0 = job.origin_x + job.cx * FLAT_RENDER_CHUNK - 1;
+        g_async_mesh_y0 = FLAT_WORLD_Y_MIN + job.sy * FLAT_RENDER_SECTION - 1;
+        g_async_mesh_z0 = job.origin_z + job.cz * FLAT_RENDER_CHUNK - 1;
+        g_async_mesh_w = ASYNC_SECTION_MESH_W;
+        g_async_mesh_h = ASYNC_SECTION_MESH_H;
+        g_async_mesh_d = ASYNC_SECTION_MESH_D;
+        g_async_mesh_origin_override = 1;
+        g_async_mesh_origin_x = job.origin_x;
+        g_async_mesh_origin_z = job.origin_z;
+
+        g_flat_direct_capture_only = 1;
+        g_flat_direct_capture_out0 = &mb0;
+        g_flat_direct_capture_out1 = &mb1;
+        g_flat_direct_capture_skip0 = &skip0;
+        g_flat_direct_capture_skip1 = &skip1;
+        g_flat_direct_capture_success = 0;
+        g_flat_direct_capture_aborted = 0;
+        double mesh_worker_start = now_seconds();
+        rebuild_flat_section_mesh(job.sy, job.cx, job.cz);
+        {
+            double mesh_ms = (now_seconds() - mesh_worker_start) * 1000.0;
+            if (mesh_ms < 0.0) mesh_ms = 0.0;
+            g_prof_mesh_worker_last_ms = mesh_ms;
+            if (g_prof_mesh_worker_samples <= 0) g_prof_mesh_worker_avg_ms = mesh_ms;
+            else g_prof_mesh_worker_avg_ms = g_prof_mesh_worker_avg_ms * 0.90 + mesh_ms * 0.10;
+            g_prof_mesh_worker_samples++;
+        }
+        int success = g_flat_direct_capture_success;
+        async_section_mesh_clear_tls();
+        int stopping = InterlockedCompareExchange(&g_async_section_mesh_stop, 0, 0) != 0;
+
+        if (success && !stopping) {
+            InterlockedExchange(&g_async_section_mesh_worker_state[worker_index], ASYNC_MESH_WORKER_PUBLISHING);
+            AsyncSectionMeshResult r;
+            memset(&r, 0, sizeof(r));
+            r.ready = 1;
+            r.cx = job.cx;
+            r.cz = job.cz;
+            r.sy = job.sy;
+            r.world_cx = job.world_cx;
+            r.world_cz = job.world_cz;
+            r.origin_x = job.origin_x;
+            r.origin_z = job.origin_z;
+            r.version = job.version;
+            r.light_version = job.light_version;
+            r.priority = job.priority;
+            r.visibility_mask = flat_compute_snapshot_visibility(job.blocks);
+            r.skip0 = skip0;
+            r.skip1 = skip1;
+            r.mb0 = mb0;
+            r.mb1 = mb1;
+            memset(&mb0, 0, sizeof(mb0));
+            memset(&mb1, 0, sizeof(mb1));
+
+            if (async_mesh_worker_gpu_prebuild_enabled()) async_mesh_push_upload_job(&r);
+            else async_mesh_push_result(&r);
+        } else if (!stopping) {
+            /* A failed capture used to leave g_flat_section_mesh_building set
+               forever.  Clear it so the render pass can retry next frame. */
+            int current_cx = -1, current_cz = -1;
+            flat_world_map_enter();
+            if (job.sy >= 0 && job.sy < FLAT_RENDER_SECTIONS_Y &&
+                async_mesh_current_local(job.world_cx, job.world_cz, &current_cx, &current_cz) &&
+                g_flat_section_mesh_version[job.sy][current_cz][current_cx] == job.version &&
+                g_flat_chunk_light_version[current_cz][current_cx] == job.light_version) {
+                g_flat_section_mesh_building[job.sy][current_cz][current_cx] = 0;
+                g_flat_section_building_mesh_version[job.sy][current_cz][current_cx] = 0;
+                g_flat_section_building_light_version[job.sy][current_cz][current_cx] = 0;
+                g_flat_section_dirty[job.sy][current_cz][current_cx] = 1;
+            }
+            flat_world_map_leave();
+        }
+        flat_direct_free_builder(&mb0);
+        flat_direct_free_builder(&mb1);
+
+        EnterCriticalSection(&g_async_section_mesh_cs);
+        if (g_async_section_mesh_busy > 0) g_async_section_mesh_busy--;
+        int more_jobs = (!g_async_section_mesh_stop && g_async_section_mesh_job_count > 0);
+        stopping = g_async_section_mesh_stop ? 1 : 0;
+        LeaveCriticalSection(&g_async_section_mesh_cs);
+        if (stopping) break;
+        if (more_jobs) SetEvent(g_async_section_mesh_event);
+    }
+    InterlockedExchange(&g_async_section_mesh_worker_state[worker_index], ASYNC_MESH_WORKER_EXITED);
+    return 0;
+}
+
+static void async_section_mesh_init(void) {
+    if (g_async_section_mesh_initialized) return;
+    /* The previous world releases this session lock.  Mesh workers must never
+       start for the next world while flat_world_map_enter() is still a no-op. */
+    flat_world_map_lock_ensure();
+    g_async_section_mesh_initialized = 1;
+    InitializeCriticalSection(&g_async_section_mesh_cs);
+    g_async_section_mesh_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (async_mesh_worker_gpu_prebuild_enabled()) g_async_section_mesh_upload_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!g_async_section_mesh_event || (async_mesh_worker_gpu_prebuild_enabled() && !g_async_section_mesh_upload_event)) return;
+    g_async_section_mesh_stop = 0;
+    g_async_section_mesh_worker_count = 0;
+    int desired_workers = ASYNC_SECTION_MESH_WORKER_COUNT;
+#if defined(PEX_PLATFORM_ANDROID_TV)
+    desired_workers = 1;
+#elif defined(PEX_PLATFORM_ANDROID)
+    {
+        int cpu_count = SDL_GetCPUCount();
+        desired_workers = (cpu_count >= 6) ? 2 : 1;
+    }
+#endif
+    for (int i = 0; i < desired_workers && i < (int)ARRAY_COUNT(g_async_section_mesh_threads); ++i) {
+#if defined(PEX_PLATFORM_PSP)
+        g_async_section_mesh_threads[i] = CreateThread(NULL, 0x20000, async_section_mesh_worker_proc, (LPVOID)(intptr_t)(i + 1), 0, NULL);
+#elif defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+        g_async_section_mesh_threads[i] = CreateThread(NULL, 0x100000, async_section_mesh_worker_proc, (LPVOID)(intptr_t)(i + 1), 0, NULL);
+#else
+        g_async_section_mesh_threads[i] = CreateThread(NULL, 0x400000, async_section_mesh_worker_proc, (LPVOID)(intptr_t)(i + 1), 0, NULL);
+#endif
+        if (g_async_section_mesh_threads[i]) {
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+            SetThreadPriority(g_async_section_mesh_threads[i], THREAD_PRIORITY_BELOW_NORMAL);
+#else
+            SetThreadPriority(g_async_section_mesh_threads[i], THREAD_PRIORITY_NORMAL);
+#endif
+            g_async_section_mesh_worker_count++;
+        }
+    }
+    if (async_mesh_worker_gpu_prebuild_enabled()) g_async_section_mesh_upload_thread = CreateThread(NULL, 0x200000, async_mesh_upload_worker, NULL, 0, NULL);
+    if (g_async_section_mesh_upload_thread) SetThreadPriority(g_async_section_mesh_upload_thread, THREAD_PRIORITY_BELOW_NORMAL);
+}
+
+static int async_section_mesh_pending(void) {
+    if (world_quit_is_active()) return 0;
+    if (!g_async_section_mesh_initialized) return 0;
+    int pending = 0;
+    EnterCriticalSection(&g_async_section_mesh_cs);
+    pending = g_async_section_mesh_job_count || g_async_section_mesh_busy ||
+              g_async_section_mesh_upload_count || g_async_section_mesh_upload_busy ||
+              g_async_section_mesh_result_count;
+    LeaveCriticalSection(&g_async_section_mesh_cs);
+    return pending;
+}
+
+static int async_mesh_submit(int sy, int cx, int cz, int priority) {
+    if (!flat_async_section_mesh_enabled()) return 0;
+    if (sy < 0 || sy >= FLAT_RENDER_SECTIONS_Y || cz < 0 || cz >= FLAT_RENDER_CHUNKS || cx < 0 || cx >= FLAT_RENDER_CHUNKS) return 0;
+    if (flat_light_commit_busy()) return 2;
+    if (!g_flat_world_chunk_generated[cz][cx] || !flat_chunk_light_ready(cx, cz)) return 2;
+    if (g_flat_section_mesh_building[sy][cz][cx]) {
+        if (g_flat_section_building_mesh_version[sy][cz][cx] == g_flat_section_mesh_version[sy][cz][cx] &&
+            g_flat_section_building_light_version[sy][cz][cx] == g_flat_chunk_light_version[cz][cx]) {
+            return 1;
+        }
+        /* A newer terrain/light key exists.  Let the newer request own the slot;
+           the old worker result will be rejected by its stamped key. */
+        g_flat_section_mesh_building[sy][cz][cx] = 0;
+        g_flat_section_building_mesh_version[sy][cz][cx] = 0;
+        g_flat_section_building_light_version[sy][cz][cx] = 0;
+    }
+    async_section_mesh_init();
+    if (!g_async_section_mesh_event || g_async_section_mesh_worker_count <= 0) return 0;
+    if (async_mesh_worker_gpu_prebuild_enabled() && (!g_async_section_mesh_upload_event || !g_async_section_mesh_upload_thread)) return 0;
+
+    int can_submit = 0;
+    EnterCriticalSection(&g_async_section_mesh_cs);
+    int pipeline_load = g_async_section_mesh_job_count + g_async_section_mesh_busy +
+                        g_async_section_mesh_upload_count + g_async_section_mesh_upload_busy +
+                        g_async_section_mesh_result_count;
+#if defined(PEX_PLATFORM_ANDROID_TV)
+    int pipeline_limit = priority ? 3 : 2;
+#elif defined(PEX_PLATFORM_ANDROID)
+    int pipeline_limit = priority ? 5 : 4;
+#else
+    int pipeline_limit = ASYNC_SECTION_MESH_JOB_QUEUE_MAX;
+#endif
+    if (!g_async_section_mesh_stop && pipeline_load < pipeline_limit &&
+        (g_async_section_mesh_job_count < ASYNC_SECTION_MESH_JOB_QUEUE_MAX || priority)) can_submit = 1;
+    LeaveCriticalSection(&g_async_section_mesh_cs);
+    if (!can_submit) return 2;
+
+    AsyncSectionMeshJob job;
+    memset(&job, 0, sizeof(job));
+    job.cx = cx;
+    job.cz = cz;
+    job.sy = sy;
+    job.origin_x = g_flat_world_origin_x;
+    job.origin_z = g_flat_world_origin_z;
+    job.world_cx = floor_div16(job.origin_x) + cx;
+    job.world_cz = floor_div16(job.origin_z) + cz;
+    job.version = g_flat_section_mesh_version[sy][cz][cx];
+    job.light_version = g_flat_chunk_light_version[cz][cx];
+    job.priority = priority ? 1 : 0;
+    int sx0 = job.origin_x + cx * FLAT_RENDER_CHUNK - 1;
+    int sy0 = FLAT_WORLD_Y_MIN + sy * FLAT_RENDER_SECTION - 1;
+    int sz0 = job.origin_z + cz * FLAT_RENDER_CHUNK - 1;
+    double snapshot_start = profile_begin();
+    if (g_loggy_enabled) {
+        g_loggy_mesh_submit_calls++;
+        g_loggy_mesh_submit_snapshot_cells += ASYNC_SECTION_MESH_W * ASYNC_SECTION_MESH_H * ASYNC_SECTION_MESH_D;
+    }
+    /* Fast main-thread snapshot.  The old path called flat_get_* five times for
+       every one of 5832 cells.  That showed up as Mesh submit snapshot=4ms+ and
+       made an "async" rebuild still stall rendering.  Snapshot directly from the
+       fixed flat arrays when the cell is inside the current world window; fall
+       back to Java default sky / zero blocks for missing border chunks. */
+    int default_sky = flat_java_default_sky_light();
+    for (int iy = 0; iy < ASYNC_SECTION_MESH_H; iy++) {
+        int wy = sy0 + iy;
+        int y_ok = (wy >= FLAT_WORLD_Y_MIN && wy <= FLAT_WORLD_Y_MAX);
+        int yi = y_ok ? flat_y_index(wy) : 0;
+        for (int iz = 0; iz < ASYNC_SECTION_MESH_D; iz++) {
+            int wz = sz0 + iz;
+            int fz = wz - job.origin_z;
+            int pz = flat_storage_z_world(wz);
+            int z_ok = (fz >= 0 && fz < FLAT_WORLD_SIZE);
+            for (int ix = 0; ix < ASYNC_SECTION_MESH_W; ix++) {
+                int wx = sx0 + ix;
+                int fx = wx - job.origin_x;
+                int px = flat_storage_x_world(wx);
+                int idx = ((iy * ASYNC_SECTION_MESH_D) + iz) * ASYNC_SECTION_MESH_W + ix;
+                unsigned char b = 0, m = 0, lv = 0, skyv = 0, blv = 0;
+                if (y_ok && z_ok && fx >= 0 && fx < FLAT_WORLD_SIZE) {
+                    int lcx = fx / FLAT_RENDER_CHUNK;
+                    int lcz = fz / FLAT_RENDER_CHUNK;
+                    int chunk_ok = flat_local_chunk_valid(lcx, lcz) &&
+                        g_flat_world_chunk_generated[lcz][lcx] &&
+                        g_flat_chunk_world_cx[lcz][lcx] == floor_div16(wx) &&
+                        g_flat_chunk_world_cz[lcz][lcx] == floor_div16(wz);
+                    if (chunk_ok) {
+                        b = g_flat_blocks[yi][pz][px];
+                        m = g_flat_meta[yi][pz][px];
+                        lv = g_flat_levels[yi][pz][px];
+                        int lsy = (wy - FLAT_WORLD_Y_MIN) / FLAT_RENDER_SECTION;
+                        int storage_ok = flat_section_index_valid(lsy) &&
+                            ((g_flat_chunk_section_non_empty_mask[lcz][lcx] & (unsigned short)(1u << lsy)) != 0);
+                        skyv = storage_ok ? (unsigned char)(g_flat_sky_light[yi][pz][px] & 15) : (unsigned char)default_sky;
+                        blv = storage_ok ? (unsigned char)(g_flat_block_light[yi][pz][px] & 15) : 0;
+                    } else {
+                        skyv = (unsigned char)default_sky;
+                    }
+                } else {
+                    skyv = (wy > FLAT_WORLD_Y_MAX) ? (unsigned char)default_sky : 0;
+                }
+                job.blocks[idx] = b;
+                job.meta[idx] = m;
+                job.levels[idx] = lv;
+                job.sky_light[idx] = skyv;
+                job.block_light[idx] = blv;
+            }
+        }
+    }
+    profile_add_time(PROF_MESH_SUBMIT_SNAPSHOT, snapshot_start);
+
+    if (flat_light_commit_busy()) return 2;
+
+    EnterCriticalSection(&g_async_section_mesh_cs);
+    if (!g_async_section_mesh_stop && !g_flat_section_mesh_building[sy][cz][cx] &&
+        g_flat_world_origin_x == job.origin_x && g_flat_world_origin_z == job.origin_z &&
+        g_flat_section_mesh_version[sy][cz][cx] == job.version &&
+        g_flat_chunk_light_version[cz][cx] == job.light_version &&
+        flat_chunk_light_ready(cx, cz)) {
+        if (g_async_section_mesh_job_count >= ASYNC_SECTION_MESH_JOB_QUEUE_MAX && priority) {
+            /* Player-near block/light edits must not wait behind a full streaming
+               backlog.  Drop the newest queued background rebuild, clear its
+               building flag, then push this edit at the queue head so the worker
+               consumes it next.  A stale/dropped stream section remains dirty and
+               will be resubmitted later. */
+            int drop = (g_async_section_mesh_job_tail - 1 + ASYNC_SECTION_MESH_JOB_QUEUE_MAX) % ASYNC_SECTION_MESH_JOB_QUEUE_MAX;
+            AsyncSectionMeshJob dropped = g_async_section_mesh_jobs[drop];
+            int dropped_cx = -1, dropped_cz = -1;
+            if (dropped.sy >= 0 && dropped.sy < FLAT_RENDER_SECTIONS_Y &&
+                async_mesh_current_local(dropped.world_cx, dropped.world_cz, &dropped_cx, &dropped_cz)) {
+                g_flat_section_mesh_building[dropped.sy][dropped_cz][dropped_cx] = 0;
+                g_flat_section_building_mesh_version[dropped.sy][dropped_cz][dropped_cx] = 0;
+                g_flat_section_building_light_version[dropped.sy][dropped_cz][dropped_cx] = 0;
+            }
+            memset(&g_async_section_mesh_jobs[drop], 0, sizeof(g_async_section_mesh_jobs[0]));
+            g_async_section_mesh_job_tail = drop;
+            g_async_section_mesh_job_count--;
+        }
+        if (g_async_section_mesh_job_count < ASYNC_SECTION_MESH_JOB_QUEUE_MAX) {
+            if (priority) {
+                g_async_section_mesh_job_head = (g_async_section_mesh_job_head - 1 + ASYNC_SECTION_MESH_JOB_QUEUE_MAX) % ASYNC_SECTION_MESH_JOB_QUEUE_MAX;
+                g_async_section_mesh_jobs[g_async_section_mesh_job_head] = job;
+            } else {
+                g_async_section_mesh_jobs[g_async_section_mesh_job_tail] = job;
+                g_async_section_mesh_job_tail = (g_async_section_mesh_job_tail + 1) % ASYNC_SECTION_MESH_JOB_QUEUE_MAX;
+            }
+            g_async_section_mesh_job_count++;
+            g_flat_section_mesh_building[sy][cz][cx] = 1;
+            g_flat_section_building_mesh_version[sy][cz][cx] = job.version;
+            g_flat_section_building_light_version[sy][cz][cx] = job.light_version;
+            can_submit = 1;
+        } else {
+            can_submit = 0;
+        }
+    } else {
+        can_submit = 0;
+    }
+    LeaveCriticalSection(&g_async_section_mesh_cs);
+    if (can_submit) {
+        SetEvent(g_async_section_mesh_event);
+        if (priority) {
+            for (int wake_i = 1; wake_i < g_async_section_mesh_worker_count; ++wake_i) SetEvent(g_async_section_mesh_event);
+        }
+        return 1;
+    }
+    return priority ? 2 : 2;
+}
+
+static int async_section_mesh_submit(int sy, int cx, int cz) {
+    return async_mesh_submit(sy, cx, cz, 0);
+}
+
+static int async_mesh_submit_priority(int sy, int cx, int cz) {
+    return async_mesh_submit(sy, cx, cz, 1);
+}
+
+static void async_section_mesh_install_ready(int max_uploads) {
+    if (!g_async_section_mesh_initialized || max_uploads <= 0) return;
+    int processed = 0;
+    double deadline = now_seconds() + (max_uploads >= 16 ? 0.0060 : 0.0015);
+    while (max_uploads-- > 0) {
+        AsyncSectionMeshResult r;
+        memset(&r, 0, sizeof(r));
+        EnterCriticalSection(&g_async_section_mesh_cs);
+        if (g_async_section_mesh_result_count > 0) {
+            r = g_async_section_mesh_results[g_async_section_mesh_result_head];
+            memset(&g_async_section_mesh_results[g_async_section_mesh_result_head], 0, sizeof(g_async_section_mesh_results[0]));
+            g_async_section_mesh_result_head = (g_async_section_mesh_result_head + 1) % ASYNC_SECTION_MESH_RESULT_QUEUE_MAX;
+            g_async_section_mesh_result_count--;
+        }
+        LeaveCriticalSection(&g_async_section_mesh_cs);
+        if (!r.ready) break;
+
+        double install_start = profile_begin();
+        int valid = 0;
+        int install_cx = -1, install_cz = -1;
+        if (r.sy >= 0 && r.sy < FLAT_RENDER_SECTIONS_Y &&
+            async_mesh_current_local(r.world_cx, r.world_cz, &install_cx, &install_cz) &&
+            g_flat_section_mesh_version[r.sy][install_cz][install_cx] == r.version &&
+            g_flat_chunk_light_version[install_cz][install_cx] == r.light_version &&
+            flat_chunk_light_ready(install_cx, install_cz)) {
+            /* Accept only the exact terrain_rev + light_rev snapshot that is
+               current for this absolute chunk.  A one-chunk ring slide changes
+               only its local slot, so useful worker output is not discarded. */
+            valid = 1;
+        }
+        if (valid) {
+            int installed = 1;
+            if (r.d3d11_prebuilt && pex_using_d3d11()) {
+                PexMeshHandle *slot0 = (PexMeshHandle*)&g_flat_section_direct_mesh[r.sy][install_cz][install_cx][0];
+                PexMeshHandle *slot1 = (PexMeshHandle*)&g_flat_section_direct_mesh[r.sy][install_cz][install_cx][1];
+                if (r.skip0) d3d11_destroy_mesh_deferred(slot0);
+                else if (!d3d11_adopt_mesh(slot0, &r.d3d11_mesh0)) installed = 0;
+                if (r.skip1) d3d11_destroy_mesh_deferred(slot1);
+                else if (!d3d11_adopt_mesh(slot1, &r.d3d11_mesh1)) installed = 0;
+            } else if (flat_direct_backend()) {
+                flat_direct_upload_builder(r.sy, install_cz, install_cx, 0, &r.mb0);
+                flat_direct_upload_builder(r.sy, install_cz, install_cx, 1, &r.mb1);
+            } else {
+                int ok0 = flat_gl_cpu_mesh_install(r.sy, install_cz, install_cx, 0, &r.mb0, r.skip0, r.version, g_flat_world_origin_x, g_flat_world_origin_z);
+                int ok1 = flat_gl_cpu_mesh_install(r.sy, install_cz, install_cx, 1, &r.mb1, r.skip1, r.version, g_flat_world_origin_x, g_flat_world_origin_z);
+                installed = ok0 && ok1;
+            }
+            g_flat_section_mesh_building[r.sy][install_cz][install_cx] = 0;
+            g_flat_section_building_mesh_version[r.sy][install_cz][install_cx] = 0;
+            g_flat_section_building_light_version[r.sy][install_cz][install_cx] = 0;
+            if (installed) {
+                g_flat_section_dirty[r.sy][install_cz][install_cx] = 0;
+                g_flat_section_valid[r.sy][install_cz][install_cx] = 1;
+                g_flat_section_skip_pass[r.sy][install_cz][install_cx][0] = r.skip0;
+                g_flat_section_skip_pass[r.sy][install_cz][install_cx][1] = r.skip1;
+                /* Mark this section settled for the exact light revision baked
+                   into the worker snapshot. */
+                g_flat_section_mesh_light_version[r.sy][install_cz][install_cx] = r.light_version;
+                flat_store_section_visibility(install_cx, install_cz, r.sy, r.version,
+                                              r.world_cx, r.world_cz, r.visibility_mask);
+                pex_logf_trace("chunk mesh installed sy=%d world=%d,%d local=%d,%d skip=%d,%d version=%u", r.sy, r.world_cx, r.world_cz, install_cx, install_cz, r.skip0, r.skip1, r.version);
+            } else {
+                g_flat_section_dirty[r.sy][install_cz][install_cx] = 1;
+            }
+        } else if (r.sy >= 0 && r.sy < FLAT_RENDER_SECTIONS_Y &&
+                   async_mesh_current_local(r.world_cx, r.world_cz, &install_cx, &install_cz)) {
+            /* STRICT RENDER STATE:
+               A stale async result must never make an already-good section dirty.
+               If a newer geometry version exists, that newer edit/remap already owns
+               the dirty/building state.  Only clear/retry when the result still
+               matches the current version and there is no valid mesh to keep. */
+            if (g_flat_section_building_mesh_version[r.sy][install_cz][install_cx] == r.version &&
+                g_flat_section_building_light_version[r.sy][install_cz][install_cx] == r.light_version) {
+                g_flat_section_mesh_building[r.sy][install_cz][install_cx] = 0;
+                g_flat_section_building_mesh_version[r.sy][install_cz][install_cx] = 0;
+                g_flat_section_building_light_version[r.sy][install_cz][install_cx] = 0;
+                if (!g_flat_section_valid[r.sy][install_cz][install_cx]) g_flat_section_dirty[r.sy][install_cz][install_cx] = 1;
+            }
+            if (g_loggy_enabled) g_loggy_mesh_stale_results++;
+            pex_logf_trace("chunk mesh discarded stale result sy=%d world=%d,%d result_origin=%d,%d current_origin=%d,%d version=%u current_version=%u", r.sy, r.world_cx, r.world_cz, r.origin_x, r.origin_z, g_flat_world_origin_x, g_flat_world_origin_z, r.version, g_flat_section_mesh_version[r.sy][install_cz][install_cx]);
+        } else if (g_loggy_enabled) {
+            g_loggy_mesh_stale_results++;
+        }
+        async_section_mesh_free_result(&r);
+        profile_add_time(PROF_MESH_RESULT_INSTALL, install_start);
+        processed++;
+        if (processed > 0 && now_seconds() >= deadline) break;
+    }
+}
+
+static void async_section_mesh_request_stop(void) {
+    if (!g_async_section_mesh_initialized) return;
+    InterlockedExchange(&g_async_section_mesh_stop, 1);
+    /* Discard jobs that have not started.  Busy workers own private snapshots and
+       will observe the cancellation flag inside their current section scan. */
+    EnterCriticalSection(&g_async_section_mesh_cs);
+    g_async_section_mesh_job_head = 0;
+    g_async_section_mesh_job_tail = 0;
+    g_async_section_mesh_job_count = 0;
+    LeaveCriticalSection(&g_async_section_mesh_cs);
+    if (g_async_section_mesh_event) SetEvent(g_async_section_mesh_event);
+    if (g_async_section_mesh_upload_event) SetEvent(g_async_section_mesh_upload_event);
+    for (int i = 0; i < (int)ARRAY_COUNT(g_async_section_mesh_threads); ++i) {
+        if (!g_async_section_mesh_threads[i]) continue;
+        if (g_async_section_mesh_event) SetEvent(g_async_section_mesh_event);
+        SetThreadPriority(g_async_section_mesh_threads[i], THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    if (g_async_section_mesh_upload_thread) SetThreadPriority(g_async_section_mesh_upload_thread, THREAD_PRIORITY_BELOW_NORMAL);
+}
+
+static int async_section_mesh_open_handle_count(void) {
+    int count = 0;
+    for (int i = 0; i < (int)ARRAY_COUNT(g_async_section_mesh_threads); ++i)
+        if (g_async_section_mesh_threads[i]) count++;
+    if (g_async_section_mesh_upload_thread) count++;
+    return count;
+}
+
+static void async_section_mesh_join_workers(void) {
+    int total = async_section_mesh_open_handle_count();
+    int last_remaining = total;
+    DWORD last_log_ms = GetTickCount();
+    if (total <= 0) return;
+
+    for (;;) {
+        int remaining = 0;
+        for (int i = 0; i < (int)ARRAY_COUNT(g_async_section_mesh_threads); ++i) {
+            HANDLE h = g_async_section_mesh_threads[i];
+            if (!h) continue;
+            DWORD wr = WaitForSingleObject(h, 0);
+            if (wr == WAIT_OBJECT_0) {
+                CloseHandle(h);
+                g_async_section_mesh_threads[i] = NULL;
+            } else {
+                remaining++;
+            }
+        }
+        if (g_async_section_mesh_upload_thread) {
+            DWORD wr = WaitForSingleObject(g_async_section_mesh_upload_thread, 0);
+            if (wr == WAIT_OBJECT_0) {
+                CloseHandle(g_async_section_mesh_upload_thread);
+                g_async_section_mesh_upload_thread = NULL;
+            } else {
+                remaining++;
+            }
+        }
+        if (remaining <= 0) break;
+
+        if (g_async_section_mesh_event) {
+            for (int i = 0; i < remaining; ++i) SetEvent(g_async_section_mesh_event);
+        }
+        if (g_async_section_mesh_upload_event) SetEvent(g_async_section_mesh_upload_event);
+
+        if (world_quit_is_active()) {
+            int done = total - remaining;
+            world_quit_set_stage(PEX_WORLD_QUIT_STOPPING_RENDER_WORKERS,
+                                 56 + (done * 9) / (total > 0 ? total : 1));
+        }
+        DWORD now_ms = GetTickCount();
+        if (remaining != last_remaining || (DWORD)(now_ms - last_log_ms) >= 2000u) {
+            pex_logf("mesh shutdown waiting remaining=%d states=%ld,%ld,%ld,%ld upload=%ld",
+                     remaining,
+                     (long)InterlockedCompareExchange(&g_async_section_mesh_worker_state[0], 0, 0),
+                     (long)InterlockedCompareExchange(&g_async_section_mesh_worker_state[1], 0, 0),
+                     (long)InterlockedCompareExchange(&g_async_section_mesh_worker_state[2], 0, 0),
+                     (long)InterlockedCompareExchange(&g_async_section_mesh_worker_state[3], 0, 0),
+                     (long)InterlockedCompareExchange(&g_async_section_mesh_upload_state, 0, 0));
+            last_remaining = remaining;
+            last_log_ms = now_ms;
+        }
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+        /* Cancellation is checked inside the block/face loops; poll quickly so
+           Save & Quit does not sit on "Cancelling mesh builders" for another
+           coarse 10 ms interval after the worker has already stopped. */
+        Sleep(1);
+#else
+        Sleep(10);
+#endif
+    }
+}
+
+static void async_section_mesh_shutdown(void) {
+    if (!g_async_section_mesh_initialized) return;
+    async_section_mesh_request_stop();
+    async_section_mesh_join_workers();
+    g_async_section_mesh_worker_count = 0;
+
+    async_mesh_clear_results(g_async_section_mesh_upload_jobs, ASYNC_SECTION_MESH_UPLOAD_QUEUE_MAX);
+    async_mesh_clear_results(g_async_section_mesh_results, ASYNC_SECTION_MESH_RESULT_QUEUE_MAX);
+
+    if (g_async_section_mesh_event) {
+        CloseHandle(g_async_section_mesh_event);
+        g_async_section_mesh_event = NULL;
+    }
+    if (g_async_section_mesh_upload_event) {
+        CloseHandle(g_async_section_mesh_upload_event);
+        g_async_section_mesh_upload_event = NULL;
+    }
+    DeleteCriticalSection(&g_async_section_mesh_cs);
+    g_async_section_mesh_initialized = 0;
+    g_async_section_mesh_stop = 0;
+    g_async_section_mesh_busy = 0;
+    g_async_section_mesh_upload_busy = 0;
+    g_async_section_mesh_job_head = g_async_section_mesh_job_tail = g_async_section_mesh_job_count = 0;
+    g_async_section_mesh_upload_head = g_async_section_mesh_upload_tail = g_async_section_mesh_upload_count = 0;
+    g_async_section_mesh_result_head = g_async_section_mesh_result_tail = g_async_section_mesh_result_count = 0;
+    for (int i = 0; i < (int)ARRAY_COUNT(g_async_section_mesh_worker_state); ++i)
+        InterlockedExchange(&g_async_section_mesh_worker_state[i], ASYNC_MESH_WORKER_UNUSED);
+    InterlockedExchange(&g_async_section_mesh_upload_state, ASYNC_MESH_WORKER_UNUSED);
+    memset(g_flat_section_mesh_building, 0, sizeof(g_flat_section_mesh_building));
+    memset(g_flat_section_building_mesh_version, 0, sizeof(g_flat_section_building_mesh_version));
+    memset(g_flat_section_building_light_version, 0, sizeof(g_flat_section_building_light_version));
+}
+
+
+/* Java 1.8.8-style section visibility graph.  Each 16^3 section caches which
+   boundary faces are connected through non-opaque cells.  Rendering walks this
+   graph from the camera instead of submitting every section whose AABB touches
+   the frustum, so solid hills/walls stop hidden underground and interior work. */
+enum {
+    FLAT_VIS_NEG_X = 0, FLAT_VIS_POS_X = 1,
+    FLAT_VIS_NEG_Y = 2, FLAT_VIS_POS_Y = 3,
+    FLAT_VIS_NEG_Z = 4, FLAT_VIS_POS_Z = 5,
+    FLAT_VIS_START = 6
+};
+#define FLAT_VIS_ALL ((uint64_t)((1ULL << 36) - 1ULL))
+static uint64_t g_flat_section_visibility[FLAT_RENDER_SECTIONS_Y][FLAT_RENDER_CHUNKS][FLAT_RENDER_CHUNKS];
+static unsigned int g_flat_section_visibility_version[FLAT_RENDER_SECTIONS_Y][FLAT_RENDER_CHUNKS][FLAT_RENDER_CHUNKS];
+static unsigned char g_flat_section_visibility_valid[FLAT_RENDER_SECTIONS_Y][FLAT_RENDER_CHUNKS][FLAT_RENDER_CHUNKS];
+static int g_flat_section_visibility_world_cx[FLAT_RENDER_SECTIONS_Y][FLAT_RENDER_CHUNKS][FLAT_RENDER_CHUNKS];
+static int g_flat_section_visibility_world_cz[FLAT_RENDER_SECTIONS_Y][FLAT_RENDER_CHUNKS][FLAT_RENDER_CHUNKS];
+static unsigned int g_flat_visibility_list_hash = 0;
+
+static int flat_visibility_opposite(int face) {
+    static const int opposite[6] = { 1, 0, 3, 2, 5, 4 };
+    return (face >= 0 && face < 6) ? opposite[face] : FLAT_VIS_START;
+}
+
+static int flat_visibility_connected(uint64_t mask, int from, int to) {
+    if (from == FLAT_VIS_START) return 1;
+    if (from < 0 || from >= 6 || to < 0 || to >= 6) return 0;
+    return (mask & (1ULL << (from * 6 + to))) != 0;
+}
+
+static int flat_visibility_cell_opaque(int id) {
+    return id != 0 && flat_light_opacity_for_id(id) >= 255 && flat_block_is_solid(id);
+}
+
+static uint64_t flat_compute_visibility_from_opaque(const unsigned char *opaque, int opaque_count) {
+    unsigned char visited[4096];
+    unsigned short queue[4096];
+    memset(visited, 0, sizeof(visited));
+    if (opaque_count <= 0) return FLAT_VIS_ALL;
+    if (opaque_count >= 4096) return 0;
+
+    uint64_t result = 0;
+    for (int seed = 0; seed < 4096; ++seed) {
+        if (opaque[seed] || visited[seed]) continue;
+        int head = 0, tail = 0;
+        unsigned int touched = 0;
+        queue[tail++] = (unsigned short)seed;
+        visited[seed] = 1;
+        while (head < tail) {
+            int idx = queue[head++];
+            int x = idx & 15;
+            int z = (idx >> 4) & 15;
+            int y = (idx >> 8) & 15;
+            if (x == 0) touched |= 1u << FLAT_VIS_NEG_X;
+            if (x == 15) touched |= 1u << FLAT_VIS_POS_X;
+            if (y == 0) touched |= 1u << FLAT_VIS_NEG_Y;
+            if (y == 15) touched |= 1u << FLAT_VIS_POS_Y;
+            if (z == 0) touched |= 1u << FLAT_VIS_NEG_Z;
+            if (z == 15) touched |= 1u << FLAT_VIS_POS_Z;
+
+#define FLAT_VIS_PUSH(nidx) do { int _n = (nidx); if (!opaque[_n] && !visited[_n]) { visited[_n] = 1; queue[tail++] = (unsigned short)_n; } } while (0)
+            if (x > 0) FLAT_VIS_PUSH(idx - 1);
+            if (x < 15) FLAT_VIS_PUSH(idx + 1);
+            if (z > 0) FLAT_VIS_PUSH(idx - 16);
+            if (z < 15) FLAT_VIS_PUSH(idx + 16);
+            if (y > 0) FLAT_VIS_PUSH(idx - 256);
+            if (y < 15) FLAT_VIS_PUSH(idx + 256);
+#undef FLAT_VIS_PUSH
+        }
+        for (int a = 0; a < 6; ++a) if (touched & (1u << a)) {
+            for (int b = 0; b < 6; ++b) if (touched & (1u << b)) {
+                result |= 1ULL << (a * 6 + b);
+            }
+        }
+    }
+    return result;
+}
+
+/* Compute connectivity from the exact 18^3 snapshot already copied for the
+   async mesh worker.  This keeps the 4096-cell flood fill off the render thread
+   and makes the culling data match the geometry revision being installed. */
+static uint64_t flat_compute_snapshot_visibility(const unsigned char *blocks) {
+    unsigned char opaque[4096];
+    int opaque_count = 0;
+    if (!blocks) return FLAT_VIS_ALL;
+    for (int y = 0; y < 16; ++y) {
+        if (InterlockedCompareExchange(&g_async_section_mesh_stop, 0, 0) != 0) return FLAT_VIS_ALL;
+        for (int z = 0; z < 16; ++z) {
+            for (int x = 0; x < 16; ++x) {
+                int dst = (y << 8) | (z << 4) | x;
+                int src = (((y + 1) * ASYNC_SECTION_MESH_D) + (z + 1)) * ASYNC_SECTION_MESH_W + (x + 1);
+                int is_opaque = flat_visibility_cell_opaque(blocks[src]);
+                opaque[dst] = (unsigned char)is_opaque;
+                opaque_count += is_opaque;
+            }
+        }
+    }
+    return flat_compute_visibility_from_opaque(opaque, opaque_count);
+}
+
+static void flat_store_section_visibility(int cx, int cz, int sy, unsigned int version,
+                                          int world_cx, int world_cz, uint64_t mask) {
+    if (sy < 0 || sy >= FLAT_RENDER_SECTIONS_Y ||
+        cz < 0 || cz >= FLAT_RENDER_CHUNKS || cx < 0 || cx >= FLAT_RENDER_CHUNKS) return;
+    g_flat_section_visibility[sy][cz][cx] = mask;
+    g_flat_section_visibility_version[sy][cz][cx] = version;
+    g_flat_section_visibility_world_cx[sy][cz][cx] = world_cx;
+    g_flat_section_visibility_world_cz[sy][cz][cx] = world_cz;
+    g_flat_section_visibility_valid[sy][cz][cx] = 1;
+}
+
+static uint64_t flat_section_visibility_mask(int cx, int cz, int sy) {
+    int world_cx = floor_div16(g_flat_world_origin_x) + cx;
+    int world_cz = floor_div16(g_flat_world_origin_z) + cz;
+    unsigned int version = g_flat_section_mesh_version[sy][cz][cx];
+    if (!g_flat_section_visibility_valid[sy][cz][cx] ||
+        g_flat_section_visibility_version[sy][cz][cx] != version ||
+        g_flat_section_visibility_world_cx[sy][cz][cx] != world_cx ||
+        g_flat_section_visibility_world_cz[sy][cz][cx] != world_cz) {
+        /* Until the matching worker result arrives, treat every face as
+           connected.  This is conservative (never hides terrain) and avoids a
+           large first-frame visibility scan on the render thread. */
+        return FLAT_VIS_ALL;
+    }
+    return g_flat_section_visibility[sy][cz][cx];
+}
+
+typedef struct FlatVisibilityQueueNode {
+    short cx, cz, sy;
+    signed char entry_face;
+} FlatVisibilityQueueNode;
+
+static int flat_section_aabb_visible(const FlatFrustum *fr, int cx, int cz, int sy) {
+    float x0 = (float)(g_flat_world_origin_x + cx * FLAT_RENDER_CHUNK) - 2.0f;
+    float z0 = (float)(g_flat_world_origin_z + cz * FLAT_RENDER_CHUNK) - 2.0f;
+    float x1 = x0 + (float)FLAT_RENDER_CHUNK + 4.0f;
+    float z1 = z0 + (float)FLAT_RENDER_CHUNK + 4.0f;
+    float y0 = (float)(FLAT_WORLD_Y_MIN + sy * FLAT_RENDER_SECTION) - 2.0f;
+    float y1 = y0 + (float)FLAT_RENDER_SECTION + 4.0f;
+    if (y1 > (float)FLAT_WORLD_Y_MAX + 3.0f) y1 = (float)FLAT_WORLD_Y_MAX + 3.0f;
+    return flat_aabb_in_frustum(fr, x0, y0, z0, x1, y1, z1);
+}
+
+static int build_flat_visible_sections(const FlatFrustum *fr, FlatRenderSectionRef *out, int cap) {
+    int count = 0;
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    float px = pr->prev_x + (pr->x - pr->prev_x) * g_frame_partial;
+    float py = pr->prev_y + (pr->y - pr->prev_y) * g_frame_partial;
+    float pz = pr->prev_z + (pr->z - pr->prev_z) * g_frame_partial;
+
+    int pcx = flat_index((int)floorf(px)) / FLAT_RENDER_CHUNK;
+    int pcz = flat_z_index((int)floorf(pz)) / FLAT_RENDER_CHUNK;
+    int psy = ((int)floorf(py) - FLAT_WORLD_Y_MIN) / FLAT_RENDER_SECTION;
+    if (pcx < 0) pcx = 0; if (pcx >= FLAT_RENDER_CHUNKS) pcx = FLAT_RENDER_CHUNKS - 1;
+    if (pcz < 0) pcz = 0; if (pcz >= FLAT_RENDER_CHUNKS) pcz = FLAT_RENDER_CHUNKS - 1;
+    if (psy < 0) psy = 0; if (psy >= FLAT_RENDER_SECTIONS_Y) psy = FLAT_RENDER_SECTIONS_Y - 1;
+
+    int radius = generated_render_radius();
+    static unsigned char visited[FLAT_RENDER_SECTIONS_Y][FLAT_RENDER_CHUNKS][FLAT_RENDER_CHUNKS];
+    static unsigned char emitted[FLAT_RENDER_SECTIONS_Y][FLAT_RENDER_CHUNKS][FLAT_RENDER_CHUNKS];
+    static FlatVisibilityQueueNode queue[FLAT_MAX_VISIBLE_SECTIONS * 7];
+    int qhead = 0, qtail = 0;
+    memset(visited, 0, sizeof(visited));
+    memset(emitted, 0, sizeof(emitted));
+
+    if (g_flat_world_chunk_generated[pcz][pcx] && flat_chunk_light_ready(pcx, pcz)) {
+        queue[qtail++] = (FlatVisibilityQueueNode){ (short)pcx, (short)pcz, (short)psy, (signed char)FLAT_VIS_START };
+        visited[psy][pcz][pcx] = (unsigned char)(1u << FLAT_VIS_START);
+    }
+
+    static const int dx[6] = { -1, 1, 0, 0, 0, 0 };
+    static const int dy[6] = { 0, 0, -1, 1, 0, 0 };
+    static const int dz[6] = { 0, 0, 0, 0, -1, 1 };
+    unsigned int list_hash = 2166136261u;
+
+    while (qhead < qtail) {
+        FlatVisibilityQueueNode node = queue[qhead++];
+        int cx = node.cx, cz = node.cz, sy = node.sy;
+        if (cx < 0 || cx >= FLAT_RENDER_CHUNKS || cz < 0 || cz >= FLAT_RENDER_CHUNKS || sy < 0 || sy >= FLAT_RENDER_SECTIONS_Y) continue;
+        if (abs(cx - pcx) > radius || abs(cz - pcz) > radius) continue;
+        if (!g_flat_world_chunk_generated[cz][cx] || !flat_chunk_light_ready(cx, cz)) continue;
+        if (!flat_section_aabb_visible(fr, cx, cz, sy) && !(cx == pcx && cz == pcz && sy == psy)) continue;
+
+        if (!emitted[sy][cz][cx]) {
+            emitted[sy][cz][cx] = 1;
+            if (!(!flat_section_has_blocks(cx, cz, sy) &&
+                  g_flat_section_valid[sy][cz][cx] &&
+                  g_flat_section_skip_pass[sy][cz][cx][0] &&
+                  g_flat_section_skip_pass[sy][cz][cx][1])) {
+                if (count >= cap) break;
+                float mx = (float)(g_flat_world_origin_x + cx * 16 + 8) - px;
+                float my = (float)(FLAT_WORLD_Y_MIN + sy * 16 + 8) - py;
+                float mz = (float)(g_flat_world_origin_z + cz * 16 + 8) - pz;
+                out[count].cx = cx; out[count].cz = cz; out[count].sy = sy;
+                out[count].dist2 = mx*mx + my*my + mz*mz;
+                list_hash ^= (unsigned int)(cx + cz * 37 + sy * 1369);
+                list_hash *= 16777619u;
+                count++;
+            }
+        }
+
+        uint64_t connections = flat_section_visibility_mask(cx, cz, sy);
+        for (int exit_face = 0; exit_face < 6; ++exit_face) {
+            if (!flat_visibility_connected(connections, node.entry_face, exit_face)) continue;
+            int ncx = cx + dx[exit_face];
+            int ncz = cz + dz[exit_face];
+            int nsy = sy + dy[exit_face];
+            if (ncx < 0 || ncx >= FLAT_RENDER_CHUNKS || ncz < 0 || ncz >= FLAT_RENDER_CHUNKS || nsy < 0 || nsy >= FLAT_RENDER_SECTIONS_Y) continue;
+            if (abs(ncx - pcx) > radius || abs(ncz - pcz) > radius) continue;
+            if (!g_flat_world_chunk_generated[ncz][ncx] || !flat_chunk_light_ready(ncx, ncz)) continue;
+            int entry = flat_visibility_opposite(exit_face);
+            unsigned char bit = (unsigned char)(1u << entry);
+            if (visited[nsy][ncz][ncx] & bit) continue;
+            if (!flat_section_aabb_visible(fr, ncx, ncz, nsy)) continue;
+            visited[nsy][ncz][ncx] |= bit;
+            if (qtail < (int)ARRAY_COUNT(queue)) {
+                queue[qtail++] = (FlatVisibilityQueueNode){ (short)ncx, (short)ncz, (short)nsy, (signed char)entry };
+            }
+        }
+    }
+
+    if (list_hash != g_flat_visibility_list_hash) {
+        g_flat_visibility_list_hash = list_hash;
+        g_flat_renderer_sort_dirty = 1;
+    }
+    if (flat_renderer_sort_needed(px, py, pz, count) || g_flat_visible_sorted_count != count) {
+        qsort(out, (size_t)count, sizeof(out[0]), flat_section_ref_cmp_near);
+        if (count > 0) memcpy(g_flat_visible_sorted_sections, out, (size_t)count * sizeof(out[0]));
+        g_flat_visible_sorted_count = count;
+        flat_note_renderer_sorted(px, py, pz, count);
+    } else if (count > 0) {
+        memcpy(out, g_flat_visible_sorted_sections, (size_t)count * sizeof(out[0]));
+    }
+    return count;
+}
+
+static void flat_self_heal_visible_sections(const FlatRenderSectionRef *refs, int count) {
+    double self_heal_start = profile_begin();
+    if (!refs || count <= 0) {
+        profile_add_time(PROF_MESH_SELF_HEAL, self_heal_start);
+        return;
+    }
+
+    int direct = flat_direct_backend() ? 1 : 0;
+    int async_mesh = flat_async_section_mesh_enabled() ? 1 : 0;
+    int recent_edit = (g_ingame_ticks - g_flat_recent_block_mesh_dirty_tick) >= 0 &&
+                      (g_ingame_ticks - g_flat_recent_block_mesh_dirty_tick) <= 12;
+    int streaming = stream_generation_active() ? 1 : 0;
+    int mesh_queue_active = streaming || async_section_mesh_pending() ||
+                            g_prof_mesh_jobs_last > 0 || g_prof_mesh_results_last > 0 ||
+                            g_prof_mesh_uploads_last > 0;
+
+    /* Correct rule: CHAT, PAUSE and INGAME all render the same world.  Do not
+       special-case overlays.  Self-heal must be cheap in the real in-game path.
+
+       Self-heal is only a last-resort checker for stale/missing mesh handles.
+       It must not do 16x16x16 block scans on the render thread.  Empty-section
+       detection belongs to the normal mesh worker; if a suspicious section is
+       empty, the worker will produce skip0/skip1 and mark it valid cheaply off
+       the main thread. */
+    enum {
+        SELF_HEAL_IDLE_BACKOFF_FRAMES = 45,
+        SELF_HEAL_BUSY_BACKOFF_FRAMES = 12,
+        SELF_HEAL_PROBES_IDLE = 2,
+        SELF_HEAL_PROBES_BUSY = 3,
+        SELF_HEAL_PROBES_EDIT = 10
+    };
+    static int s_probe_cursor = 0;
+    static int s_frame_counter = 0;
+    s_frame_counter++;
+
+    if (!recent_edit) {
+        int backoff = mesh_queue_active ? SELF_HEAL_BUSY_BACKOFF_FRAMES : SELF_HEAL_IDLE_BACKOFF_FRAMES;
+        if ((s_frame_counter % backoff) != 0) {
+            profile_add_time(PROF_MESH_SELF_HEAL, self_heal_start);
+            return;
+        }
+    }
+
+    int probe_budget = recent_edit ? SELF_HEAL_PROBES_EDIT : (mesh_queue_active ? SELF_HEAL_PROBES_BUSY : SELF_HEAL_PROBES_IDLE);
+    if (probe_budget > count) probe_budget = count;
+    if (probe_budget <= 0) {
+        profile_add_time(PROF_MESH_SELF_HEAL, self_heal_start);
+        return;
+    }
+
+    int start = s_probe_cursor % count;
+    s_probe_cursor = (start + probe_budget) % count;
+    int probes_done = 0;
+
+    /* Very hard budget.  This loop now only reads metadata, so it should be far
+       below this, but keep the guard so this safety net can never own a frame. */
+    double deadline = self_heal_start + (recent_edit ? 0.00020 : 0.00005);
+
+    for (int i = 0; i < probe_budget; i++) {
+        if (now_seconds() >= deadline) break;
+        int ri = (start + i) % count;
+        int cx = refs[ri].cx, cz = refs[ri].cz, sy = refs[ri].sy;
+        if (cx < 0 || cx >= FLAT_RENDER_CHUNKS || cz < 0 || cz >= FLAT_RENDER_CHUNKS || sy < 0 || sy >= FLAT_RENDER_SECTIONS_Y) continue;
+        if (!g_flat_world_chunk_generated[cz][cx]) continue;
+        if (!flat_chunk_light_ready(cx, cz)) continue;
+        probes_done++;
+
+        /* Math self-heal: sparsely validate generated, light-ready chunks against
+           the top-down skylight equation.  A mismatch queues a light repair only;
+           it does not dirty render meshes until the repair commits a new light_rev. */
+        if (!recent_edit && (s_frame_counter % 30) == 0 && sy == 0) {
+            if (flat_sky_light_needs_rebuild(cx, cz)) {
+                int wx = g_flat_world_origin_x + cx * FLAT_RENDER_CHUNK + 8;
+                int wz = g_flat_world_origin_z + cz * FLAT_RENDER_CHUNK + 8;
+                flat_queue_light_repair_at_block(wx, wz);
+            }
+        }
+
+        int dirty_or_invalid = (!g_flat_section_valid[sy][cz][cx] || g_flat_section_dirty[sy][cz][cx]);
+        int payload_missing = 0;
+
+        if (!dirty_or_invalid) {
+            if (direct) {
+                if (!g_flat_section_skip_pass[sy][cz][cx][0] && !g_flat_section_direct_mesh[sy][cz][cx][0]) payload_missing = 1;
+                if (flat_separate_liquid_pass_enabled() && !g_flat_section_skip_pass[sy][cz][cx][1] && !g_flat_section_direct_mesh[sy][cz][cx][1]) payload_missing = 1;
+            } else if (async_mesh) {
+                if (!g_flat_section_skip_pass[sy][cz][cx][0] && !flat_gl_cpu_mesh_ready(sy, cz, cx, 0)) payload_missing = 1;
+                if (flat_separate_liquid_pass_enabled() && !g_flat_section_skip_pass[sy][cz][cx][1] && !flat_gl_cpu_mesh_ready(sy, cz, cx, 1)) payload_missing = 1;
+            } else {
+                if (!g_flat_section_skip_pass[sy][cz][cx][0] && g_flat_section_lists[sy][cz][cx][0] == 0) payload_missing = 1;
+                if (flat_separate_liquid_pass_enabled() && !g_flat_section_skip_pass[sy][cz][cx][1] && g_flat_section_lists[sy][cz][cx][1] == 0) payload_missing = 1;
+            }
+        }
+
+        if (!dirty_or_invalid && !payload_missing) continue;
+
+        /* No flat_section_has_blocks() here.  That was the 4-5 ms frame killer.
+           Just mark the section for the normal async rebuild path. */
+        if (payload_missing && !g_flat_section_dirty[sy][cz][cx]) {
+            g_flat_section_dirty[sy][cz][cx] = 1;
+            g_flat_world_chunk_dirty[cz][cx] = 1;
+            g_flat_renderer_sort_dirty = 1;
+            if (g_loggy_enabled) g_loggy_mesh_self_heal_missing++;
+            pex_logf_trace("chunk render self-heal queued missing mesh local=%d,%d sy=%d valid=%d direct=%d async=%d", cx, cz, sy, g_flat_section_valid[sy][cz][cx], direct, async_mesh);
+        }
+
+        /* Stuck build flags are rare.  Only clear them for actually suspicious
+           sections, and only occasionally, so a live worker is not disturbed. */
+        if ((dirty_or_invalid || payload_missing) &&
+            g_flat_section_mesh_building[sy][cz][cx] && (s_frame_counter % 120) == 0) {
+            g_flat_section_mesh_building[sy][cz][cx] = 0;
+            g_flat_section_dirty[sy][cz][cx] = 1;
+            pex_logf_trace("chunk render self-heal cleared stuck build flag local=%d,%d sy=%d", cx, cz, sy);
+        }
+    }
+
+    if (g_loggy_enabled) g_loggy_mesh_self_heal_refs += probes_done;
+    profile_add_time(PROF_MESH_SELF_HEAL, self_heal_start);
+}
+
+static void drain_edit_priority_meshes(int streaming, int recent_edit) {
+    (void)streaming;
+    if (!recent_edit && g_flat_edit_priority_count <= 0) return;
+
+    /* Fully async edit path: never rebuild edited terrain on the render/game
+       thread.  Push the dirty sections to the front of the async worker pool and
+       let the already-rendered old mesh stay alive until a completed replacement
+       is adopted.  Placement feedback is handled by the tiny visual edit overlay;
+       breaking/removal feedback comes from priority mesh completion, not sync work. */
+#if defined(PEX_PLATFORM_ANDROID_TV)
+    int max_edits = 1;
+    double deadline = now_seconds() + 0.00035;
+#elif defined(PEX_PLATFORM_ANDROID)
+    int max_edits = recent_edit ? 2 : 1;
+    double deadline = now_seconds() + (recent_edit ? 0.00065 : 0.00030);
+#else
+    int max_edits = recent_edit ? 12 : 2;
+    double deadline = now_seconds() + (recent_edit ? 0.0010 : 0.00025);
+#endif
+    while (max_edits-- > 0 && now_seconds() < deadline) {
+        int sy = 0, cx = 0, cz = 0;
+        if (!flat_take_edit_priority_section(&sy, &cx, &cz)) break;
+        if (!flat_local_chunk_valid(cx, cz) || !flat_section_index_valid(sy)) continue;
+        if (!g_flat_world_chunk_generated[cz][cx] || !flat_chunk_light_ready(cx, cz)) continue;
+        if (!flat_section_needs_mesh_rebuild(sy, cz, cx)) continue;
+        int submit = async_mesh_submit_priority(sy, cx, cz);
+        if (submit == 1) {
+            if (g_loggy_enabled) g_loggy_mesh_edit_priority_async++;
+        } else if (submit == 2) {
+            /* Worker queue is full or already building it. Keep it near the front
+               without blocking the frame. */
+            flat_note_edit_priority_section(cx, cz, sy);
+            break;
+        }
+    }
+    g_loggy_mesh_edit_priority_left = g_flat_edit_priority_count;
+}
+
+static void rebuild_visible_flat_sections(const FlatRenderSectionRef *refs, int count) {
+    flat_gl_cpu_mesh_check_origin();
+    int direct = flat_direct_backend() ? 1 : 0;
+    int async_mesh = flat_async_section_mesh_enabled() ? 1 : 0;
+    int streaming = stream_generation_active() ? 1 : 0;
+    if (g_async_section_mesh_initialized) {
+        EnterCriticalSection(&g_async_section_mesh_cs);
+        g_prof_mesh_jobs_last = g_async_section_mesh_job_count + (g_async_section_mesh_busy ? 1 : 0);
+        g_prof_mesh_uploads_last = g_async_section_mesh_upload_count + (g_async_section_mesh_upload_busy ? 1 : 0);
+        g_prof_mesh_results_last = g_async_section_mesh_result_count;
+        LeaveCriticalSection(&g_async_section_mesh_cs);
+    } else {
+        g_prof_mesh_jobs_last = 0;
+        g_prof_mesh_uploads_last = 0;
+        g_prof_mesh_results_last = 0;
+    }
+
+    int recent_edit = (g_ingame_ticks - g_flat_recent_block_mesh_dirty_tick) >= 0 &&
+                      (g_ingame_ticks - g_flat_recent_block_mesh_dirty_tick) <= 12;
+    drain_edit_priority_meshes(streaming, recent_edit);
+    flat_self_heal_visible_sections(refs, count);
+    int sf_updates = stivufine_chunk_updates();
+    LONG light_boost = InterlockedCompareExchange(&g_flat_light_mesh_boost_frames, 0, 0);
+    int lighting_repaint = flat_lighting_pending_dirty() || light_boost > 0;
+    if (light_boost > 0) {
+        (void)InterlockedCompareExchange(&g_flat_light_mesh_boost_frames, light_boost - 1, light_boost);
+    }
+    int rebuilds_left = (recent_edit && stivufine_dynamic_chunk_updates_enabled()) ? sf_updates + 2 : sf_updates;
+    if ((streaming || lighting_repaint) && !recent_edit) {
+        /* Terrain generation and exact lighting both create bursts of dirty visible
+           sections.  Keep the submission path bounded, but do not fall back to one
+           section per frame while a completed light repair is waiting to be shown. */
+        int stream_budget = streaming ? (direct ? 6 : 8) : (direct ? 4 : 6);
+        if (g_prof_mesh_jobs_last > 24) stream_budget = 4;
+        if (g_prof_mesh_results_last > 24) stream_budget = 3;
+        if (rebuilds_left < stream_budget) rebuilds_left = stream_budget;
+    }
+#if defined(PEX_PLATFORM_ANDROID_TV)
+    if (rebuilds_left > 1) rebuilds_left = 1;
+    double deadline = now_seconds() + 0.00045;
+#elif defined(PEX_PLATFORM_ANDROID)
+    if (rebuilds_left > 2) rebuilds_left = 2;
+    double deadline = now_seconds() + 0.00080;
+#else
+    double deadline = now_seconds() + (recent_edit ? 0.0060 : ((streaming || lighting_repaint) ? 0.0015 : 0.0030));
+#endif
+
+#if defined(PEX_PLATFORM_PSP)
+    if (async_mesh) async_section_mesh_install_ready(streaming ? 1 : 1);
+#else
+    /* Java's RenderGlobal keeps block edits at the front of worldRenderersToUpdate.
+       The C renderer builds meshes off-thread, so the equivalent is to adopt a few
+       already-finished priority edit meshes before background stream results.
+       Keep the normal budget low to avoid frame hitches. */
+    if (async_mesh) {
+#if defined(PEX_PLATFORM_ANDROID_TV)
+        int install_budget = 1;
+#elif defined(PEX_PLATFORM_ANDROID)
+        int install_budget = (recent_edit || streaming || lighting_repaint) ? 2 : 1;
+#else
+        int install_budget = recent_edit ? 8 : ((streaming || lighting_repaint) ? 4 : 2);
+        if (!recent_edit && g_prof_mesh_results_last > 12) install_budget = (streaming || lighting_repaint) ? 8 : 4;
+#endif
+        async_section_mesh_install_ready(install_budget);
+    }
+#endif
+
+    for (int i = 0; i < count && rebuilds_left > 0; i++) {
+        if (now_seconds() > deadline) break;
+        int cx = refs[i].cx, cz = refs[i].cz, sy = refs[i].sy;
+        if (!flat_chunk_light_ready(cx, cz)) continue;
+        int needs = 0;
+        /* STRICT RENDER STATE: do not rebuild valid meshes solely because the
+           background light epoch changed.  Only explicit dirty/invalid/missing
+           payload states can request a mesh. */
+
+        if (async_mesh) {
+            if (!g_flat_section_valid[sy][cz][cx] || g_flat_section_dirty[sy][cz][cx]) {
+                needs = 1;
+            } else if (direct) {
+                if (!g_flat_section_skip_pass[sy][cz][cx][0] && !g_flat_section_direct_mesh[sy][cz][cx][0]) needs = 1;
+                else if (flat_separate_liquid_pass_enabled() && !g_flat_section_skip_pass[sy][cz][cx][1] && !g_flat_section_direct_mesh[sy][cz][cx][1]) needs = 1;
+            } else {
+                if (!g_flat_section_skip_pass[sy][cz][cx][0] && !flat_gl_cpu_mesh_ready(sy, cz, cx, 0)) needs = 1;
+                else if (flat_separate_liquid_pass_enabled() && !g_flat_section_skip_pass[sy][cz][cx][1] && !flat_gl_cpu_mesh_ready(sy, cz, cx, 1)) needs = 1;
+            }
+        } else if (direct) {
+            if (!g_flat_section_valid[sy][cz][cx] || g_flat_section_dirty[sy][cz][cx]) {
+                needs = 1;
+            } else if (!g_flat_section_skip_pass[sy][cz][cx][0] && !g_flat_section_direct_mesh[sy][cz][cx][0]) {
+                needs = 1;
+            } else if (flat_separate_liquid_pass_enabled() && !g_flat_section_skip_pass[sy][cz][cx][1] && !g_flat_section_direct_mesh[sy][cz][cx][1]) {
+                needs = 1;
+            }
+        } else {
+            if (g_flat_section_lists[sy][cz][cx][0] == 0 ||
+                g_flat_section_lists[sy][cz][cx][1] == 0 ||
+                g_flat_section_dirty[sy][cz][cx]) {
+                needs = 1;
+            }
+        }
+
+        if (needs) {
+            int near_player_edit = recent_edit && (refs[i].dist2 < (48.0f * 48.0f));
+            if (async_mesh) {
+                if (near_player_edit) (void)async_mesh_submit_priority(sy, cx, cz);
+                else (void)async_section_mesh_submit(sy, cx, cz);
+            } else {
+                /* Only legacy/non-threaded platforms use this fallback.  Desktop
+                   OpenGL/D3D use the worker-pool path above. */
+                pex_logf_trace("chunk mesh legacy sync rebuild sy=%d local=%d,%d", sy, cx, cz);
+                rebuild_flat_section_list(sy, cx, cz);
+            }
+            rebuilds_left--;
+        }
+    }
+}
+
+static int flat_section_needs_mesh_rebuild(int sy, int cz, int cx) {
+    if (sy < 0 || sy >= FLAT_RENDER_SECTIONS_Y || cz < 0 || cz >= FLAT_RENDER_CHUNKS || cx < 0 || cx >= FLAT_RENDER_CHUNKS) return 0;
+    if (g_flat_world_chunk_generated[cz][cx] && !flat_chunk_light_ready(cx, cz)) return 0;
+    /* Strict mode: light-version drift alone is not a rebuild request. */
+    if (g_flat_section_skip_pass[sy][cz][cx][0] &&
+        (!flat_separate_liquid_pass_enabled() || g_flat_section_skip_pass[sy][cz][cx][1]) &&
+        !g_flat_section_dirty[sy][cz][cx]) return 0;
+    if (flat_async_section_mesh_enabled()) {
+        if (!g_flat_section_valid[sy][cz][cx] || g_flat_section_dirty[sy][cz][cx]) return 1;
+        if (flat_direct_backend()) {
+            if (!g_flat_section_skip_pass[sy][cz][cx][0] && !g_flat_section_direct_mesh[sy][cz][cx][0]) return 1;
+            if (flat_separate_liquid_pass_enabled() && !g_flat_section_skip_pass[sy][cz][cx][1] && !g_flat_section_direct_mesh[sy][cz][cx][1]) return 1;
+        } else {
+            if (!g_flat_section_skip_pass[sy][cz][cx][0] && !flat_gl_cpu_mesh_ready(sy, cz, cx, 0)) return 1;
+            if (flat_separate_liquid_pass_enabled() && !g_flat_section_skip_pass[sy][cz][cx][1] && !flat_gl_cpu_mesh_ready(sy, cz, cx, 1)) return 1;
+        }
+        return 0;
+    }
+    if (flat_direct_backend()) {
+        if (!g_flat_section_valid[sy][cz][cx] || g_flat_section_dirty[sy][cz][cx]) return 1;
+        if (!g_flat_section_skip_pass[sy][cz][cx][0] && !g_flat_section_direct_mesh[sy][cz][cx][0]) return 1;
+        if (flat_separate_liquid_pass_enabled() && !g_flat_section_skip_pass[sy][cz][cx][1] && !g_flat_section_direct_mesh[sy][cz][cx][1]) return 1;
+        return 0;
+    }
+    if (g_flat_section_lists[sy][cz][cx][0] == 0 ||
+        g_flat_section_lists[sy][cz][cx][1] == 0 ||
+        g_flat_section_dirty[sy][cz][cx]) return 1;
+    return 0;
+}
+
+static int g_worldgen_mesh_prep_active = 0;
+static int g_worldgen_mesh_prep_count = 0;
+static int g_worldgen_mesh_prep_index = 0;
+static FlatRenderSectionRef g_worldgen_mesh_prep_refs[FLAT_MAX_VISIBLE_SECTIONS];
+
+static void worldgen_mesh_prep_reset(void) {
+    g_worldgen_mesh_prep_active = 0;
+    g_worldgen_mesh_prep_count = 0;
+    g_worldgen_mesh_prep_index = 0;
+}
+
+static void worldgen_mesh_prep_build_list(void) {
+    g_worldgen_mesh_prep_count = 0;
+    g_worldgen_mesh_prep_index = 0;
+
+    float px = g_player_x;
+    float py = g_player_y;
+    float pz = g_player_z;
+    int pcx = flat_index((int)floorf(px)) / FLAT_RENDER_CHUNK;
+    int pcz = flat_z_index((int)floorf(pz)) / FLAT_RENDER_CHUNK;
+    if (pcx < 0) pcx = 0; if (pcx >= FLAT_RENDER_CHUNKS) pcx = FLAT_RENDER_CHUNKS - 1;
+    if (pcz < 0) pcz = 0; if (pcz >= FLAT_RENDER_CHUNKS) pcz = FLAT_RENDER_CHUNKS - 1;
+
+    int r = generated_render_radius();
+    int cx0 = pcx - r, cx1 = pcx + r;
+    int cz0 = pcz - r, cz1 = pcz + r;
+    if (g_worldgen.active) {
+        /* Java 1.2.5 preloadWorld() drains lighting before entering, but
+           RenderGlobal.updateRenderers() only rebuilds a small prioritized set per
+           frame.  Prepare only the near spawn view here: enough to stop first-frame
+           brightness popping, not every generated section in the 49-chunk island. */
+        int prep_r = 2;
+        cx0 = pcx - prep_r; cx1 = pcx + prep_r;
+        cz0 = pcz - prep_r; cz1 = pcz + prep_r;
+    }
+    if (cx0 < 0) cx0 = 0;
+    if (cz0 < 0) cz0 = 0;
+    if (cx1 >= FLAT_RENDER_CHUNKS) cx1 = FLAT_RENDER_CHUNKS - 1;
+    if (cz1 >= FLAT_RENDER_CHUNKS) cz1 = FLAT_RENDER_CHUNKS - 1;
+
+    for (int cz = cz0; cz <= cz1; cz++) {
+        for (int cx = cx0; cx <= cx1; cx++) {
+            if (!g_flat_world_chunk_generated[cz][cx] || !flat_chunk_light_ready(cx, cz)) continue;
+            for (int sy = 0; sy < FLAT_RENDER_SECTIONS_Y; sy++) {
+                if (!flat_section_has_blocks(cx, cz, sy)) {
+                    flat_mark_generated_section(cx, cz, sy);
+                    continue;
+                }
+                if (!flat_section_needs_mesh_rebuild(sy, cz, cx)) continue;
+                if (g_worldgen_mesh_prep_count >= FLAT_MAX_VISIBLE_SECTIONS) break;
+                float x0 = (float)(g_flat_world_origin_x + cx * FLAT_RENDER_CHUNK);
+                float z0 = (float)(g_flat_world_origin_z + cz * FLAT_RENDER_CHUNK);
+                float y0 = (float)(FLAT_WORLD_Y_MIN + sy * FLAT_RENDER_SECTION);
+                float mx = x0 + 8.0f - px;
+                float my = y0 + 8.0f - py;
+                float mz = z0 + 8.0f - pz;
+                g_worldgen_mesh_prep_refs[g_worldgen_mesh_prep_count].cx = cx;
+                g_worldgen_mesh_prep_refs[g_worldgen_mesh_prep_count].cz = cz;
+                g_worldgen_mesh_prep_refs[g_worldgen_mesh_prep_count].sy = sy;
+                g_worldgen_mesh_prep_refs[g_worldgen_mesh_prep_count].dist2 = mx * mx + my * my + mz * mz;
+                g_worldgen_mesh_prep_count++;
+            }
+        }
+    }
+    qsort(g_worldgen_mesh_prep_refs, (size_t)g_worldgen_mesh_prep_count,
+          sizeof(g_worldgen_mesh_prep_refs[0]), flat_section_ref_cmp_near);
+    g_worldgen_mesh_prep_active = 1;
+}
+
+static int worldgen_mesh_verify_complete(void) {
+    if (!g_worldgen_mesh_prep_active) return 0;
+    for (int i = 0; i < g_worldgen_mesh_prep_count; ++i) {
+        FlatRenderSectionRef *r = &g_worldgen_mesh_prep_refs[i];
+        if (flat_section_needs_mesh_rebuild(r->sy, r->cz, r->cx)) return 0;
+    }
+    return 1;
+}
+
+static int worldgen_mesh_prep_step(int max_rebuilds) {
+#if defined(PEX_PLATFORM_PSP) && defined(PEX_PSP_FAST_WORLD) && PEX_PSP_FAST_WORLD
+    (void)max_rebuilds;
+    g_worldgen_mesh_prep_active = 1;
+    g_worldgen_mesh_prep_count = 1;
+    g_worldgen_mesh_prep_index = 1;
+    return 1;
+#endif
+    if (!g_worldgen_mesh_prep_active) worldgen_mesh_prep_build_list();
+    if (max_rebuilds < 1) max_rebuilds = 1;
+
+    if (g_worldgen.active) {
+        /* Do not block on the whole preload island, but do require the near spawn
+           renderers to be built from the final light version.  This is the missing
+           light->mesh synchronization that made default spawn chunks brighten only
+           after entering the world or after a block edit. */
+        if (flat_async_section_mesh_enabled()) {
+#if defined(PEX_PLATFORM_WII)
+            int built = 0;
+            while (g_worldgen_mesh_prep_index < g_worldgen_mesh_prep_count && built < max_rebuilds) {
+                FlatRenderSectionRef *r = &g_worldgen_mesh_prep_refs[g_worldgen_mesh_prep_index++];
+                if (flat_section_needs_mesh_rebuild(r->sy, r->cz, r->cx)) {
+                    rebuild_flat_section_list(r->sy, r->cx, r->cz);
+                    built++;
+                }
+            }
+            return (g_worldgen_mesh_prep_index >= g_worldgen_mesh_prep_count);
+#else
+            async_section_mesh_install_ready(max_rebuilds);
+            int submitted = 0;
+            while (g_worldgen_mesh_prep_index < g_worldgen_mesh_prep_count && submitted < max_rebuilds) {
+                FlatRenderSectionRef *r = &g_worldgen_mesh_prep_refs[g_worldgen_mesh_prep_index];
+                if (!flat_section_needs_mesh_rebuild(r->sy, r->cz, r->cx)) {
+                    g_worldgen_mesh_prep_index++;
+                    continue;
+                }
+                if (g_flat_section_mesh_building[r->sy][r->cz][r->cx]) break;
+                /* Loading/pre-entry prep must never use the priority path.  The
+                   priority submitter is allowed to drop queued background jobs; when
+                   the old Preparing Chunks gate used it, the prep index advanced
+                   past sections whose jobs were silently discarded, verify_complete
+                   failed, reset to zero, and the loading screen looped. */
+                int submit_result = async_section_mesh_submit(r->sy, r->cx, r->cz);
+                if (submit_result == 2) break;
+                if (submit_result == 0) rebuild_flat_section_list(r->sy, r->cx, r->cz);
+                g_worldgen_mesh_prep_index++;
+                submitted++;
+            }
+            if (g_worldgen_mesh_prep_index >= g_worldgen_mesh_prep_count) {
+                async_section_mesh_install_ready(max_rebuilds);
+
+                int target_still_building = 0;
+                for (int i = 0; i < g_worldgen_mesh_prep_count; ++i) {
+                    FlatRenderSectionRef *r = &g_worldgen_mesh_prep_refs[i];
+                    if (g_flat_section_mesh_building[r->sy][r->cz][r->cx]) {
+                        target_still_building = 1;
+                        break;
+                    }
+                }
+                if (target_still_building) return 0;
+
+                if (!worldgen_mesh_verify_complete()) {
+                    /* Do not loop a full N/N Preparing Chunks pass forever.  Mark the
+                       remaining sections dirty and let the normal Java-style renderer
+                       update queue rebuild them after entry.  Lighting has already
+                       settled by this phase, so any runtime rebuild uses final light. */
+                    for (int i = 0; i < g_worldgen_mesh_prep_count; ++i) {
+                        FlatRenderSectionRef *r = &g_worldgen_mesh_prep_refs[i];
+                        if (flat_section_needs_mesh_rebuild(r->sy, r->cz, r->cx)) {
+                            g_flat_section_dirty[r->sy][r->cz][r->cx] = 1;
+                            g_flat_section_mesh_building[r->sy][r->cz][r->cx] = 0;
+                        }
+                    }
+                }
+                return 1;
+            }
+            return 0;
+#endif
+        }
+    }
+
+    if (flat_async_section_mesh_enabled()) {
+#if defined(PEX_PLATFORM_WII)
+        /* Wii: do not enter the async section-mesh worker while loading a world.
+           The previous build crashed at flat_get_block() from the worker snapshot
+           path during "Preparing chunks". Build a small number of direct GX
+           meshes synchronously instead. */
+        int built = 0;
+        while (g_worldgen_mesh_prep_index < g_worldgen_mesh_prep_count && built < max_rebuilds) {
+            FlatRenderSectionRef *r = &g_worldgen_mesh_prep_refs[g_worldgen_mesh_prep_index++];
+            if (flat_section_needs_mesh_rebuild(r->sy, r->cz, r->cx)) {
+                wii_debug_logf("wii sync prep mesh sy=%d cx=%d cz=%d", r->sy, r->cx, r->cz);
+                rebuild_flat_section_list(r->sy, r->cx, r->cz);
+                built++;
+            }
+        }
+        return (g_worldgen_mesh_prep_index >= g_worldgen_mesh_prep_count);
+#else
+        /* Loading/pre-entry chunk preparation is not gameplay-critical, so drain
+           a batch of completed worker uploads here.  Runtime rendering still
+           uses the one-install-per-frame budget in rebuild_visible_flat_sections. */
+        async_section_mesh_install_ready(max_rebuilds);
+        int submitted = 0;
+        while (g_worldgen_mesh_prep_index < g_worldgen_mesh_prep_count && submitted < max_rebuilds) {
+            FlatRenderSectionRef *r = &g_worldgen_mesh_prep_refs[g_worldgen_mesh_prep_index];
+            if (!flat_section_needs_mesh_rebuild(r->sy, r->cz, r->cx)) {
+                g_worldgen_mesh_prep_index++;
+                continue;
+            }
+            if (g_flat_section_mesh_building[r->sy][r->cz][r->cx]) break;
+            int submit_result = async_section_mesh_submit(r->sy, r->cx, r->cz);
+            if (submit_result == 2) break;
+            if (submit_result == 0) {
+                rebuild_flat_section_list(r->sy, r->cx, r->cz);
+            }
+            g_worldgen_mesh_prep_index++;
+            submitted++;
+        }
+        if (g_worldgen_mesh_prep_index >= g_worldgen_mesh_prep_count) {
+            async_section_mesh_install_ready(max_rebuilds);
+            if (async_section_mesh_pending()) return 0;
+            if (!worldgen_mesh_verify_complete()) {
+                g_worldgen_mesh_prep_index = 0;
+                return 0;
+            }
+            return 1;
+        }
+        return 0;
+#endif
+    }
+
+    int built = 0;
+    while (g_worldgen_mesh_prep_index < g_worldgen_mesh_prep_count && built < max_rebuilds) {
+        FlatRenderSectionRef *r = &g_worldgen_mesh_prep_refs[g_worldgen_mesh_prep_index++];
+        if (flat_section_needs_mesh_rebuild(r->sy, r->cz, r->cx)) {
+            rebuild_flat_section_list(r->sy, r->cx, r->cz);
+            built++;
+        }
+    }
+    if (g_worldgen_mesh_prep_index >= g_worldgen_mesh_prep_count) {
+        if (!worldgen_mesh_verify_complete()) {
+            g_worldgen_mesh_prep_index = 0;
+            return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static int worldgen_mesh_prep_total(void) {
+#if defined(PEX_PLATFORM_PSP) && defined(PEX_PSP_FAST_WORLD) && PEX_PSP_FAST_WORLD
+    return 1;
+#endif
+    if (!g_worldgen_mesh_prep_active) worldgen_mesh_prep_build_list();
+    return g_worldgen_mesh_prep_count;
+}
+
+static int worldgen_mesh_prep_done(void) {
+#if defined(PEX_PLATFORM_PSP) && defined(PEX_PSP_FAST_WORLD) && PEX_PSP_FAST_WORLD
+    return 1;
+#endif
+    if (!g_worldgen_mesh_prep_active) worldgen_mesh_prep_build_list();
+    return g_worldgen_mesh_prep_index;
+}
+
+
+static void draw_flat_section_passes_direct(const FlatRenderSectionRef *refs, int count) {
+    PexRendererBackend *rb = flat_direct_backend();
+    if (!rb) return;
+    PexRenderState st;
+    flat_direct_make_state(&st, 0);
+#if defined(_WIN32) || defined(PEX_PLATFORM_XBOX_UWP)
+    if (pex_using_d3d11()) {
+        static PexMeshHandle handles[FLAT_MAX_VISIBLE_SECTIONS];
+        int handle_count = 0;
+        for (int i = 0; i < count && handle_count < FLAT_MAX_VISIBLE_SECTIONS; i++) {
+            int cx = refs[i].cx, cz = refs[i].cz, sy = refs[i].sy;
+            PexMeshHandle h = g_flat_section_direct_mesh[sy][cz][cx][0];
+            if (flat_chunk_light_ready(cx, cz) && g_flat_section_valid[sy][cz][cx] && !g_flat_section_skip_pass[sy][cz][cx][0] && h) handles[handle_count++] = h;
+        }
+        d3d11_draw_mesh_batch(handles, handle_count, &st);
+        return;
+    }
+#endif
+    for (int i = 0; i < count; i++) {
+        int cx = refs[i].cx, cz = refs[i].cz, sy = refs[i].sy;
+        PexMeshHandle h = g_flat_section_direct_mesh[sy][cz][cx][0];
+        if (flat_chunk_light_ready(cx, cz) && g_flat_section_valid[sy][cz][cx] && !g_flat_section_skip_pass[sy][cz][cx][0] && h) rb->draw_mesh(h, &st);
+    }
+}
+
+static void draw_translucent_sections_direct(const FlatRenderSectionRef *refs, int count) {
+    PexRendererBackend *rb = flat_direct_backend();
+    if (!rb || !flat_separate_liquid_pass_enabled()) return;
+    PexRenderState st;
+    flat_direct_make_state(&st, 1);
+#if defined(_WIN32) || defined(PEX_PLATFORM_XBOX_UWP)
+    if (pex_using_d3d11()) {
+        static PexMeshHandle handles[FLAT_MAX_VISIBLE_SECTIONS];
+        int handle_count = 0;
+        for (int i = count - 1; i >= 0 && handle_count < FLAT_MAX_VISIBLE_SECTIONS; i--) {
+            int cx = refs[i].cx, cz = refs[i].cz, sy = refs[i].sy;
+            PexMeshHandle h = g_flat_section_direct_mesh[sy][cz][cx][1];
+            if (flat_chunk_light_ready(cx, cz) && g_flat_section_valid[sy][cz][cx] && !g_flat_section_skip_pass[sy][cz][cx][1] && h) handles[handle_count++] = h;
+        }
+        d3d11_draw_mesh_batch(handles, handle_count, &st);
+        return;
+    }
+#endif
+    for (int i = count - 1; i >= 0; i--) {
+        int cx = refs[i].cx, cz = refs[i].cz, sy = refs[i].sy;
+        PexMeshHandle h = g_flat_section_direct_mesh[sy][cz][cx][1];
+        if (flat_chunk_light_ready(cx, cz) && g_flat_section_valid[sy][cz][cx] && !g_flat_section_skip_pass[sy][cz][cx][1] && h) rb->draw_mesh(h, &st);
+    }
+}
+
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+static int flat_android_section_mesh_visible(const FlatRenderSectionRef *ref, int pass) {
+    int cx = ref->cx, cz = ref->cz, sy = ref->sy;
+    return flat_chunk_light_ready(cx, cz) &&
+           g_flat_section_valid[sy][cz][cx] &&
+           !g_flat_section_skip_pass[sy][cz][cx][pass] &&
+           flat_gl_cpu_mesh_drawable(sy, cz, cx, pass);
+}
+
+static int flat_android_mesh_has_gpu(const FlatGLCpuMesh *m) {
+    return m && (m->android_mesh[0] || m->android_mesh[1] || m->android_mesh[2]);
+}
+
+static void flat_android_draw_static_group(const FlatRenderSectionRef *refs, int count, int pass,
+                                           int group, int alpha_test, int two_sided, int reverse) {
+    int found = 0;
+    for (int n = 0; n < count; ++n) {
+        int i = reverse ? (count - 1 - n) : n;
+        if (!flat_android_section_mesh_visible(&refs[i], pass)) continue;
+        FlatGLCpuMesh *m = &g_flat_section_gl_cpu_mesh[refs[i].sy][refs[i].cz][refs[i].cx][pass];
+        if (group >= 0 && group < 3 && m->android_mesh[group]) { found = 1; break; }
+    }
+    if (!found) return;
+
+    float sun = flat_light_sun_brightness(1.0f);
+    float gamma = g_opts.sf_gamma;
+    float light_base = flat_light_table_base();
+    pex_android_tv_static_mesh_begin(tex_terrain.id, alpha_test, pass == 1, !two_sided,
+                                     sun, gamma, light_base);
+    for (int n = 0; n < count; ++n) {
+        int i = reverse ? (count - 1 - n) : n;
+        if (!flat_android_section_mesh_visible(&refs[i], pass)) continue;
+        FlatGLCpuMesh *m = &g_flat_section_gl_cpu_mesh[refs[i].sy][refs[i].cz][refs[i].cx][pass];
+        if (group >= 0 && group < 3 && m->android_mesh[group])
+            pex_android_tv_static_mesh_draw(m->android_mesh[group]);
+    }
+    pex_android_tv_static_mesh_end();
+}
+
+static void flat_android_draw_cpu_fallbacks(const FlatRenderSectionRef *refs, int count, int pass, int reverse) {
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    for (int n = 0; n < count; ++n) {
+        int i = reverse ? (count - 1 - n) : n;
+        if (!flat_android_section_mesh_visible(&refs[i], pass)) continue;
+        FlatGLCpuMesh *m = &g_flat_section_gl_cpu_mesh[refs[i].sy][refs[i].cz][refs[i].cx][pass];
+        if (!flat_android_mesh_has_gpu(m)) flat_gl_draw_cpu_mesh(m);
+    }
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+}
+#endif
+
+static void draw_flat_section_passes_gl_cpu(const FlatRenderSectionRef *refs, int count) {
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    /* GLES terrain is resident in static VBO/IBO batches. Keep three real
+       layers so opaque geometry avoids fragment discard and one-sided block
+       meshes can use back-face culling. This retains the same geometry and
+       textures; it only removes work that cannot affect the image. */
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_TRUE);
+    glAlphaFunc(GL_GREATER, 0.5f);
+
+    flat_android_draw_static_group(refs, count, 0, 0, 0, 0, 0); /* opaque, culled */
+    flat_android_draw_static_group(refs, count, 0, 1, 1, 0, 0); /* cutout, culled */
+    flat_android_draw_static_group(refs, count, 0, 2, 1, 1, 0); /* cutout, two-sided */
+
+    /* Allocation failure fallback. It is normally empty after installation. */
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_ALPHA_TEST);
+    flat_android_draw_cpu_fallbacks(refs, count, 0, 0);
+    glDisable(GL_ALPHA_TEST);
+    glColor4f(1,1,1,1);
+    return;
+#else
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+    g_flat_gl_light_upload_budget = 8;
+#endif
+    GLint old_shade_model = pex_gl_save_shade_model();
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    /* Java EntityRenderer.renderWorld() switches terrain to GL_SMOOTH when
+       ambient occlusion/smooth lighting is active. The C mesh stores block
+       light/AO as per-vertex colors; real OpenGL must interpolate those colors. */
+    pex_gl_shade_model_smooth();
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.5f);
+    glDepthMask(GL_TRUE);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    for (int i = 0; i < count; i++) {
+        int cx = refs[i].cx, cz = refs[i].cz, sy = refs[i].sy;
+        if (flat_chunk_light_ready(cx, cz) && g_flat_section_valid[sy][cz][cx] && !g_flat_section_skip_pass[sy][cz][cx][0] &&
+            flat_gl_cpu_mesh_drawable(sy, cz, cx, 0)) {
+            flat_gl_draw_cpu_mesh(&g_flat_section_gl_cpu_mesh[sy][cz][cx][0]);
+        }
+    }
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+    if (flat_gl_vbo_supported()) { g_flat_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); g_flat_glBindBuffer(GL_ARRAY_BUFFER, 0); }
+#endif
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+    pex_gl_restore_shade_model(old_shade_model);
+    glDisable(GL_ALPHA_TEST);
+    glColor4f(1,1,1,1);
+#endif
+}
+
+static void draw_translucent_sections_gl_cpu(const FlatRenderSectionRef *refs, int count) {
+    if (!flat_separate_liquid_pass_enabled()) return;
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+
+    /* Liquid/portal geometry remains two-sided and is kept in back-to-front
+       section order exactly as before. */
+    flat_android_draw_static_group(refs, count, 1, 2, 0, 1, 1);
+    flat_android_draw_cpu_fallbacks(refs, count, 1, 1);
+
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glColor4f(1,1,1,1);
+    return;
+#else
+    GLint old_shade_model = pex_gl_save_shade_model();
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    pex_gl_shade_model_smooth();
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    for (int i = count - 1; i >= 0; i--) {
+        int cx = refs[i].cx, cz = refs[i].cz, sy = refs[i].sy;
+        if (flat_chunk_light_ready(cx, cz) && g_flat_section_valid[sy][cz][cx] && !g_flat_section_skip_pass[sy][cz][cx][1] &&
+            flat_gl_cpu_mesh_drawable(sy, cz, cx, 1)) {
+            flat_gl_draw_cpu_mesh(&g_flat_section_gl_cpu_mesh[sy][cz][cx][1]);
+        }
+    }
+#if defined(PEX_PLATFORM_LINUX_SDL2)
+    if (flat_gl_vbo_supported()) { g_flat_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0); g_flat_glBindBuffer(GL_ARRAY_BUFFER, 0); }
+#endif
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisableClientState(GL_VERTEX_ARRAY);
+    pex_gl_restore_shade_model(old_shade_model);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glColor4f(1,1,1,1);
+#endif
+}
+
+static void draw_flat_section_passes(const FlatRenderSectionRef *refs, int count) {
+    if (flat_direct_backend()) { draw_flat_section_passes_direct(refs, count); return; }
+    if (flat_async_section_mesh_enabled()) { draw_flat_section_passes_gl_cpu(refs, count); return; }
+    GLint old_shade_model = pex_gl_save_shade_model();
+    pex_gl_shade_model_smooth();
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDisable(GL_ALPHA_TEST);
+    glDepthMask(GL_TRUE);
+    for (int i = 0; i < count; i++) {
+        int cx = refs[i].cx, cz = refs[i].cz, sy = refs[i].sy;
+        if (flat_chunk_light_ready(cx, cz) && g_flat_section_valid[sy][cz][cx] && !g_flat_section_skip_pass[sy][cz][cx][0] &&
+            g_flat_section_lists[sy][cz][cx][0] != 0) {
+            glCallList(g_flat_section_lists[sy][cz][cx][0]);
+        }
+    }
+    pex_gl_restore_shade_model(old_shade_model);
+    glColor4f(1,1,1,1);
+}
+
+static void draw_translucent_sections(const FlatRenderSectionRef *refs, int count) {
+    if (!flat_separate_liquid_pass_enabled()) return;
+    if (flat_direct_backend()) { draw_translucent_sections_direct(refs, count); return; }
+    if (flat_async_section_mesh_enabled()) { draw_translucent_sections_gl_cpu(refs, count); return; }
+    GLint old_shade_model = pex_gl_save_shade_model();
+    pex_gl_shade_model_smooth();
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    for (int i = count - 1; i >= 0; i--) {
+        int cx = refs[i].cx, cz = refs[i].cz, sy = refs[i].sy;
+        if (flat_chunk_light_ready(cx, cz) && g_flat_section_valid[sy][cz][cx] && !g_flat_section_skip_pass[sy][cz][cx][1] &&
+            g_flat_section_lists[sy][cz][cx][1] != 0) {
+            glCallList(g_flat_section_lists[sy][cz][cx][1]);
+        }
+    }
+    pex_gl_restore_shade_model(old_shade_model);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glColor4f(1,1,1,1);
+}
+
+static void rebuild_flat_geometry(void) {
+    /* Kept for compatibility: mark/rebuild all chunks. */
+    for (int cz = 0; cz < FLAT_RENDER_CHUNKS; cz++) {
+        for (int cx = 0; cx < FLAT_RENDER_CHUNKS; cx++) {
+            g_flat_world_chunk_dirty[cz][cx] = 1;
+            rebuild_flat_chunk_list(cx, cz);
+        }
+    }
+    g_flat_world_geometry_dirty = 0;
+}
+
+
+
+static void draw_armor_model_for_slots(const ItemStack armor_slots[4], int allow_leather_dye,
+                                       float head_pivot_y, float leg_pivot_y, float leg_pivot_z,
+                                       float body_pitch, float head_pitch, float head_yaw,
+                                       float right_arm_pitch, float right_arm_yaw, float right_arm_roll,
+                                       float left_arm_pitch, float left_arm_yaw, float left_arm_roll,
+                                       float right_leg_pitch, float left_leg_pitch) {
+    if (!armor_slots) return;
+
+    for (int pass = 0; pass < 4; pass++) {
+        int armor_index = 3 - pass;
+        const ItemStack *st = &armor_slots[armor_index];
+        if (stack_empty(st) || armor_stack_type(st->id) < 0) continue;
+        int mat = armor_stack_material_index(st->id);
+        int layer = (pass == 2) ? 1 : 0;
+        if (mat < 0 || mat >= 5 || !tex_armor[mat][layer].id) continue;
+
+        glBindTexture(GL_TEXTURE_2D, tex_armor[mat][layer].id);
+        steve_set_texture_dims(&tex_armor[mat][layer]);
+        if (allow_leather_dye && mat == 0 && st->has_custom_color) {
+            float dye_r = (float)((st->custom_color >> 16) & 255) / 255.0f;
+            float dye_g = (float)((st->custom_color >> 8) & 255) / 255.0f;
+            float dye_b = (float)(st->custom_color & 255) / 255.0f;
+            steve_set_tint(dye_r, dye_g, dye_b);
+            glColor4f(dye_r, dye_g, dye_b, 1.0f);
+        } else {
+            steve_set_tint(1.0f, 1.0f, 1.0f);
+            glColor4f(1, 1, 1, 1);
+        }
+
+        if (pass == 0) {
+            /* Helmet pass: ModelBiped(1.0F) head plus helmet/hat cube. */
+            steve_part(0, 0, 0, head_pivot_y, 0, -4, -8, -4, 8, 8, 8, 1.0f, 0, head_pitch, head_yaw, 0);
+            steve_part(32, 0, 0, head_pivot_y, 0, -4, -8, -4, 8, 8, 8, 1.5f, 0, head_pitch, head_yaw, 0);
+        } else if (pass == 1) {
+            /* Chestplate pass: torso and both arms from armor layer 1. */
+            steve_part(16, 16, 0, 0, 0, -4, 0, -2, 8, 12, 4, 1.0f, 0, body_pitch, 0, 0);
+            steve_part(40, 16, -5, 2, 0, -3, -2, -2, 4, 12, 4, 1.0f, 0, right_arm_pitch, right_arm_yaw, right_arm_roll);
+            steve_part(40, 16,  5, 2, 0, -1, -2, -2, 4, 12, 4, 1.0f, 1, left_arm_pitch, left_arm_yaw, left_arm_roll);
+        } else if (pass == 2) {
+            /* Leggings pass: Beta uses armor layer 2 with the slimmer 0.5F model and includes the waist. */
+            steve_part(16, 16, 0, 0, 0, -4, 0, -2, 8, 12, 4, 0.5f, 0, body_pitch, 0, 0);
+            steve_part(0, 16, -2, leg_pivot_y, leg_pivot_z, -2, 0, -2, 4, 12, 4, 0.5f, 0, right_leg_pitch, 0, 0);
+            steve_part(0, 16,  2, leg_pivot_y, leg_pivot_z, -2, 0, -2, 4, 12, 4, 0.5f, 1, left_leg_pitch, 0, 0);
+        } else {
+            /* Boots pass: both legs from armor layer 1. */
+            steve_part(0, 16, -2, leg_pivot_y, leg_pivot_z, -2, 0, -2, 4, 12, 4, 1.0f, 0, right_leg_pitch, 0, 0);
+            steve_part(0, 16,  2, leg_pivot_y, leg_pivot_z, -2, 0, -2, 4, 12, 4, 1.0f, 1, left_leg_pitch, 0, 0);
+        }
+        steve_set_tint(1.0f, 1.0f, 1.0f);
+        glColor4f(1, 1, 1, 1);
+    }
+}
+
+static void draw_local_player_held_item_125(float x, float eye_y, float z,
+                                            float arm_pitch, float arm_yaw, float arm_roll);
+
+static void draw_third_person_player(void) {
+    Texture *local_skin = pex_java47_local_skin_texture();
+    if (!g_third_person_view || !local_skin || !local_skin->id) return;
+
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    float x = pr->prev_x + (pr->x - pr->prev_x) * g_frame_partial;
+    float eye_y = pr->prev_y + (pr->y - pr->prev_y) * g_frame_partial;
+    float z = pr->prev_z + (pr->z - pr->prev_z) * g_frame_partial;
+    float yaw = lerp_angle(pr->prev_yaw, pr->yaw, g_frame_partial);
+    float pitch = pr->prev_pitch + (pr->pitch - pr->prev_pitch) * g_frame_partial;
+    float feet_y = eye_y - 1.62f;
+    int sneaking = (g_screen == SCREEN_INGAME && key_down_vk(g_opts.keys[5]));
+
+    /* Source reference: dh.java model animation:
+       arms/legs use cos(limbSwing*0.6662) with opposite phase. */
+    float move = pr->prev_limb_swing_amount + (pr->limb_swing_amount - pr->prev_limb_swing_amount) * g_frame_partial;
+    if (move < 0.0f) move = 0.0f;
+    if (move > 1.0f) move = 1.0f;
+    float limb = pr->prev_limb_swing + (pr->limb_swing - pr->prev_limb_swing) * g_frame_partial;
+    float idle = (float)pr->ingame_ticks + g_frame_partial;
+
+    float right_arm_pitch = cosf(limb * 0.6662f + (float)M_PI) * 2.0f * move * 0.5f * 57.29578f;
+    float left_arm_pitch  = cosf(limb * 0.6662f) * 2.0f * move * 0.5f * 57.29578f;
+    float right_leg_pitch = cosf(limb * 0.6662f) * 1.4f * move * 57.29578f;
+    float left_leg_pitch  = cosf(limb * 0.6662f + (float)M_PI) * 1.4f * move * 57.29578f;
+
+    float right_arm_yaw = 0.0f;
+    float left_arm_yaw = 0.0f;
+    float body_pitch = 0.0f;
+    float head_pivot_y = 0.0f;
+    float arm_extra_pitch = 0.0f;
+    float leg_pivot_y = 12.0f;
+    float leg_pivot_z = 0.0f;
+
+    /* ModelBiped.heldItemRight = 3 while blocking. */
+    if (player_is_blocking_125())
+        right_arm_pitch = right_arm_pitch * 0.5f - (float)M_PI * 0.3f * 57.29578f;
+
+    float right_arm_roll = (cosf(idle * 0.09f) * 0.05f + 0.05f) * 57.29578f;
+    float left_arm_roll = -right_arm_roll;
+    right_arm_pitch += sinf(idle * 0.067f) * 0.05f * 57.29578f;
+    left_arm_pitch -= sinf(idle * 0.067f) * 0.05f * 57.29578f;
+
+    if (sneaking) {
+        body_pitch = 0.5f * 57.29578f;
+        arm_extra_pitch = 0.4f * 57.29578f;
+        leg_pivot_y = 9.0f;
+        leg_pivot_z = 4.0f;
+        head_pivot_y = 1.0f;
+    }
+
+    /* Make local F5 show the same attack/mining arm animation that other players see. */
+    float swing = g_prev_hand_swing + (g_hand_swing - g_prev_hand_swing) * g_frame_partial;
+    if (swing < 0.0f) swing = 0.0f;
+    if (swing > 1.0f) swing = 1.0f;
+    if (g_hand_swing_active || swing > 0.0f || g_breaking_block) {
+        float body_yaw = sinf(sqrtf(swing) * (float)M_PI * 2.0f) * 0.2f;
+        right_arm_yaw += body_yaw * 3.0f * 57.29578f;
+        left_arm_yaw += body_yaw * 57.29578f;
+        left_arm_pitch += body_yaw * 57.29578f;
+        float v = 1.0f - swing;
+        v *= v; v *= v; v = 1.0f - v;
+        float swing_sin = sinf(v * (float)M_PI);
+        float pitch_rad = pitch / 57.29578f;
+        float head_term = sinf(swing * (float)M_PI) * -(pitch_rad - 0.7f) * 0.75f;
+        right_arm_pitch -= (swing_sin * 1.2f + head_term) * 57.29578f;
+        right_arm_roll = sinf(swing * (float)M_PI) * -0.4f * 57.29578f;
+    }
+    right_arm_pitch += arm_extra_pitch;
+    left_arm_pitch += arm_extra_pitch;
+
+    glPushMatrix();
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, local_skin->id);
+    steve_set_texture_dims(local_skin);
+    {
+        float entity_br = entity_light_factor_at(x, eye_y, z);
+        if (pr->hurt_time > 0 || pr->dead) steve_set_tint(entity_br, entity_br * 0.35f, entity_br * 0.35f);
+        else steve_set_tint(entity_br, entity_br, entity_br);
+    }
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.1f);
+
+    /* RenderLiving/ei.java style transform used by the inventory model too:
+       translate to entity feet, rotate 180-yaw, scale model, offset by 24px. */
+    glTranslatef(x, feet_y, z);
+    glRotatef(180.0f - yaw, 0.0f, 1.0f, 0.0f);
+    glScalef(-1.0f, -1.0f, 1.0f);
+    glTranslatef(0.0f, -24.0f * 0.0625f - 0.0078125f, 0.0f);
+
+    glColor4f(1, 1, 1, 1);
+    steve_part(16, 16, 0, 0, 0, -4, 0, -2, 8, 12, 4, 0.0f, 0, body_pitch, 0, 0);
+    steve_part(40, 16, -5, 2, 0, -3, -2, -2, 4, 12, 4, 0.0f, 0, right_arm_pitch, right_arm_yaw, right_arm_roll);
+    steve_part(40, 16,  5, 2, 0, -1, -2, -2, 4, 12, 4, 0.0f, 1, left_arm_pitch, left_arm_yaw, left_arm_roll);
+    steve_part(0, 16, -2, leg_pivot_y, leg_pivot_z, -2, 0, -2, 4, 12, 4, 0.0f, 0, right_leg_pitch, 0, 0);
+    steve_part(0, 16,  2, leg_pivot_y, leg_pivot_z, -2, 0, -2, 4, 12, 4, 0.0f, 1, left_leg_pitch, 0, 0);
+    steve_part(0, 0, 0, head_pivot_y, 0, -4, -8, -4, 8, 8, 8, 0.0f, 0, pitch, 0, 0);
+    steve_part(32, 0, 0, head_pivot_y, 0, -4, -8, -4, 8, 8, 8, 0.5f, 0, pitch, 0, 0);
+    draw_armor_model_for_slots(g_armor_inventory, 0, head_pivot_y, leg_pivot_y, leg_pivot_z,
+                               body_pitch, pitch, 0.0f,
+                               right_arm_pitch, right_arm_yaw, right_arm_roll,
+                               left_arm_pitch, left_arm_yaw, left_arm_roll,
+                               right_leg_pitch, left_leg_pitch);
+    draw_local_player_held_item_125(x, eye_y, z, right_arm_pitch, right_arm_yaw, right_arm_roll);
+
+    glDisable(GL_ALPHA_TEST);
+    steve_set_tint(1.0f, 1.0f, 1.0f);
+    glColor4f(1, 1, 1, 1);
+    glPopMatrix();
+}
+
+
+
+
+static int multiplayer_renderable_remote_player_count(void) {
+    if (!g_mp_connected) return 0;
+    int count = 0;
+    for (int i = 0; i < PEX_NET_MAX_PLAYERS; i++) {
+        PexNetRenderPlayerState *r = &g_mp_render_players[i];
+        if (!r->active || r->skin_only || r->player_id <= 0 || r->player_id == g_mp_player_id) continue;
+        if (r->health <= 0 || (r->flags & PEX_PLAYER_FLAG_INVISIBLE)) continue;
+        count++;
+    }
+    return count;
+}
+
+static int pex_item_full3d_125(int id) {
+    switch (id) {
+        case ITEM_STICK:
+        case ITEM_BONE:
+        case ITEM_FISHING_ROD:
+        case ITEM_SWORD_IRON: case ITEM_WOODEN_SWORD: case ITEM_STONE_SWORD:
+        case ITEM_SWORD_DIAMOND: case ITEM_SWORD_GOLD:
+        case ITEM_SHOVEL_IRON: case ITEM_WOODEN_SHOVEL: case ITEM_STONE_SHOVEL:
+        case ITEM_SHOVEL_DIAMOND: case ITEM_SHOVEL_GOLD:
+        case ITEM_PICKAXE_IRON: case ITEM_WOODEN_PICKAXE: case ITEM_STONE_PICKAXE:
+        case ITEM_PICKAXE_DIAMOND: case ITEM_PICKAXE_GOLD:
+        case ITEM_AXE_IRON: case ITEM_WOODEN_AXE: case ITEM_STONE_AXE:
+        case ITEM_AXE_DIAMOND: case ITEM_AXE_GOLD:
+        case ITEM_HOE_WOOD: case ITEM_HOE_STONE: case ITEM_HOE_IRON:
+        case ITEM_HOE_DIAMOND: case ITEM_HOE_GOLD:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int pex_item_rotates_around_when_rendering_125(int id) {
+    return id == ITEM_FISHING_ROD;
+}
+
+static void multiplayer_apply_right_arm_postrender_125(float arm_pitch, float arm_yaw, float arm_roll) {
+    /* Same ModelRenderer.postRender order used by bipedRightArm: translate to
+       the right-arm pivot, then apply Z/Y/X rotations.  The player root is
+       already in the Java ModelBiped coordinate system at 1/16 scale. */
+    glTranslatef(-5.0f * 0.0625f, 2.0f * 0.0625f, 0.0f);
+    if (arm_roll != 0.0f) glRotatef(arm_roll, 0.0f, 0.0f, 1.0f);
+    if (arm_yaw != 0.0f) glRotatef(arm_yaw, 0.0f, 1.0f, 0.0f);
+    if (arm_pitch != 0.0f) glRotatef(arm_pitch, 1.0f, 0.0f, 0.0f);
+}
+
+static void draw_biped_held_item_125(int id, int count, int damage, float light_x, float light_y, float light_z,
+                                       float arm_pitch, float arm_yaw, float arm_roll, int blocking) {
+    if (id <= 0 || count <= 0) return;
+
+    entity_item_light_prepare(light_x, light_y, light_z);
+    glPushMatrix();
+    multiplayer_apply_right_arm_postrender_125(arm_pitch, arm_yaw, arm_roll);
+    glTranslatef(-1.0f / 16.0f, 7.0f / 16.0f, 1.0f / 16.0f);
+
+    if (render_item_as_block_id(id) && tex_terrain.id) {
+        /* RenderBiped held 3D-block branch. */
+        float s = 0.5f * (12.0f / 16.0f);
+        glTranslatef(0.0f, 3.0f / 16.0f, -(5.0f / 16.0f));
+        glRotatef(20.0f, 1.0f, 0.0f, 0.0f);
+        glRotatef(45.0f, 0.0f, 1.0f, 0.0f);
+        glScalef(s, -s, s);
+        glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+        draw_block_item_model_with_meta(id, damage, -0.5f, -0.5f, -0.5f);
+    } else if (id == ITEM_BOW && tex_items.id) {
+        float s = 10.0f / 16.0f;
+        glTranslatef(0.0f, 2.0f / 16.0f, 5.0f / 16.0f);
+        glRotatef(-20.0f, 0.0f, 1.0f, 0.0f);
+        glScalef(s, -s, s);
+        glRotatef(-100.0f, 1.0f, 0.0f, 0.0f);
+        glRotatef(45.0f, 0.0f, 1.0f, 0.0f);
+        draw_item3d_from_texture(&tex_items, item_icon_tile(id));
+    } else if (pex_item_full3d_125(id) && tex_items.id) {
+        float s = 10.0f / 16.0f;
+        if (pex_item_rotates_around_when_rendering_125(id)) {
+            glRotatef(180.0f, 0.0f, 0.0f, 1.0f);
+            glTranslatef(0.0f, -(2.0f / 16.0f), 0.0f);
+        }
+        if (blocking && held_is_sword(id)) {
+            /* RenderPlayer 1.2.5 blocking transform. */
+            glTranslatef(0.05f, 0.0f, -0.1f);
+            glRotatef(-50.0f, 0.0f, 1.0f, 0.0f);
+            glRotatef(-10.0f, 1.0f, 0.0f, 0.0f);
+            glRotatef(-60.0f, 0.0f, 0.0f, 1.0f);
+        }
+        glTranslatef(0.0f, 3.0f / 16.0f, 0.0f);
+        glScalef(s, -s, s);
+        glRotatef(-100.0f, 1.0f, 0.0f, 0.0f);
+        glRotatef(45.0f, 0.0f, 1.0f, 0.0f);
+        draw_item3d_from_texture(&tex_items, item_icon_tile(id));
+    } else if (world_item_is_block_id(id) && tex_terrain.id) {
+        float s = 6.0f / 16.0f;
+        glTranslatef(0.25f, 3.0f / 16.0f, -(3.0f / 16.0f));
+        glScalef(s, s, s);
+        glRotatef(60.0f, 0.0f, 0.0f, 1.0f);
+        glRotatef(-90.0f, 1.0f, 0.0f, 0.0f);
+        glRotatef(20.0f, 0.0f, 0.0f, 1.0f);
+        glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+        draw_dropped_terrain_sprite(world_block_item_tile(id));
+    } else if (tex_items.id) {
+        /* Ordinary held items remain the old flat icon transform.  Full3D tools,
+           swords, stick, bone, bow, and fishing rod take the branches above. */
+        float s = 6.0f / 16.0f;
+        glTranslatef(0.25f, 3.0f / 16.0f, -(3.0f / 16.0f));
+        glScalef(s, s, s);
+        glRotatef(60.0f, 0.0f, 0.0f, 1.0f);
+        glRotatef(-90.0f, 1.0f, 0.0f, 0.0f);
+        glRotatef(20.0f, 0.0f, 0.0f, 1.0f);
+        glBindTexture(GL_TEXTURE_2D, tex_items.id);
+        draw_dropped_item_sprite(item_icon_tile(id));
+    }
+
+    glPopMatrix();
+}
+
+static void draw_remote_player_held_item(const PexNetRenderPlayerState *r, float arm_pitch, float arm_yaw, float arm_roll) {
+    if (!r || r->held_item_id <= 0 || r->held_item_count <= 0) return;
+    draw_biped_held_item_125(r->held_item_id, r->held_item_count, r->held_item_damage, r->x, r->y, r->z,
+                             arm_pitch, arm_yaw, arm_roll, 0);
+}
+
+static void draw_local_player_held_item_125(float x, float eye_y, float z,
+                                            float arm_pitch, float arm_yaw, float arm_roll) {
+    const ItemStack *held = &g_inventory[g_selected_hotbar_slot];
+    if (stack_empty(held)) return;
+    draw_biped_held_item_125(held->id, held->count, held->damage, x, eye_y, z,
+                             arm_pitch, arm_yaw, arm_roll, player_is_blocking_125());
+}
+
+static int multiplayer_remote_player_visible(const PexNetRenderPlayerState *r,
+                                             const FlatFrustum *fr,
+                                             float *out_dist2) {
+    if (!r) return 0;
+    float dx = r->x - g_player_render_frame.x;
+    float dy = r->y - g_player_render_frame.y;
+    float dz = r->z - g_player_render_frame.z;
+    float dist2 = dx * dx + dy * dy + dz * dz;
+    if (out_dist2) *out_dist2 = dist2;
+
+    /* Keep the entity radius bounded independently of the server's tracking
+       distance.  Hubs can keep many decorative players alive far outside the
+       camera; rendering those full biped models was pure OpenGL CPU overhead. */
+    float max_dist = (float)g_opts.render_distance * 16.0f + 16.0f;
+    if (max_dist < 48.0f) max_dist = 48.0f;
+    if (max_dist > 128.0f) max_dist = 128.0f;
+    if (dist2 > max_dist * max_dist) return 0;
+
+    if (fr) {
+        float feet_y = r->y - 1.62f;
+        if (!flat_aabb_in_frustum(fr,
+                                  r->x - 0.45f, feet_y - 0.10f, r->z - 0.45f,
+                                  r->x + 0.45f, feet_y + 2.15f, r->z + 0.45f)) return 0;
+    }
+    return 1;
+}
+
+static void draw_multiplayer_remote_players(const FlatFrustum *fr, int remote_player_count) {
+    if (!g_mp_connected || !tex_steve.id) return;
+
+    glPushMatrix();
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.1f);
+
+    for (int i = 0; i < PEX_NET_MAX_PLAYERS; i++) {
+        PexNetRenderPlayerState *r = &g_mp_render_players[i];
+        if (!r->active || r->skin_only || r->player_id <= 0 || r->player_id == g_mp_player_id) continue;
+        if (r->flags & PEX_PLAYER_FLAG_INVISIBLE) continue;
+        float player_dist2 = 0.0f;
+        if (!multiplayer_remote_player_visible(r, fr, &player_dist2)) continue;
+
+        /* Full armor, held-item and skin-overlay passes multiply the number of
+           immediate-mode draws per player.  Preserve full detail nearby, but
+           use the base biped farther away; in crowded hubs the transition is
+           pulled closer because those details are sub-pixel at that distance. */
+        float detail_dist = remote_player_count > 8 ? 22.0f : 40.0f;
+        int reduced_detail = player_dist2 > detail_dist * detail_dist;
+
+        float rx = r->x;
+        float ry = r->y;
+        float rz = r->z;
+        float yaw = r->yaw;
+        float pitch = r->pitch;
+        float death_time = r->death_time > 0.0f ? (r->death_time * 20.0f + g_frame_partial) : 0.0f;
+        int sneaking = (r->flags & PEX_PLAYER_FLAG_SNEAKING) != 0;
+        float feet_y = ry - 1.62f;
+        float idle = (float)g_ingame_ticks + g_frame_partial + (float)(r->player_id * 7);
+        float move = r->move_amount;
+        if (move > 1.0f) move = 1.0f;
+        float limb = r->limb_swing + g_frame_partial * move;
+        float right_arm_pitch = cosf(limb * 0.6662f + (float)M_PI) * 35.0f * move;
+        float left_arm_pitch  = cosf(limb * 0.6662f) * 35.0f * move;
+        float right_leg_pitch = cosf(limb * 0.6662f) * 55.0f * move;
+        float left_leg_pitch  = cosf(limb * 0.6662f + (float)M_PI) * 55.0f * move;
+        float right_arm_yaw = 0.0f;
+        float left_arm_yaw = 0.0f;
+        float right_arm_roll = (cosf(idle * 0.09f) * 0.05f + 0.05f) * 57.29578f;
+        float left_arm_roll = -right_arm_roll;
+        float body_pitch = 0.0f;
+        float head_pivot_y = 0.0f;
+        float arm_extra_pitch = 0.0f;
+        float leg_pivot_y = 12.0f;
+        float leg_pivot_z = 0.0f;
+        if (sneaking) {
+            body_pitch = 0.5f * 57.29578f;
+            arm_extra_pitch = 0.4f * 57.29578f;
+            leg_pivot_y = 9.0f;
+            leg_pivot_z = 4.0f;
+            head_pivot_y = 1.0f;
+        }
+        float swing = r->prev_swing + (r->swing - r->prev_swing) * g_frame_partial;
+        if (swing < 0.0f) swing = 0.0f;
+        if (swing > 1.0f) swing = 1.0f;
+        if (r->swing_active || swing > 0.0f) {
+            float body_yaw = sinf(sqrtf(swing) * (float)M_PI * 2.0f) * 0.2f;
+            right_arm_yaw += body_yaw * 3.0f * 57.29578f;
+            left_arm_yaw += body_yaw * 57.29578f;
+            left_arm_pitch += body_yaw * 57.29578f;
+            float v = 1.0f - swing;
+            v *= v; v *= v; v = 1.0f - v;
+            float swing_sin = sinf(v * (float)M_PI);
+            float pitch_rad = pitch / 57.29578f;
+            float head_term = sinf(swing * (float)M_PI) * -(pitch_rad - 0.7f) * 0.75f;
+            right_arm_pitch -= (swing_sin * 1.2f + head_term) * 57.29578f;
+            right_arm_roll = sinf(swing * (float)M_PI) * -0.4f * 57.29578f;
+        }
+        right_arm_pitch += arm_extra_pitch;
+        left_arm_pitch += arm_extra_pitch;
+
+        glPushMatrix();
+        Texture *skin_tex = (r->has_skin && r->skin.id) ? &r->skin : &tex_steve;
+        glBindTexture(GL_TEXTURE_2D, skin_tex->id);
+        steve_set_texture_dims(skin_tex);
+        {
+            float entity_br = entity_light_factor_at(rx, ry, rz);
+            if (r->hurt_time > 0.0f || r->health <= 0) steve_set_tint(entity_br, entity_br * 0.35f, entity_br * 0.35f);
+            else steve_set_tint(entity_br, entity_br, entity_br);
+        }
+        glTranslatef(rx, feet_y, rz);
+        glRotatef(180.0f - yaw, 0.0f, 1.0f, 0.0f);
+        if (death_time > 0.0f) {
+            float death = ((death_time - 1.0f) / 20.0f) * 1.6f;
+            if (death < 0.0f) death = 0.0f;
+            death = sqrtf(death);
+            if (death > 1.0f) death = 1.0f;
+            glRotatef(death * 90.0f, 0.0f, 0.0f, 1.0f);
+        }
+        glScalef(-1.0f, -1.0f, 1.0f);
+        glTranslatef(0.0f, -24.0f * 0.0625f - 0.0078125f, 0.0f);
+
+        steve_part(16, 16, 0, 0, 0, -4, 0, -2, 8, 12, 4, 0.0f, 0, body_pitch, 0, 0);
+        steve_part(40, 16, -5, 2, 0, -3, -2, -2, 4, 12, 4, 0.0f, 0, right_arm_pitch, right_arm_yaw, right_arm_roll);
+        steve_part(40, 16,  5, 2, 0, -1, -2, -2, 4, 12, 4, 0.0f, 1, left_arm_pitch, left_arm_yaw, left_arm_roll);
+        steve_part(0, 16, -2, leg_pivot_y, leg_pivot_z, -2, 0, -2, 4, 12, 4, 0.0f, 0, right_leg_pitch, 0, 0);
+        steve_part(0, 16,  2, leg_pivot_y, leg_pivot_z, -2, 0, -2, 4, 12, 4, 0.0f, 1, left_leg_pitch, 0, 0);
+        steve_part(0, 0, 0, head_pivot_y, 0, -4, -8, -4, 8, 8, 8, 0.0f, 0, pitch, 0, 0);
+        if (!reduced_detail)
+            steve_part(32, 0, 0, head_pivot_y, 0, -4, -8, -4, 8, 8, 8, 0.5f, 0, pitch, 0, 0);
+        if (!reduced_detail) {
+            /* Java equipment slots 1..4 are copied into the remote player's
+               boots..helmet array only when those layers will be drawn. */
+            ItemStack remote_armor[4];
+            memset(remote_armor, 0, sizeof(remote_armor));
+            for (int armor_i = 0; armor_i < 4; ++armor_i) {
+                remote_armor[armor_i].id = r->armor[armor_i].id;
+                remote_armor[armor_i].count = r->armor[armor_i].count;
+                remote_armor[armor_i].damage = r->armor[armor_i].damage;
+                remote_armor[armor_i].has_custom_color = r->armor[armor_i].has_custom_color;
+                remote_armor[armor_i].custom_color = r->armor[armor_i].custom_color;
+            }
+            draw_armor_model_for_slots(remote_armor, 1, head_pivot_y, leg_pivot_y, leg_pivot_z,
+                                       body_pitch, pitch, 0.0f,
+                                       right_arm_pitch, right_arm_yaw, right_arm_roll,
+                                       left_arm_pitch, left_arm_yaw, left_arm_roll,
+                                       right_leg_pitch, left_leg_pitch);
+            draw_remote_player_held_item(r, right_arm_pitch, right_arm_yaw, right_arm_roll);
+        }
+        glPopMatrix();
+    }
+
+    glDisable(GL_ALPHA_TEST);
+    steve_set_tint(1.0f, 1.0f, 1.0f);
+    glColor4f(1, 1, 1, 1);
+    glPopMatrix();
+}
+
+static void multiplayer_name_tag_view_angles(float *out_yaw, float *out_pitch) {
+    const PexPlayerRenderState *pr = &g_player_render_frame;
+    float yaw = lerp_angle(pr->prev_yaw, pr->yaw, g_frame_partial);
+    float pitch = pr->prev_pitch + (pr->pitch - pr->prev_pitch) * g_frame_partial;
+    if (g_third_person_view == 2) {
+        yaw += 180.0f;
+        pitch = -pitch;
+    }
+    if (out_yaw) *out_yaw = yaw;
+    if (out_pitch) *out_pitch = pitch;
+}
+
+static void draw_multiplayer_name_tags(const FlatFrustum *fr, int remote_player_count) {
+    if (!g_mp_connected || !tex_font.id) return;
+
+    float view_yaw = 0.0f;
+    float view_pitch = 0.0f;
+    multiplayer_name_tag_view_angles(&view_yaw, &view_pitch);
+
+    glDisable(GL_FOG);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    for (int i = 0; i < PEX_NET_MAX_PLAYERS; i++) {
+        PexNetRenderPlayerState *r = &g_mp_render_players[i];
+        if (!r->active || r->skin_only || r->player_id <= 0 || r->player_id == g_mp_player_id) continue;
+        if (r->health <= 0 || (r->flags & PEX_PLAYER_FLAG_INVISIBLE)) continue;
+        const char *name = r->name[0] ? r->name : "Player";
+        if ((r->flags & PEX_PLAYER_FLAG_HIDE_NAMETAG) || !pex_java47_player_name_tag_visible(name)) continue;
+
+        float dist2 = 0.0f;
+        if (!multiplayer_remote_player_visible(r, fr, &dist2)) continue;
+        int sneaking = (r->flags & PEX_PLAYER_FLAG_SNEAKING) != 0;
+        float max_dist = sneaking ? 32.0f : 64.0f;
+        if (remote_player_count > 8 && max_dist > 36.0f) max_dist = 36.0f;
+        if (dist2 > max_dist * max_dist) continue;
+
+        int tw = text_width(name);
+        if (tw <= 0) continue;
+
+        float feet_y = r->y - 1.62f;
+        /* Java RenderLivingLabel anchors labels above the entity height.  The
+           previous 2.3F sat almost on the Steve head; 2.55F gives the old
+           small air gap above the 1.8-block player. */
+        float label_y = feet_y + 2.55f;
+        float scale = (1.0f / 60.0f) * 1.6f;
+        int half = tw / 2;
+
+        glPushMatrix();
+        glTranslatef(r->x, label_y, r->z);
+        glNormal3f(0.0f, 1.0f, 0.0f);
+        glRotatef(-view_yaw, 0.0f, 1.0f, 0.0f);
+        glRotatef(view_pitch, 1.0f, 0.0f, 0.0f);
+        glScalef(-scale, -scale, scale);
+
+        if (sneaking) {
+            /* Sneaking labels in 1.2.5 are smaller/closer and translucent, and
+               they keep depth testing so they do not shout through walls. */
+            glTranslatef(0.0f, 0.25f / scale, 0.0f);
+            glDepthMask(GL_FALSE);
+            glEnable(GL_DEPTH_TEST);
+            glDisable(GL_TEXTURE_2D);
+            draw_rect(-half - 1, -1, half + 1, 8, (int)0x40000000u);
+            glEnable(GL_TEXTURE_2D);
+            glDepthMask(GL_TRUE);
+            draw_text_no_shadow(name, -tw / 2, 0, (int)0x20FFFFFFu);
+        } else {
+            /* Normal player labels are world-space billboards.  Draw the black
+               strip and faint text without depth test, then the white text with
+               depth test, matching the old RenderLivingLabel two-pass look. */
+            glDepthMask(GL_FALSE);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_TEXTURE_2D);
+            draw_rect(-half - 1, -1, half + 1, 8, (int)0x40000000u);
+            glEnable(GL_TEXTURE_2D);
+            draw_text_no_shadow(name, -tw / 2, 0, (int)0x20FFFFFFu);
+            glEnable(GL_DEPTH_TEST);
+            glDepthMask(GL_TRUE);
+            draw_text_no_shadow(name, -tw / 2, 0, 0xFFFFFF);
+        }
+
+        glPopMatrix();
+    }
+
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.1f);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_FOG);
+    glColor4f(1, 1, 1, 1);
+}
+
+static int overlay_tile_for_block(int id) {
+    if (id == BLOCK_WATER || id == BLOCK_STILL_WATER) return liquid_top_tile_for_block(id);
+    if (id == BLOCK_LAVA || id == BLOCK_STILL_LAVA) return liquid_top_tile_for_block(id);
+    if (id == BLOCK_GRASS) return 2;
+    if (id == BLOCK_STONE) return 1;
+    if (id == BLOCK_DIRT) return 2;
+    if (id == BLOCK_COBBLESTONE) return 16;
+    if (id == BLOCK_BEDROCK) return 17;
+    if (id == BLOCK_PLANKS) return 4;
+    if (id == BLOCK_LOG) return 20;
+    if (id == BLOCK_SAND) return 18;
+    if (id == BLOCK_GRAVEL) return 19;
+    if (id == BLOCK_FURNACE) return furnace_side_tile();
+    return 1;
+}
+
+static void draw_player_fire_overlay_125(void) {
+    if (g_player_fire_ticks <= 0 || !tex_terrain.id) return;
+    glDisable(GL_FOG);
+    setup_gui_projection();
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(1.0f, 1.0f, 1.0f, 0.9f);
+    for (int side = 0; side < 2; ++side) {
+        int tile = 31 + side * 16;
+        float u0, v0, u1, v1;
+        terrain_tile_uv(tile, &u0, &v0, &u1, &v1);
+        float dir = (float)(side * 2 - 1);
+        glPushMatrix();
+        glTranslatef((float)g_gui_w * 0.5f - dir * (float)g_gui_w * 0.24f,
+                     (float)g_gui_h * 0.2f, 0.0f);
+        glRotatef(dir * 10.0f, 0.0f, 1.0f, 0.0f);
+        glBegin(GL_QUADS);
+        glTexCoord2f(u1, v1); glVertex3f(-(float)g_gui_w * 0.5f, -(float)g_gui_h * 0.5f, -0.5f);
+        glTexCoord2f(u0, v1); glVertex3f( (float)g_gui_w * 0.5f, -(float)g_gui_h * 0.5f, -0.5f);
+        glTexCoord2f(u0, v0); glVertex3f( (float)g_gui_w * 0.5f,  (float)g_gui_h * 0.5f, -0.5f);
+        glTexCoord2f(u1, v0); glVertex3f(-(float)g_gui_w * 0.5f,  (float)g_gui_h * 0.5f, -0.5f);
+        glEnd();
+        glPopMatrix();
+    }
+    glColor4f(1, 1, 1, 1);
+}
+
+static void draw_in_block_overlay(void) {
+    int id = flat_player_suffocation_block();
+    int liquid_eye = flat_player_head_block();
+    if (!id && (liquid_eye == BLOCK_WATER || liquid_eye == BLOCK_STILL_WATER ||
+                liquid_eye == BLOCK_LAVA || liquid_eye == BLOCK_STILL_LAVA)) {
+        id = liquid_eye;
+    }
+    if (!id || !tex_terrain.id) return;
+
+    float u0, v0, u1, v1;
+    int water_overlay = (id == BLOCK_WATER || id == BLOCK_STILL_WATER) && tex_water_overlay.id;
+    if (water_overlay) {
+        float yaw = g_player_render_frame.yaw / 64.0f;
+        float pitch = g_player_render_frame.pitch / 64.0f;
+        u0 = 4.0f + yaw; v0 = 4.0f + pitch;
+        u1 = 0.0f + yaw; v1 = 0.0f + pitch;
+    } else {
+        terrain_tile_uv(overlay_tile_for_block(id), &u0, &v0, &u1, &v1);
+    }
+
+    glDisable(GL_FOG);
+    setup_gui_projection();
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, water_overlay ? tex_water_overlay.id : tex_terrain.id);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    if (id == BLOCK_WATER || id == BLOCK_STILL_WATER) {
+        glColor4f(1.0f, 1.0f, 1.0f, 0.50f);
+    } else if (id == BLOCK_LAVA || id == BLOCK_STILL_LAVA) {
+        glColor4f(1.0f, 0.35f, 0.05f, 0.55f);
+    } else {
+        glColor4f(0.55f, 0.55f, 0.55f, 0.65f);
+    }
+
+    /* Source-style "inside block" overlay: a close textured quad over the view. */
+    glBegin(GL_QUADS);
+    glTexCoord2f(u0, v1); glVertex2f(0.0f, (float)g_gui_h);
+    glTexCoord2f(u1, v1); glVertex2f((float)g_gui_w, (float)g_gui_h);
+    glTexCoord2f(u1, v0); glVertex2f((float)g_gui_w, 0.0f);
+    glTexCoord2f(u0, v0); glVertex2f(0.0f, 0.0f);
+    glEnd();
+
+    glColor4f(1, 1, 1, 1);
+}
+
+
+#if defined(PEX_PLATFORM_PSP) && defined(PEX_PSP_FAST_WORLD) && PEX_PSP_FAST_WORLD
+/* PSP emergency world renderer.
+   The PC renderer builds many 16x16x16 display-list sections while the player
+   moves.  On PSP/PPSSPP this causes the visible freeze/unfreeze pattern even
+   when the average FPS counter is low-but-not-zero.  For the first playable PSP
+   build we use a stable surface renderer: no section rebuild queue, no display
+   lists, no world mesh worker, no cache churn.  It draws the live RAM world
+   directly around the player each frame with a hard vertex budget. */
+static int psp_fast_surface_top(int wx, int wz, int *out_y, int *out_id) {
+    for (int y = FLAT_WORLD_Y_MAX; y >= FLAT_WORLD_Y_MIN; --y) {
+        int id = flat_get_block(wx, y, wz);
+        if (id != 0 && !block_is_liquid(id)) {
+            if (out_y) *out_y = y;
+            if (out_id) *out_id = id;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void psp_fast_emit_surface_block(int id, int x, int y, int z) {
+    if (!id) return;
+    if (id == BLOCK_SNOW_LAYER) {
+        emit_snow_layer_block(x, y, z);
+        return;
+    }
+    if (block_uses_special_model(id) || block_uses_cross_plant_model(id)) {
+        /* The full special/cross models are expensive and often alpha-heavy.
+           Draw a cheap supporting top face instead so forests/flowers do not
+           stall the PSP build. */
+        int below = flat_get_block(x, y - 1, z);
+        if (below) { id = below; y = y - 1; }
+        else return;
+    }
+
+    if (flat_face_exposed_for_block(id, x, y, z, 1)) emit_world_block_face_at(id, x, y, z, 1);
+
+    /* Nearby cliff/wall hints.  This keeps the world from looking like a flat
+       map without drawing whole vertical columns. */
+    for (int face = 2; face <= 5; ++face) {
+        if (flat_face_exposed_for_block(id, x, y, z, face)) emit_world_block_face_at(id, x, y, z, face);
+    }
+}
+
+#define PEX_PSP_FAST_TILE_SIZE 16
+#if defined(PEX_PSP_1000_TARGET) && PEX_PSP_1000_TARGET
+#define PEX_PSP_FAST_MAX_TILES 72
+#else
+#define PEX_PSP_FAST_MAX_TILES 128
+#endif
+typedef struct PspFastSurfaceTile {
+    int valid;
+    int dirty;
+    int tx, tz;
+    GLuint tex;
+    PspBatch *batch;
+    PspBatch *water_batch;
+    int vertex_count;
+    int water_vertex_count;
+} PspFastSurfaceTile;
+
+static PspFastSurfaceTile g_psp_fast_surface_tiles[PEX_PSP_FAST_MAX_TILES];
+static GLuint g_psp_fast_surface_tex = 0;
+
+static int psp_floor_div_tile(int v) {
+    int s = PEX_PSP_FAST_TILE_SIZE;
+    return (v >= 0) ? (v / s) : ((v - s + 1) / s);
+}
+
+static void psp_fast_surface_free_cache(void) {
+    for (int i = 0; i < PEX_PSP_FAST_MAX_TILES; ++i) {
+        if (g_psp_fast_surface_tiles[i].batch) psp_batch_destroy(g_psp_fast_surface_tiles[i].batch);
+        if (g_psp_fast_surface_tiles[i].water_batch) psp_batch_destroy(g_psp_fast_surface_tiles[i].water_batch);
+        memset(&g_psp_fast_surface_tiles[i], 0, sizeof(g_psp_fast_surface_tiles[i]));
+    }
+}
+
+static PspFastSurfaceTile *psp_fast_surface_find_tile(int tx, int tz) {
+    for (int i = 0; i < PEX_PSP_FAST_MAX_TILES; ++i) {
+        if (g_psp_fast_surface_tiles[i].valid && g_psp_fast_surface_tiles[i].tx == tx && g_psp_fast_surface_tiles[i].tz == tz) return &g_psp_fast_surface_tiles[i];
+    }
+    return NULL;
+}
+
+static PspFastSurfaceTile *psp_fast_surface_alloc_tile(int tx, int tz, int center_tx, int center_tz) {
+    PspFastSurfaceTile *slot = NULL;
+    for (int i = 0; i < PEX_PSP_FAST_MAX_TILES; ++i) {
+        if (!g_psp_fast_surface_tiles[i].valid) { slot = &g_psp_fast_surface_tiles[i]; break; }
+    }
+    if (!slot) {
+        int best = 0, best_d = -1;
+        for (int i = 0; i < PEX_PSP_FAST_MAX_TILES; ++i) {
+            int dx = g_psp_fast_surface_tiles[i].tx - center_tx;
+            int dz = g_psp_fast_surface_tiles[i].tz - center_tz;
+            int d = dx * dx + dz * dz;
+            if (d > best_d) { best_d = d; best = i; }
+        }
+        slot = &g_psp_fast_surface_tiles[best];
+        if (slot->batch) psp_batch_destroy(slot->batch);
+        if (slot->water_batch) psp_batch_destroy(slot->water_batch);
+    }
+    memset(slot, 0, sizeof(*slot));
+    slot->valid = 1;
+    slot->dirty = 1;
+    slot->tx = tx;
+    slot->tz = tz;
+    slot->tex = tex_terrain.id;
+    return slot;
+}
+
+static int psp_fast_surface_tile_dirty(int tx, int tz) {
+    if (!g_psp_fast_surface_dirty) return 0;
+    int x0 = tx * PEX_PSP_FAST_TILE_SIZE;
+    int z0 = tz * PEX_PSP_FAST_TILE_SIZE;
+    int x1 = x0 + PEX_PSP_FAST_TILE_SIZE - 1;
+    int z1 = z0 + PEX_PSP_FAST_TILE_SIZE - 1;
+    if (x1 < g_psp_fast_dirty_min_x || x0 > g_psp_fast_dirty_max_x) return 0;
+    if (z1 < g_psp_fast_dirty_min_z || z0 > g_psp_fast_dirty_max_z) return 0;
+    return 1;
+}
+
+static void psp_fast_surface_capture_begin(void) {
+    g_psp_begin_active = 1;
+    g_psp_begin_mode = GL_QUADS;
+    g_psp_imm_count = 0;
+}
+
+static PspBatch *psp_fast_capture_batch(void) {
+    g_psp_begin_active = 0;
+    PspBatch *nb = psp_batch_create(g_psp_imm, g_psp_imm_count, GL_QUADS);
+    g_psp_imm_count = 0;
+    return nb;
+}
+
+static PspBatch *psp_fast_build_tile_batch(int tx, int tz, int pcx, int pcz, int radius) {
+    glEnable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glColor4f(1, 1, 1, 1);
+
+    int x0 = tx * PEX_PSP_FAST_TILE_SIZE;
+    int z0 = tz * PEX_PSP_FAST_TILE_SIZE;
+    int r2 = radius * radius;
+    psp_fast_surface_capture_begin();
+    for (int z = z0; z < z0 + PEX_PSP_FAST_TILE_SIZE; ++z) {
+        int dz = z - pcz;
+        for (int x = x0; x < x0 + PEX_PSP_FAST_TILE_SIZE; ++x) {
+            int dx = x - pcx;
+            if (dx * dx + dz * dz > r2) continue;
+            int y = 0, id = 0;
+            if (!psp_fast_surface_top(x, z, &y, &id)) continue;
+            psp_fast_emit_surface_block(id, x, y, z);
+            if (g_psp_imm_count > PEX_PSP_MAX_IMM_VERTS - 128) break;
+        }
+        if (g_psp_imm_count > PEX_PSP_MAX_IMM_VERTS - 128) break;
+    }
+    return psp_fast_capture_batch();
+}
+
+
+static PspBatch *psp_fast_build_water_batch(int tx, int tz, int pcx, int pcz, int radius) {
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glColor4f(1, 1, 1, 0.72f);
+
+    int x0 = tx * PEX_PSP_FAST_TILE_SIZE;
+    int z0 = tz * PEX_PSP_FAST_TILE_SIZE;
+    int r2 = radius * radius;
+    psp_fast_surface_capture_begin();
+    for (int z = z0; z < z0 + PEX_PSP_FAST_TILE_SIZE; ++z) {
+        int dz = z - pcz;
+        for (int x = x0; x < x0 + PEX_PSP_FAST_TILE_SIZE; ++x) {
+            int dx = x - pcx;
+            if (dx * dx + dz * dz > r2) continue;
+            for (int y = FLAT_WORLD_Y_MIN; y <= FLAT_WORLD_Y_MAX; ++y) {
+                int id = flat_get_block(x, y, z);
+                if (!block_is_liquid(id)) continue;
+                if (!liquid_face_exposed(x, y, z, 0) && !liquid_face_exposed(x, y, z, 1) &&
+                    !liquid_face_exposed(x, y, z, 2) && !liquid_face_exposed(x, y, z, 3) &&
+                    !liquid_face_exposed(x, y, z, 4) && !liquid_face_exposed(x, y, z, 5)) continue;
+                emit_liquid_block_faces(id, x, y, z);
+                if (g_psp_imm_count > PEX_PSP_MAX_IMM_VERTS - 192) break;
+            }
+            if (g_psp_imm_count > PEX_PSP_MAX_IMM_VERTS - 192) break;
+        }
+        if (g_psp_imm_count > PEX_PSP_MAX_IMM_VERTS - 192) break;
+    }
+    return psp_fast_capture_batch();
+}
+
+static int psp_fast_surface_radius_blocks(void) {
+    int radius = generated_render_radius() * 16;
+    if (radius < 16) radius = 16;
+#if defined(PEX_PSP_1000_TARGET) && PEX_PSP_1000_TARGET
+    if (radius > 48) radius = 48;
+#else
+    if (radius > 64) radius = 64;
+#endif
+    return radius;
+}
+
+static void psp_fast_surface_update_tiles(int pcx, int pcz) {
+    int radius = psp_fast_surface_radius_blocks();
+    int min_tx = psp_floor_div_tile(pcx - radius);
+    int max_tx = psp_floor_div_tile(pcx + radius);
+    int min_tz = psp_floor_div_tile(pcz - radius);
+    int max_tz = psp_floor_div_tile(pcz + radius);
+    int center_tx = psp_floor_div_tile(pcx);
+    int center_tz = psp_floor_div_tile(pcz);
+
+    if (g_psp_fast_surface_tex != tex_terrain.id) {
+        for (int i = 0; i < PEX_PSP_FAST_MAX_TILES; ++i) g_psp_fast_surface_tiles[i].dirty = 1;
+        g_psp_fast_surface_tex = tex_terrain.id;
+        psp_fast_mark_all_dirty();
+    }
+
+    for (int i = 0; i < PEX_PSP_FAST_MAX_TILES; ++i) {
+        PspFastSurfaceTile *t = &g_psp_fast_surface_tiles[i];
+        if (!t->valid) continue;
+        if (t->tx < min_tx - 1 || t->tx > max_tx + 1 || t->tz < min_tz - 1 || t->tz > max_tz + 1) {
+            if (t->batch) psp_batch_destroy(t->batch);
+            if (t->water_batch) psp_batch_destroy(t->water_batch);
+            memset(t, 0, sizeof(*t));
+            continue;
+        }
+        if (psp_fast_surface_tile_dirty(t->tx, t->tz)) t->dirty = 1;
+    }
+
+#if defined(PEX_PSP_1000_TARGET) && PEX_PSP_1000_TARGET
+    int rebuild_budget = 1;
+#else
+    int rebuild_budget = 4;
+#endif
+    for (int pass = 0; pass < 2 && rebuild_budget > 0; ++pass) {
+        for (int tz = min_tz; tz <= max_tz && rebuild_budget > 0; ++tz) {
+            for (int tx = min_tx; tx <= max_tx && rebuild_budget > 0; ++tx) {
+                int tcx = tx * PEX_PSP_FAST_TILE_SIZE + PEX_PSP_FAST_TILE_SIZE / 2;
+                int tcz = tz * PEX_PSP_FAST_TILE_SIZE + PEX_PSP_FAST_TILE_SIZE / 2;
+                int dx = tcx - pcx;
+                int dz = tcz - pcz;
+                if (pass == 0 && (dx * dx + dz * dz > (radius + PEX_PSP_FAST_TILE_SIZE) * (radius + PEX_PSP_FAST_TILE_SIZE))) continue;
+                PspFastSurfaceTile *t = psp_fast_surface_find_tile(tx, tz);
+                if (!t) t = psp_fast_surface_alloc_tile(tx, tz, center_tx, center_tz);
+                if (!t) continue;
+                if (!t->dirty && t->batch && t->tex == tex_terrain.id) continue;
+                PspBatch *nb = psp_fast_build_tile_batch(tx, tz, pcx, pcz, radius);
+                PspBatch *wb = psp_fast_build_water_batch(tx, tz, pcx, pcz, radius);
+                if (t->batch) psp_batch_destroy(t->batch);
+                if (t->water_batch) psp_batch_destroy(t->water_batch);
+                t->batch = nb;
+                t->water_batch = wb;
+                t->vertex_count = nb ? nb->count : 0;
+                t->water_vertex_count = wb ? wb->count : 0;
+                t->tex = tex_terrain.id;
+                t->dirty = 0;
+                rebuild_budget--;
+            }
+        }
+    }
+
+    g_psp_fast_surface_dirty = 0;
+    g_psp_fast_dirty_min_x = 0x7fffffff;
+    g_psp_fast_dirty_max_x = -0x7fffffff;
+    g_psp_fast_dirty_min_z = 0x7fffffff;
+    g_psp_fast_dirty_max_z = -0x7fffffff;
+}
+
+static void psp_fast_surface_draw_tiles(int pcx, int pcz) {
+    int radius = psp_fast_surface_radius_blocks() + PEX_PSP_FAST_TILE_SIZE;
+    int r2 = radius * radius;
+    for (int i = 0; i < PEX_PSP_FAST_MAX_TILES; ++i) {
+        PspFastSurfaceTile *t = &g_psp_fast_surface_tiles[i];
+        if (!t->valid || !t->batch) continue;
+        int tcx = t->tx * PEX_PSP_FAST_TILE_SIZE + PEX_PSP_FAST_TILE_SIZE / 2;
+        int tcz = t->tz * PEX_PSP_FAST_TILE_SIZE + PEX_PSP_FAST_TILE_SIZE / 2;
+        int dx = tcx - pcx;
+        int dz = tcz - pcz;
+        if (dx * dx + dz * dz > r2) continue;
+        psp_draw_persistent_batch(t->batch);
+    }
+}
+
+
+static void psp_fast_draw_water(int pcx, int pcz) {
+    int radius = psp_fast_surface_radius_blocks() + PEX_PSP_FAST_TILE_SIZE;
+    int r2 = radius * radius;
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glColor4f(1,1,1,1);
+    for (int i = 0; i < PEX_PSP_FAST_MAX_TILES; ++i) {
+        PspFastSurfaceTile *t = &g_psp_fast_surface_tiles[i];
+        if (!t->valid || !t->water_batch) continue;
+        int tcx = t->tx * PEX_PSP_FAST_TILE_SIZE + PEX_PSP_FAST_TILE_SIZE / 2;
+        int tcz = t->tz * PEX_PSP_FAST_TILE_SIZE + PEX_PSP_FAST_TILE_SIZE / 2;
+        int dx = tcx - pcx;
+        int dz = tcz - pcz;
+        if (dx * dx + dz * dz > r2) continue;
+        psp_draw_persistent_batch(t->water_batch);
+    }
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glColor4f(1,1,1,1);
+}
+
+static void psp_fast_draw_edits(int pcx, int pcz) {
+    int radius = psp_fast_surface_radius_blocks() + 4;
+    int r2 = radius * radius;
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glDisable(GL_BLEND);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_DEPTH_TEST);
+    glColor4f(1, 1, 1, 1);
+    for (int i = 0; i < 64; ++i) {
+        if (!g_psp_fast_edited_blocks[i].stamp) continue;
+        int x = g_psp_fast_edited_blocks[i].x;
+        int y = g_psp_fast_edited_blocks[i].y;
+        int z = g_psp_fast_edited_blocks[i].z;
+        int dx = x - pcx;
+        int dz = z - pcz;
+        if (dx * dx + dz * dz > r2) continue;
+        int id = flat_get_block(x, y, z);
+        if (!id) continue;
+        draw_generic_world_block_model(id, (float)x, (float)y, (float)z);
+    }
+}
+
+static void psp_fast_draw_world(void) {
+    setup_world_projection();
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+    glDisable(GL_ALPHA_TEST);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+
+    int pcx = (int)floorf(g_player_render_frame.x);
+    int pcz = (int)floorf(g_player_render_frame.z);
+    psp_fast_surface_update_tiles(pcx, pcz);
+
+    apply_player_camera(g_frame_partial);
+    apply_source_like_fog();
+    psp_fast_surface_draw_tiles(pcx, pcz);
+    psp_fast_draw_edits(pcx, pcz);
+    psp_fast_draw_water(pcx, pcz);
+    glEnable(GL_FOG);
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+    if (!pex_shaders_active()) draw_source_clouds();
+#else
+    draw_source_clouds();
+#endif
+
+    glColor4f(1,1,1,1);
+    glDisable(GL_FOG);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+}
+#endif
+
+static void draw_flat_visual_edit_overlays(void) {
+    if (g_flat_visual_edit_count <= 0 || !tex_terrain.id) return;
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    glDisable(GL_BLEND);
+    glDisable(GL_ALPHA_TEST);
+    glColor4f(1, 1, 1, 1);
+#if !defined(PEX_PLATFORM_PSP)
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-1.0f, -1.0f);
+#endif
+    for (int i = 0; i < g_flat_visual_edit_count; ) {
+        FlatVisualEditBlock *e = &g_flat_visual_edits[i];
+        if (!flat_in_bounds(e->x, e->y, e->z) || flat_get_block(e->x, e->y, e->z) != e->id ||
+            (g_ingame_ticks - e->tick) > 20) {
+            flat_prune_visual_edit_index(i);
+            continue;
+        }
+        int lcx = flat_local_chunk_x(e->x);
+        int lcz = flat_local_chunk_z(e->z);
+        int sy = flat_section_y_for_world(e->y);
+        if (flat_local_chunk_valid(lcx, lcz) && flat_section_index_valid(sy) &&
+            g_flat_section_valid[sy][lcz][lcx] && !g_flat_section_dirty[sy][lcz][lcx] &&
+            !g_flat_section_mesh_building[sy][lcz][lcx]) {
+            flat_prune_visual_edit_index(i);
+            continue;
+        }
+        draw_world_block_exposed(e->id, e->x, e->y, e->z);
+        i++;
+    }
+#if !defined(PEX_PLATFORM_PSP)
+    glDisable(GL_POLYGON_OFFSET_FILL);
+#endif
+    glColor4f(1, 1, 1, 1);
+}
+
+static void draw_flat_test_world(void) {
+    if (!tex_terrain.id) return;
+    update_portal_texture_animation();
+    update_liquid_texture_animation();
+#if defined(PEX_PLATFORM_PSP) && defined(PEX_PSP_FAST_WORLD) && PEX_PSP_FAST_WORLD
+    psp_fast_draw_world();
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    draw_remote_break_overlays();
+    if (g_breaking_block && flat_get_block(g_break_x, g_break_y, g_break_z) != 0) {
+        float dmg = g_prev_break_damage + (g_break_damage - g_prev_break_damage) * g_frame_partial;
+        int stage = (int)(dmg * 10.0f);
+        draw_break_overlay_cube((float)g_break_x, (float)g_break_y, (float)g_break_z, stage);
+    }
+    glDepthMask(GL_TRUE);
+    draw_block_selection_border();
+    return;
+#endif
+
+    setup_world_projection();
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+
+    apply_player_camera(g_frame_partial);
+    apply_source_like_fog();
+
+    /* The stream service may slide local chunk/section metadata off-thread.
+       Hold a short read-side critical section across cull/rebuild/draw so one
+       frame cannot observe half of a metadata remap.  Voxel data itself is an
+       absolute-coordinate ring and is not copied during this lock. */
+    flat_world_map_enter();
+
+    /* Java-style WorldRenderer grid: build/draw 16x16x16 render sections.
+       Missing/dirty geometry is rebuilt with a small per-frame budget; terrain
+       generation is handled by the streaming worker, never by rendering. */
+    if (g_flat_world_geometry_dirty || g_flat_section_geometry_dirty) {
+        flat_mark_all_chunks_dirty();
+    }
+
+#if defined(PEX_PLATFORM_WII) || defined(PEX_PLATFORM_PSP) || defined(PEX_PLATFORM_WASM)
+    flat_flush_pending_lighting();
+#else
+    /* Never start, wake, or run lighting work from the render path. Every
+       terrain-edit/streaming path already signals the dedicated worker. */
+#endif
+
+    double prof_part = profile_begin();
+    FlatFrustum fr;
+    flat_frustum_build(&fr);
+    int visible_count = build_flat_visible_sections(&fr, g_flat_visible_sections, FLAT_MAX_VISIBLE_SECTIONS);
+    profile_add_time(PROF_CULL_SORT, prof_part);
+    prof_part = profile_begin();
+    if (g_loggy_enabled) {
+        g_loggy_visible_sections = visible_count;
+        g_loggy_visible_chunks = 0;
+        for (int vc_z = 0; vc_z < FLAT_RENDER_CHUNKS; ++vc_z) {
+            for (int vc_x = 0; vc_x < FLAT_RENDER_CHUNKS; ++vc_x) {
+                if (g_flat_world_chunk_generated[vc_z][vc_x]) g_loggy_visible_chunks++;
+            }
+        }
+    }
+    rebuild_visible_flat_sections(g_flat_visible_sections, visible_count);
+    profile_add_time(PROF_MESH_MAIN, prof_part);
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+    if (pex_shaders_active() && pex_shaders_begin_shadow()) {
+        draw_flat_section_passes(g_flat_visible_sections, visible_count);
+        pex_shaders_end_shadow();
+    }
+    if (pex_shaders_active()) pex_shaders_bind_terrain();
+#endif
+    prof_part = profile_begin();
+    draw_flat_section_passes(g_flat_visible_sections, visible_count);
+    draw_flat_visual_edit_overlays();
+    profile_add_time(PROF_WORLD_DRAW, prof_part);
+    flat_world_map_leave();
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+    if (pex_shaders_active()) pex_shaders_bind_entities();
+#endif
+
+    prof_part = profile_begin();
+    double entity_part = profile_begin();
+    draw_third_person_player();
+    profile_add_time(PROF_ENTITY_LOCAL_PLAYER, entity_part);
+
+    int remote_player_count = multiplayer_renderable_remote_player_count();
+    if (g_loggy_enabled) g_loggy_entity_remote_players = remote_player_count;
+
+    entity_part = profile_begin();
+    draw_multiplayer_remote_players(&fr, remote_player_count);
+    draw_multiplayer_name_tags(&fr, remote_player_count);
+    profile_add_time(PROF_ENTITY_REMOTE_PLAYERS, entity_part);
+
+    /* Name tags are now rendered as world-space billboards, so multiplayer no
+       longer needs glGet* matrix readbacks just to project labels into GUI. */
+    if (g_loggy_enabled) g_loggy_entity_matrix_skips++;
+
+    entity_part = profile_begin();
+    draw_falling_blocks(g_frame_partial);
+    profile_add_time(PROF_ENTITY_FALLING_BLOCKS, entity_part);
+
+    entity_part = profile_begin();
+    draw_passive_mobs(g_frame_partial);
+    pex_java47_draw_special_entities(g_frame_partial);
+    draw_vehicles(g_frame_partial);
+    draw_projectiles(g_frame_partial);
+    draw_xp_orbs(g_frame_partial);
+    profile_add_time(PROF_ENTITY_PASSIVE_MOBS, entity_part);
+
+    profile_add_time(PROF_WORLD_ENTITIES, prof_part);
+
+    prof_part = profile_begin();
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+    if (pex_shaders_active()) pex_shaders_bind_textured_lit();
+#endif
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+    draw_dropped_items();
+    draw_pickup_fx_items();
+    draw_dig_particles(g_frame_partial);
+    profile_add_time(PROF_WORLD_PARTICLES, prof_part);
+
+    prof_part = profile_begin();
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+    if (pex_shaders_active()) { pex_shaders_copy_depth(1); pex_shaders_bind_water(); }
+#endif
+    draw_translucent_sections(g_flat_visible_sections, visible_count);
+    profile_add_time(PROF_WORLD_TRANSLUCENT, prof_part);
+
+    prof_part = profile_begin();
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+    if (pex_shaders_active()) pex_shaders_bind_textured();
+#endif
+    draw_block_selection_border();
+    draw_remote_break_overlays();
+    if (g_breaking_block && flat_get_block(g_break_x, g_break_y, g_break_z) != 0) {
+        float dmg = g_prev_break_damage + (g_break_damage - g_prev_break_damage) * g_frame_partial;
+        int stage = (int)(dmg * 10.0f);
+        draw_break_overlay_cube((float)g_break_x, (float)g_break_y, (float)g_break_z, stage);
+    }
+    profile_add_time(PROF_WORLD_OVERLAYS, prof_part);
+
+    prof_part = profile_begin();
+    glEnable(GL_FOG);
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+    if (!pex_shaders_active()) draw_source_clouds();
+#else
+    draw_source_clouds();
+#endif
+    profile_add_time(PROF_WORLD_CLOUDS, prof_part);
+
+    glColor4f(1,1,1,1);
+    glDisable(GL_FOG);
+    glEnable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+}
+
+
+static void draw_item3d_from_texture(Texture *atlas, int tile) {
+    /* Port of uploaded source lk.java lines 16-118 for item icons.
+       The atlas is parameterized so block items that Java renders from
+       terrain.png, such as ladders, do not accidentally use gui/items.png. */
+    if (!atlas || !atlas->id) return;
+    float tw = atlas->w ? (float)atlas->w : 256.0f;
+    float th = atlas->h ? (float)atlas->h : 256.0f;
+    float u0 = (float)((tile & 15) * 16 + 0.0f) / tw;
+    float u1 = (float)((tile & 15) * 16 + 15.99f) / tw;
+    float v0 = (float)((tile >> 4) * 16 + 0.0f) / th;
+    float v1 = (float)((tile >> 4) * 16 + 15.99f) / th;
+    float w = 1.0f;
+    float depth = 0.0625f;
+
+    glBindTexture(GL_TEXTURE_2D, atlas->id);
+    glPushMatrix();
+    glTranslatef(-0.0f, -0.3f, 0.0f);
+    glScalef(1.5f, 1.5f, 1.5f);
+    glRotatef(50.0f, 0.0f, 1.0f, 0.0f);
+    glRotatef(335.0f, 0.0f, 0.0f, 1.0f);
+    glTranslatef(-0.9375f, -0.0625f, 0.0f);
+
+    /* Caller supplies entity/item brightness through the current GL color. */
+
+    glBegin(GL_QUADS);
+    /* front */
+    glTexCoord2f(u1, v1); glVertex3f(0.0f, 0.0f, 0.0f);
+    glTexCoord2f(u0, v1); glVertex3f(w,    0.0f, 0.0f);
+    glTexCoord2f(u0, v0); glVertex3f(w,    1.0f, 0.0f);
+    glTexCoord2f(u1, v0); glVertex3f(0.0f, 1.0f, 0.0f);
+
+    /* back */
+    glTexCoord2f(u1, v0); glVertex3f(0.0f, 1.0f, -depth);
+    glTexCoord2f(u0, v0); glVertex3f(w,    1.0f, -depth);
+    glTexCoord2f(u0, v1); glVertex3f(w,    0.0f, -depth);
+    glTexCoord2f(u1, v1); glVertex3f(0.0f, 0.0f, -depth);
+    glEnd();
+
+    /* left/right thickness: source uses 16 strips for pixel-thick sides. */
+    glBegin(GL_QUADS);
+    for (int i = 0; i < 16; i++) {
+        float a = (float)i / 16.0f;
+        float uu = u1 + (u0 - u1) * a - 0.001953125f;
+        float x = w * a;
+        glTexCoord2f(uu, v1); glVertex3f(x, 0.0f, -depth);
+        glTexCoord2f(uu, v1); glVertex3f(x, 0.0f, 0.0f);
+        glTexCoord2f(uu, v0); glVertex3f(x, 1.0f, 0.0f);
+        glTexCoord2f(uu, v0); glVertex3f(x, 1.0f, -depth);
+    }
+    for (int i = 0; i < 16; i++) {
+        float a = (float)i / 16.0f;
+        float uu = u1 + (u0 - u1) * a - 0.001953125f;
+        float x = w * a + 0.0625f;
+        glTexCoord2f(uu, v0); glVertex3f(x, 1.0f, -depth);
+        glTexCoord2f(uu, v0); glVertex3f(x, 1.0f, 0.0f);
+        glTexCoord2f(uu, v1); glVertex3f(x, 0.0f, 0.0f);
+        glTexCoord2f(uu, v1); glVertex3f(x, 0.0f, -depth);
+    }
+    for (int i = 0; i < 16; i++) {
+        float a = (float)i / 16.0f;
+        float vv = v1 + (v0 - v1) * a - 0.001953125f;
+        float y = w * a + 0.0625f;
+        glTexCoord2f(u1, vv); glVertex3f(0.0f, y, 0.0f);
+        glTexCoord2f(u0, vv); glVertex3f(w,    y, 0.0f);
+        glTexCoord2f(u0, vv); glVertex3f(w,    y, -depth);
+        glTexCoord2f(u1, vv); glVertex3f(0.0f, y, -depth);
+    }
+    for (int i = 0; i < 16; i++) {
+        float a = (float)i / 16.0f;
+        float vv = v1 + (v0 - v1) * a - 0.001953125f;
+        float y = w * a;
+        glTexCoord2f(u0, vv); glVertex3f(w,    y, 0.0f);
+        glTexCoord2f(u1, vv); glVertex3f(0.0f, y, 0.0f);
+        glTexCoord2f(u1, vv); glVertex3f(0.0f, y, -depth);
+        glTexCoord2f(u0, vv); glVertex3f(w,    y, -depth);
+    }
+    glEnd();
+
+    glPopMatrix();
+}
+
+static void draw_item3d_from_atlas(int tile) {
+    draw_item3d_from_texture(&tex_items, tile);
+}
+
+static void draw_first_person_hand(void) {
+#if defined(PEX_PLATFORM_LINUX_SDL2) || (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP))
+    if (breach_active()) { breach_draw_first_person(); return; }
+#endif
+    Texture *local_skin = pex_java47_local_skin_texture();
+    if (!local_skin || !local_skin->id) return;
+
+    setup_world_projection();
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    /* Java 1.2.5: the first-person item/hand pass is rendered inside the same
+       hurt-camera + view-bobbing matrix pair used by EntityRenderer before
+       ItemRenderer.renderItemInFirstPerson(). */
+    apply_hurt_camera_effect(g_frame_partial);
+    apply_view_bobbing(g_frame_partial);
+
+    /* Java 1.2.5 ItemRenderer.renderItemInFirstPerson(): add the smoothed arm
+       yaw/pitch sway so the held hand/item responds when the player looks
+       around, not only while walking. */
+    {
+        const PexPlayerRenderState *pr = &g_player_render_frame;
+        float arm_pitch = pr->prev_render_arm_pitch + (pr->render_arm_pitch - pr->prev_render_arm_pitch) * g_frame_partial;
+        float arm_yaw = pr->prev_render_arm_yaw + (pr->render_arm_yaw - pr->prev_render_arm_yaw) * g_frame_partial;
+        glRotatef((pr->pitch - arm_pitch) * 0.1f, 1.0f, 0.0f, 0.0f);
+        glRotatef((pr->yaw - arm_yaw) * 0.1f, 0.0f, 1.0f, 0.0f);
+    }
+
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+#if defined(PEX_PLATFORM_WII)
+    /* The Wii GX shim does not implement a safe mid-frame depth-only clear yet.
+       Desktop GL clears depth before the hand/item pass; on Wii that clear was
+       a no-op, so the first-person hand could be hidden by stale terrain depth.
+       Draw this pass as an overlay until GX depth-clear support is added. */
+    glDisable(GL_DEPTH_TEST);
+#endif
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.1f);
+
+    float swing = g_prev_hand_swing + (g_hand_swing - g_prev_hand_swing) * g_frame_partial;
+    if (swing < 0.0f) swing = 0.0f;
+    if (swing > 1.0f) swing = 1.0f;
+    float swing_sin = sinf(swing * (float)M_PI);
+    float swing_sqrt_sin = sinf(sqrtf(swing) * (float)M_PI);
+    ItemStack *held = &g_equipped_item;
+    float equip = g_prev_equipped_progress + (g_equipped_progress - g_prev_equipped_progress) * g_frame_partial;
+    if (equip < 0.0f) equip = 0.0f; if (equip > 1.0f) equip = 1.0f;
+
+    entity_item_light_prepare(g_player_x, g_player_y, g_player_z);
+
+    if (!stack_empty(held) && render_item_as_block_id(held->id) && tex_terrain.id) {
+        /* ItemRenderer held-block branch: when a block is selected Java renders the
+           3D block in-hand, not the empty player arm.  This also makes the right
+           click/use swing look different from mining with an empty hand. */
+        glBindTexture(GL_TEXTURE_2D, tex_terrain.id);
+        glPushMatrix();
+        glTranslatef(0.0f, -0.6f * (1.0f - equip), 0.0f);
+        float s = 0.8f;
+        glTranslatef(0.7f * s, -0.65f * s, -0.9f * s);
+        glTranslatef(-swing_sqrt_sin * 0.4f,
+                     sinf(sqrtf(swing) * (float)M_PI * 2.0f) * 0.2f,
+                     -swing_sin * 0.2f);
+        glRotatef(45.0f, 0.0f, 1.0f, 0.0f);
+        float swing_y = sinf(swing * swing * (float)M_PI);
+        glRotatef(-swing_y * 20.0f, 0.0f, 1.0f, 0.0f);
+        glRotatef(-swing_sqrt_sin * 20.0f, 0.0f, 0.0f, 1.0f);
+        glRotatef(-swing_sqrt_sin * 80.0f, 1.0f, 0.0f, 0.0f);
+        glScalef(0.40f, 0.40f, 0.40f);
+        glRotatef(90.0f, 0.0f, 1.0f, 0.0f);
+        draw_block_item_model_with_meta(held->id, held->damage, -0.5f, -0.5f, -0.5f);
+        glPopMatrix();
+    } else if (!stack_empty(held) && world_item_is_block_id(held->id) && tex_terrain.id) {
+        int tile = world_block_item_tile(held->id);
+        glPushMatrix();
+        glTranslatef(0.0f, -0.6f * (1.0f - equip), 0.0f);
+        float s = 0.8f;
+        glTranslatef(-swing_sqrt_sin * 0.4f,
+                     sinf(sqrtf(swing) * (float)M_PI * 2.0f) * 0.2f,
+                     -swing_sin * 0.2f);
+        glTranslatef(0.7f * s, -0.65f * s, -0.9f * s);
+        glRotatef(45.0f, 0.0f, 1.0f, 0.0f);
+        float swing_y = sinf(swing * swing * (float)M_PI);
+        glRotatef(-swing_y * 20.0f, 0.0f, 1.0f, 0.0f);
+        glRotatef(-swing_sqrt_sin * 20.0f, 0.0f, 0.0f, 1.0f);
+        glRotatef(-swing_sqrt_sin * 80.0f, 1.0f, 0.0f, 0.0f);
+        glScalef(0.40f, 0.40f, 0.40f);
+        draw_item3d_from_texture(&tex_terrain, tile);
+        glPopMatrix();
+    } else if (!stack_empty(held) && tex_items.id) {
+        /* Non-block first-person item branch, using uploaded source lk.java
+           lines 16-118 for the actual extruded item geometry. */
+        int tile = item_icon_tile(held->id);
+        glPushMatrix();
+        glTranslatef(0.0f, -0.6f * (1.0f - equip), 0.0f);
+        float s = 0.8f;
+        glTranslatef(-swing_sqrt_sin * 0.4f,
+                     sinf(sqrtf(swing) * (float)M_PI * 2.0f) * 0.2f,
+                     -swing_sin * 0.2f);
+        glTranslatef(0.7f * s, -0.65f * s, -0.9f * s);
+        glRotatef(45.0f, 0.0f, 1.0f, 0.0f);
+        float swing_y = sinf(swing * swing * (float)M_PI);
+        glRotatef(-swing_y * 20.0f, 0.0f, 1.0f, 0.0f);
+        glRotatef(-swing_sqrt_sin * 20.0f, 0.0f, 0.0f, 1.0f);
+        glRotatef(-swing_sqrt_sin * 80.0f, 1.0f, 0.0f, 0.0f);
+        glScalef(0.40f, 0.40f, 0.40f);
+        if (player_is_blocking_125() && held_is_sword(held->id)) {
+            /* ItemRenderer 1.2.5 EnumAction.block transform. */
+            glTranslatef(-0.5f, 0.2f, 0.0f);
+            glRotatef(30.0f, 0.0f, 1.0f, 0.0f);
+            glRotatef(-80.0f, 1.0f, 0.0f, 0.0f);
+            glRotatef(60.0f, 0.0f, 1.0f, 0.0f);
+        }
+        draw_item3d_from_atlas(tile);
+        glPopMatrix();
+    } else {
+        glBindTexture(GL_TEXTURE_2D, local_skin->id);
+        steve_set_texture_dims(local_skin);
+        glPushMatrix();
+        glTranslatef(0.0f, -0.6f * (1.0f - equip), 0.0f);
+        float s = 0.8f;
+        glTranslatef(-swing_sqrt_sin * 0.3f,
+                     sinf(sqrtf(swing) * (float)M_PI * 2.0f) * 0.4f,
+                     -swing_sin * 0.4f);
+        glTranslatef(0.8f * s, -0.75f * s, -0.9f * s);
+        glRotatef(45.0f, 0.0f, 1.0f, 0.0f);
+        glRotatef(swing_sqrt_sin * 70.0f, 0.0f, 1.0f, 0.0f);
+        glRotatef(-swing_sin * 20.0f, 0.0f, 0.0f, 1.0f);
+        glTranslatef(-1.0f, 3.6f, 3.5f);
+        glRotatef(120.0f, 0.0f, 0.0f, 1.0f);
+        glRotatef(200.0f, 1.0f, 0.0f, 0.0f);
+        glRotatef(-135.0f, 0.0f, 1.0f, 0.0f);
+        glTranslatef(5.6f, 0.0f, 0.0f);
+
+        /* ch.java::b(): render right arm at model scale 1/16. */
+        glColor4f(1,1,1,1);
+        steve_part(40, 16, -5, 2, 0, -3, -2, -2, 4, 12, 4, 0.0f, 0, 0.0f, 0.0f, 5.729578f);
+        glPopMatrix();
+    }
+
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glColor4f(1,1,1,1);
+}
+
+
+static int android_world_backdrop_can_cache(void) {
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    return g_screen == SCREEN_PAUSE || g_screen == SCREEN_ACHIEVEMENTS ||
+           g_screen == SCREEN_STATISTICS || g_screen == SCREEN_INVENTORY ||
+           g_screen == SCREEN_CREATIVE || g_screen == SCREEN_WORKBENCH ||
+           g_screen == SCREEN_FURNACE || g_screen == SCREEN_CHEST;
+#else
+    return 0;
+#endif
+}
+
+static void draw_ingame_world_view(int with_hand) {
+    int shader_frame = 0;
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+    if (g_opts.shaders) {
+        float sr=0.0f, sg=0.0f, sb=0.0f;
+        if (g_current_dimension == -1) { sr=0.10f; sg=0.01f; sb=0.01f; }
+        else if (g_current_dimension == 1) { sr=0.032f; sg=0.032f; sb=0.032f; }
+        else sky_color_at_time(g_frame_partial, &sr, &sg, &sb);
+        int held_id = stack_empty(&g_equipped_item) ? 0 : g_equipped_item.id;
+        int held_light = (held_id > 0 && world_item_is_block_id(held_id)) ? flat_block_light_value_for_id(held_id) : 0;
+        shader_frame = pex_shaders_begin_world(g_render_w, g_render_h, g_current_dimension, (int)(g_world_time % 24000LL),
+                                                g_frame_partial, g_player_x, render_eye_y(g_frame_partial), g_player_z,
+                                                flat_player_head_in_water(), held_id, held_light, sr, sg, sb,
+                                                world_sun_angle(g_frame_partial));
+    }
+#endif
+    int target_mode = 0;
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    target_mode = pex_android_tv_world_target_begin(g_opts.render_scale_percent,
+                                                     g_render_w, g_render_h,
+                                                     android_world_backdrop_can_cache());
+#endif
+    if (target_mode != 2) {
+        draw_sky_only();
+        draw_flat_test_world();
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+        if (shader_frame) { pex_shaders_copy_depth(2); pex_shaders_bind_hand(); }
+#endif
+        if (with_hand && !g_third_person_view) draw_first_person_hand();
+        if (!g_third_person_view) {
+            draw_player_fire_overlay_125();
+            draw_in_block_overlay();
+        }
+        draw_portal_overlay();
+#if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
+        if (shader_frame) pex_shaders_end_world();
+#endif
+    }
+#if defined(PEX_PLATFORM_ANDROID) || defined(PEX_PLATFORM_ANDROID_TV)
+    if (target_mode == 1) pex_android_tv_world_target_end(g_render_w, g_render_h);
+#endif
+    setup_gui_projection();
+}

@@ -1,0 +1,113 @@
+#ifndef PEXCRAFT_RENDERER_BACKEND_H
+#define PEXCRAFT_RENDERER_BACKEND_H
+
+#include <stdint.h>
+
+#ifndef PEX_RENDERER_MAX_TEXTURES
+#define PEX_RENDERER_MAX_TEXTURES 4096
+#endif
+#ifndef PEX_RENDERER_MAX_MESHES
+#define PEX_RENDERER_MAX_MESHES 65536
+#endif
+
+typedef uint32_t PexMeshHandle;
+typedef uint32_t PexTextureHandle;
+
+typedef struct PexVertex {
+    float x, y, z;
+    float u, v;
+    /* Packed as memory RGBA for D3D11 DXGI_FORMAT_R8G8B8A8_UNORM:
+       value = r | (g << 8) | (b << 16) | (a << 24). */
+    uint32_t color;
+    /* Java mixed brightness packed as (sky << 20) | (block << 4).
+       Backends that cannot apply the lightmap dynamically ignore this field and
+       receive a CPU-lit color at upload time. */
+    uint32_t light;
+    /* LIGHT Shaders compatibility attributes. They are ignored by legacy
+       backends, while the desktop OpenGL shader path exposes them as the
+       OptiFine mc_Entity/mc_midTexCoord/at_tangent inputs and lightmap UV. */
+    float light_u, light_v;
+    float normal_x, normal_y, normal_z;
+    float tangent_x, tangent_y, tangent_z, tangent_w;
+    float mid_u, mid_v;
+    float entity_id;
+} PexVertex;
+
+#if !((defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2))
+/* Non-desktop builds retain the legacy renderer. These compile-time stubs keep
+   the shared terrain mesh code source-compatible without linking the desktop
+   LIGHT shader runtime. */
+static int pex_shaders_active(void) { return 0; }
+static int pex_shaders_use_original_vertex_colors(void) { return 0; }
+static void pex_shaders_set_mesh_entity(float id) { (void)id; }
+static float pex_shaders_get_mesh_entity(void) { return 0.0f; }
+static void pex_shaders_terrain_array_pointers(const PexVertex *base, int vbo_bound) { (void)base; (void)vbo_bound; }
+static void pex_shaders_terrain_arrays_end(void) { }
+#endif
+
+typedef struct PexMesh {
+    const PexVertex *vertices;
+    const uint32_t *indices;
+    uint32_t vertex_count;
+    uint32_t index_count;
+    int dynamic;
+} PexMesh;
+
+typedef struct PexTextureDesc {
+    int width;
+    int height;
+    const uint32_t *rgba_pixels;
+    int repeat;
+    int nearest;
+} PexTextureDesc;
+
+typedef struct PexRenderState {
+    PexTextureHandle texture;
+    int texture_enabled;
+    int blend_enabled;
+    int alpha_test_enabled;
+    int depth_enabled;
+    int depth_write;
+    int fog_enabled;
+    float fog_start;
+    float fog_end;
+    uint32_t fog_color;
+    float modelview[16];
+    float projection[16];
+} PexRenderState;
+
+typedef struct PexRendererStats {
+    uint32_t draw_calls;
+    uint32_t triangles;
+    uint32_t buffer_uploads;
+    uint32_t texture_uploads;
+} PexRendererStats;
+
+typedef struct PexRendererBackend {
+    const char *name;
+    int  (*init)(void *window_handle, int width, int height);
+    void (*shutdown)(void);
+    void (*resize)(int width, int height);
+    int  (*begin_frame)(float r, float g, float b, float a);
+    void (*end_frame)(void);
+
+    PexTextureHandle (*create_texture)(const PexTextureDesc *desc);
+    void (*destroy_texture)(PexTextureHandle handle);
+    int  (*update_texture_region)(PexTextureHandle handle, int x, int y, int width, int height,
+                                  const uint32_t *rgba_pixels, int source_pitch_bytes);
+
+    PexMeshHandle (*upload_mesh)(const PexMesh *mesh);
+    int  (*update_mesh)(PexMeshHandle handle, const PexMesh *mesh);
+    void (*destroy_mesh)(PexMeshHandle handle);
+    void (*draw_mesh)(PexMeshHandle handle, const PexRenderState *state);
+
+    void (*draw_dynamic)(const PexMesh *mesh, const PexRenderState *state);
+    PexRendererStats (*get_stats)(void);
+} PexRendererBackend;
+
+static PexRendererBackend *renderer_d3d9_get_backend(void);
+static PexRendererBackend *renderer_d3d11_get_backend(void);
+static int renderer_d3d9_attach_device(void *dev, int width, int height);
+static int renderer_d3d11_attach_device(void *dev, void *ctx, int width, int height);
+
+#endif /* PEXCRAFT_RENDERER_BACKEND_H */
