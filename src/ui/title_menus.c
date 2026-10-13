@@ -1086,6 +1086,15 @@ static void pex_mp_draw_unknown_server_icon(int x,int y) {
 
 
 static void draw_multiplayer(void) {
+    if(PEX_LAN_SUPPORTED && pex_mp_server_mode_get()==0){
+        draw_default_bg();draw_centered_text("PexOfDuty LAN Games",g_gui_w/2,12,0xFFFFFF);
+        if(!g_lan_game_count){
+            draw_centered_text("Searching your local network...",g_gui_w/2,65,0xAAAAAA);
+            draw_centered_text("Host: Single Player -> Pause -> Open to LAN",g_gui_w/2,85,0xAAAAAA);
+        }
+        draw_centered_text(g_lan_status,g_gui_w/2,g_gui_h-52,0xAAAAAA);
+        draw_all_buttons();return;
+    }
     pex_mp_server_list_ensure();
     draw_default_bg();
 
@@ -1217,6 +1226,10 @@ static void draw_multiplayer(void) {
 
 static void draw_connecting_screen(void) {
     draw_default_bg();
+    if(pex_lan_client()){
+        draw_centered_text(g_lan_status,g_gui_w/2,g_gui_h/2-8,0xFFFFFF);
+        draw_all_buttons();return;
+    }
 
     int pct = g_mp_connect_progress;
     if (g_mp_expected_chunks > 0 && !g_mp_world_ready) pct = (g_mp_chunks_received * 100) / g_mp_expected_chunks;

@@ -925,6 +925,7 @@ typedef enum PexDamageEntityKind {
 } PexDamageEntityKind;
 
 typedef struct PexDamageSource {
+    int breach_atomic;
     PexDamageType type;
     const char *damage_type;
     int unblockable;
@@ -1111,6 +1112,11 @@ typedef struct PassiveMob {
     int breach_bot_ammo, breach_bot_reload, breach_bot_burst;
     int breach_bot_seen_ticks, breach_bot_memory, breach_bot_patrol;
     int breach_bot_flash;
+    int breach_remote_player; /* LAN human proxy: id+1, zero for an NPC */
+    int breach_atomic_hurt;
+    int breach_team; /* LAN red=0, blue=1 */
+    int breach_bot_reposition_ticks;
+    int breach_bot_recovery_ticks;
     float breach_bot_last_x, breach_bot_last_y, breach_bot_last_z;
     int entity_id;       /* stable runtime identity; array slots may be reused */
     int target_entity_id;/* 0=player, >0=mob entity id, -1=no target */
@@ -2611,6 +2617,7 @@ static float g_player_fall_distance = 0.0f;
 static int g_player_dead = 0;
 static int g_player_death_time = 0;
 static int g_player_hurt_time = 0;
+static int g_player_atomic_hurt=0;
 static int g_player_max_hurt_time = 10;
 static float g_player_attacked_at_yaw = 0.0f;
 static int g_suffocation_damage_timer = 0;
@@ -2980,6 +2987,9 @@ static Texture tex_font_glyph[256];
 static unsigned char font_glyph_widths[65536];
 static int font_glyph_widths_loaded = 0;
 static Texture tex_icons, tex_inventory, tex_allitems, tex_workbench, tex_furnace_gui, tex_chest_gui, tex_items, tex_achievement, tex_stat_slot, tex_steve, tex_xinput;
+static Texture tex_steve_default; /* independent NPC/unreceived-skin fallback */
+#define PEX_SHOT_LOCAL_VOLUME 0.28f
+#define PEX_SHOT_REMOTE_VOLUME 0.18f
 static Texture tex_armor[5][2];
 static Texture tex_mob_pig, tex_mob_sheep, tex_mob_sheep_fur, tex_mob_cow, tex_mob_chicken, tex_mob_saddle;
 static Texture tex_mob_creeper, tex_mob_creeper_power, tex_mob_skeleton, tex_mob_spider, tex_mob_spider_eyes, tex_mob_zombie, tex_mob_slime;
@@ -3142,6 +3152,28 @@ static int breach_map_read_spawn(const char *dir, float *x, float *y, float *z, 
 static int breach_map_pick_spawn(const char *dir, float *x, float *y, float *z, float *yaw);
 static float breach_bot_tick_ai(PassiveMob *mob, int in_liquid);
 static void breach_bots_update(void);
+static void breach_weapon_on_spawn(void);
+static int breach_weapon_select(int weapon);
+static int breach_weapon_current(void);
+static int breach_weapon_selected(void);
+static int breach_weapon_switch_available(void);
+static int breach_weapon_menu_available(void);
+static int breach_weapon_fire_rate(void);
+static int breach_weapon_damage(void);
+static int breach_weapon_magazine(void);
+static double breach_weapon_reload_seconds(int empty);
+enum { BREACH_WEAPON_MAC10=0, BREACH_WEAPON_M16=1, BREACH_WEAPON_ATOMIC=2, BREACH_WEAPON_COUNT=3 };
+#define BREACH_MAX_GUN_DROPS 64
+typedef struct BreachGunDrop { int32_t active,weapon; float x,y,z; uint32_t life; } BreachGunDrop;
+static BreachGunDrop g_breach_gun_drops[BREACH_MAX_GUN_DROPS];
+static void breach_drop_gun(float x,float y,float z,int weapon);
+static void breach_gun_drops_tick(void);
+static void breach_weapon_equip(int weapon);
+static int breach_gun_drop_hit(float x,float y,float z,float dx,float dy,float dz,float max_t,float *hit);
+static const char *breach_weapon_name(int weapon);
+static void breach_spawn_bullet_visual(float x,float y,float z,float dx,float dy,float dz,float range);
+/* Custom PexOfDuty LAN transport, separate from Minecraft client protocols. */
+#include "../platform/pex_lan.h"
 
 #if !defined(PEX_HAS_LEGACY_ASSET_MANAGER)
 /* Legacy asset manager stubs for platforms without the desktop SDL2 runtime HTTP asset UI. */

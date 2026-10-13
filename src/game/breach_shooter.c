@@ -1,16 +1,22 @@
-/* BLOCK / BREACH native PexCraft single-player adaptation.
- * No additional HUD is drawn. Only a Blockbench MAC-10 appears in the
+/* BLOCK / BREACH native PexCraft shooter adaptation.
+ * The selected Blockbench MAC-10 or M16 appears in first person.
  * first-person renderer. Hands use PexCraft's current skin GL texture.
  * libbbench supplies runtime model+animation data from the .bbmodel file. */
 #include "../libbbench/libbbench.h"
 
 #define BREACH_MAG_SIZE 32
-static BBModel *g_breach_model = NULL;
+typedef struct BreachWeaponAssets { BBModel *model; Texture texture[BB_MAX_TEXTURES]; int loaded; } BreachWeaponAssets;
+static BreachWeaponAssets g_breach_weapons[BREACH_WEAPON_COUNT];
+static int g_breach_equipped_weapon=BREACH_WEAPON_MAC10;
+static int g_breach_selected_weapon=BREACH_WEAPON_MAC10;
+static int g_breach_spawn_tick=0;
+#define g_breach_model (g_breach_weapons[g_breach_equipped_weapon].model)
+#define g_breach_texture (g_breach_weapons[g_breach_equipped_weapon].texture)
+#define g_breach_loaded (g_breach_weapons[g_breach_equipped_weapon].loaded)
 static BBPose *g_breach_pose = NULL;
 static BBPose *g_breach_other = NULL;
 static BBPose *g_breach_base = NULL;
-static Texture g_breach_texture[BB_MAX_TEXTURES];
-static int g_breach_loaded = 0, g_breach_ammo = BREACH_MAG_SIZE;
+static int g_breach_ammo = BREACH_MAG_SIZE;
 static double g_breach_reload_start = -1, g_breach_reload_end = -1;
 static double g_breach_last_shot = -100, g_breach_inspect_start = -1;
 static double g_breach_auto_fire_start = -1;
@@ -27,6 +33,99 @@ static float g_breach_ground_bob = 1.0f;
 static double g_breach_slide_end = -1;
 static float g_breach_aim = 0, g_breach_recoil = 0;
 static double g_breach_last_draw_time = -1;
+static int g_breach_replay_render;
+typedef struct BreachBulletVisual {float x,y,z,dx,dy,dz,range;double start;} BreachBulletVisual;
+static BreachBulletVisual g_breach_bullets[128];
+static unsigned g_breach_bullet_cursor;
+static void breach_spawn_bullet_visual(float x,float y,float z,float dx,float dy,float dz,float range) {
+    float length=sqrtf(dx*dx+dy*dy+dz*dz);if(length<.001f)return;
+    dx/=length;dy/=length;dz/=length;
+    for(float t=.25f;t<range;t+=.25f){
+        if(!passive_ray_clear_blocks_125(x,y,z,x+dx*t,y+dy*t,z+dz*t)){range=t;break;}
+    }
+    g_breach_bullets[g_breach_bullet_cursor++%128]=(BreachBulletVisual){x,y,z,dx,dy,dz,range,now_seconds()};
+}
+static void breach_draw_bullets(void) {
+    double now=now_seconds();glDisable(GL_TEXTURE_2D);glEnable(GL_DEPTH_TEST);glLineWidth(2);
+    glColor4f(1,.85f,.35f,1);glBegin(GL_LINES);
+    for(int i=0;i<128;++i){BreachBulletVisual *b=&g_breach_bullets[i];
+        if(b->range<=0)continue;float end=(float)(now-b->start)*180;
+        if(end<0||end>b->range+2)continue;
+        float head=fminf(end,b->range),tail=fmaxf(.3f,head-2);
+        glVertex3f(b->x+b->dx*tail,b->y+b->dy*tail,b->z+b->dz*tail);
+        glVertex3f(b->x+b->dx*head,b->y+b->dy*head,b->z+b->dz*head);
+    }
+    glEnd();glLineWidth(1);glEnable(GL_TEXTURE_2D);glColor4f(1,1,1,1);
+}
+
+static int breach_weapon_current(void) { return g_breach_equipped_weapon; }
+static int breach_weapon_selected(void) { return g_breach_selected_weapon; }
+static int breach_weapon_fire_rate(void) { return g_breach_equipped_weapon==BREACH_WEAPON_M16?7:11; }
+static int breach_weapon_damage(void) { return g_breach_equipped_weapon==BREACH_WEAPON_ATOMIC?8:g_breach_equipped_weapon==BREACH_WEAPON_M16?7:4; }
+static const char *breach_weapon_name(int weapon) {
+    return weapon==BREACH_WEAPON_ATOMIC?"MAC-10 - Atomic Star":weapon==BREACH_WEAPON_M16?"M16":"MAC-10";
+}
+static void breach_drop_gun(float x,float y,float z,int weapon) {
+    if(g_mp_connected||pex_lan_client()||!breach_weapon_menu_available()||pex_lan_waiting())return;
+    int slot=-1;
+    for(int i=0;i<BREACH_MAX_GUN_DROPS;++i)if(!g_breach_gun_drops[i].active){slot=i;break;}
+    if(slot<0){slot=0;for(int i=1;i<BREACH_MAX_GUN_DROPS;++i)if(g_breach_gun_drops[i].life<g_breach_gun_drops[slot].life)slot=i;}
+    if(weapon==BREACH_WEAPON_ATOMIC)weapon=BREACH_WEAPON_MAC10;
+    if(rand()%2==0)weapon=BREACH_WEAPON_ATOMIC;
+    g_breach_gun_drops[slot]=(BreachGunDrop){1,weapon,x,y+.8f,z,1800};
+}
+static void breach_gun_drops_tick(void) {
+    if(pex_lan_client())return;
+    for(int i=0;i<BREACH_MAX_GUN_DROPS;++i){BreachGunDrop *d=&g_breach_gun_drops[i];
+        if(d->active&&(!d->life||!--d->life))d->active=0;
+    }
+}
+/* Pickup is a shot interaction, not a collision or a second damage event. */
+static int breach_gun_drop_hit(float x,float y,float z,float dx,float dy,float dz,float max_t,float *hit) {
+    int slot=-1;float nearest=max_t;
+    for(int i=0;i<BREACH_MAX_GUN_DROPS;++i){BreachGunDrop *d=&g_breach_gun_drops[i];if(!d->active)continue;
+        float rx=d->x-x,ry=d->y-y,rz=d->z-z;if(rx*rx+ry*ry+rz*rz>3.5f*3.5f)continue;
+        FlatAABB box={d->x-.35f,d->y-.35f,d->z-.35f,d->x+.35f,d->y+.35f,d->z+.35f};float t;
+        if(!passive_ray_intersect_aabb(&box,x,y,z,dx,dy,dz,nearest,&t))continue;
+        if(!passive_ray_clear_blocks_125(x,y,z,x+dx*t,y+dy*t,z+dz*t))continue;
+        slot=i;nearest=t;
+    }
+    if(slot>=0&&hit)*hit=nearest;return slot;
+}
+static double breach_weapon_reload_seconds(int empty) {
+    if(g_breach_equipped_weapon==BREACH_WEAPON_M16)return empty?2.8:2.1;
+    return empty?1.5:1.125;
+}
+static int breach_weapon_switch_available(void) {
+    return !g_player_dead && (unsigned)(g_ingame_ticks-g_breach_spawn_tick)<400u;
+}
+static int breach_weapon_menu_available(void) {
+    return !g_mp_connected && g_loaded_world_dir[0] &&
+           breach_map_read_spawn(g_loaded_world_dir,NULL,NULL,NULL,NULL);
+}
+static int breach_weapon_magazine_size(int weapon) { return weapon==BREACH_WEAPON_M16?30:BREACH_MAG_SIZE; }
+static void breach_weapon_equip(int weapon) {
+    if(weapon<0||weapon>=BREACH_WEAPON_COUNT)return;
+    g_breach_equipped_weapon=weapon;
+    g_breach_ammo=breach_weapon_magazine_size(g_breach_equipped_weapon);
+    g_breach_reload_start=g_breach_reload_end=-1;g_breach_inspecting=0;
+    g_breach_aim=0;g_breach_recoil=0;g_breach_auto_fire_start=-1;g_breach_last_shot=-100;
+}
+static void breach_weapon_equip_selected(void) {
+    if(g_breach_selected_weapon!=BREACH_WEAPON_MAC10&&g_breach_selected_weapon!=BREACH_WEAPON_M16)g_breach_selected_weapon=BREACH_WEAPON_MAC10;
+    breach_weapon_equip(g_breach_selected_weapon);
+}
+static void breach_weapon_on_spawn(void) {
+    g_breach_spawn_tick=g_ingame_ticks;breach_weapon_equip_selected();
+}
+static int breach_weapon_select(int weapon) {
+    if(weapon<0||weapon>BREACH_WEAPON_M16)return 0;
+    g_breach_selected_weapon=weapon;
+    if(breach_weapon_switch_available()){
+        breach_weapon_equip_selected();hud_add_chat(weapon==BREACH_WEAPON_M16?"Equipped M16":"Equipped MAC-10");
+    }else hud_add_chat(weapon==BREACH_WEAPON_M16?"M16 selected; it equips on respawn":"MAC-10 selected; it equips on respawn");
+    return 1;
+}
 
 static int breach_active(void) {
     return g_screen == SCREEN_INGAME && !g_mp_connected && !g_player_dead;
@@ -44,17 +143,18 @@ static void breach_play_shot_sound(int rapid) {
     };
     for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
         if (file_exists(paths[i])) {
-            pex_sound_play_file_direct(paths[i], 0.9f, 1.0f);
+            pex_sound_play_file_direct(paths[i], PEX_SHOT_LOCAL_VOLUME, 1.0f);
             return;
         }
     }
 }
 
 static void breach_start_reload(double now) {
-    if (g_breach_reload_end >= 0 || g_breach_ammo >= BREACH_MAG_SIZE) return;
+    if (g_breach_reload_end >= 0 || g_breach_ammo >= breach_weapon_magazine_size(g_breach_equipped_weapon)) return;
     g_breach_reload_start = now;
-    g_breach_reload_end = now + (g_breach_ammo ? 1.125 : 1.5);
+    g_breach_reload_end = now + breach_weapon_reload_seconds(g_breach_ammo<=0);
     g_breach_inspecting = 0;
+    pex_lan_reload();
 }
 
 /* Loads the model once when first opening a local world. Source PNGs are
@@ -63,18 +163,16 @@ static void breach_load(void) {
     if(g_breach_loaded) return;
     g_breach_loaded = 1;
     g_breach_model = (BBModel*)calloc(1,sizeof(BBModel));
-    g_breach_pose=(BBPose*)malloc(sizeof(BBPose));
-    g_breach_other=(BBPose*)malloc(sizeof(BBPose));
-    g_breach_base=(BBPose*)malloc(sizeof(BBPose));
+    if(!g_breach_pose)g_breach_pose=(BBPose*)malloc(sizeof(BBPose));
+    if(!g_breach_other)g_breach_other=(BBPose*)malloc(sizeof(BBPose));
+    if(!g_breach_base)g_breach_base=(BBPose*)malloc(sizeof(BBPose));
     if(!g_breach_model || !g_breach_pose || !g_breach_other || !g_breach_base)return;
-    const char *paths[]={
-        "src/assets/bbench/mac-10.bbmodel",
-        "assets/bbench/mac-10.bbmodel",
-        "bbench/mac-10.bbmodel",
-        "mac-10.bbmodel"
-    };
+    const char *mac_paths[]={"src/assets/bbench/mac-10.bbmodel","assets/bbench/mac-10.bbmodel","bbench/mac-10.bbmodel","mac-10.bbmodel"};
+    const char *m16_paths[]={"src/assets/bbench/m16.bbmodel","assets/bbench/m16.bbmodel","bbench/m16.bbmodel","m16.bbmodel"};
+    const char *atomic_paths[]={"src/assets/bbench/mac10_legend.bbmodel","assets/bbench/mac10_legend.bbmodel","bbench/mac10_legend.bbmodel","mac10_legend.bbmodel"};
+    const char **paths=g_breach_equipped_weapon==BREACH_WEAPON_ATOMIC?atomic_paths:g_breach_equipped_weapon==BREACH_WEAPON_M16?m16_paths:mac_paths;
     int ok=0;
-    for(size_t i=0;i<sizeof(paths)/sizeof(paths[0]);i++){
+    for(size_t i=0;i<4;i++){
         if(bb_load_file(g_breach_model,paths[i])){ok=1;break;}
     }
     if(!ok){pex_logf("BLOCK/BREACH: .bbmodel not found; place it in assets/bbench");return;}
@@ -103,16 +201,20 @@ static void breach_load(void) {
 /* Hitscan only damages zombies. Hip-fire is inaccurate; ADS tightens spread.
  * This path calls existing native PexCraft mob hit/hurt/death handlers. */
 static void breach_fire(double now) {
+    if(pex_lan_waiting())return;
     if(g_breach_ammo<=0 || g_breach_reload_end>=0 || g_breach_inspecting)return;
-    if(now-g_breach_last_shot<0.09)return;
+    if(now-g_breach_last_shot<1.0/(double)breach_weapon_fire_rate())return;
     g_breach_last_shot=now;
     --g_breach_ammo;
     g_breach_recoil=fminf(1.6f,g_breach_recoil+0.65f);
     /* Exactly one playback request per accepted bullet, never a timed loop. */
     breach_play_shot_sound(g_breach_fire_was_down && key_down_vk(VK_LBUTTON));
+    pex_lan_shot();
     float dx=0,dy=0,dz=-1;
     pex_touch_aware_look_vector(&dx,&dy,&dz);
-    float spread=(0.065f*(1.0f-g_breach_aim)+0.0065f*g_breach_aim);
+    float spread=g_breach_equipped_weapon==BREACH_WEAPON_M16?
+        (0.040f*(1.0f-g_breach_aim)+0.002f*g_breach_aim):
+        (0.065f*(1.0f-g_breach_aim)+0.0065f*g_breach_aim);
     float move=sqrtf(g_player_motion_x*g_player_motion_x+g_player_motion_z*g_player_motion_z);
     spread*=1.0f+fminf(move*2.0f,1.5f)+(g_player_on_ground?0.0f:1.0f);
     dx+=(pex_rand_float01()-pex_rand_float01())*spread;
@@ -120,6 +222,9 @@ static void breach_fire(double now) {
     dz+=(pex_rand_float01()-pex_rand_float01())*spread;
     float len=sqrtf(dx*dx+dy*dy+dz*dz);
     if(len>0.0001f){dx/=len;dy/=len;dz/=len;}
+    if(pex_lan_client()){
+        breach_spawn_bullet_visual(g_player_x,g_player_y-.08f,g_player_z,dx,dy,dz,48);return;
+    }
     PassiveMob *target=NULL;
     float best_t=48.0f;
     for(int i=0;i<MAX_PASSIVE_MOBS;i++){
@@ -132,15 +237,29 @@ static void breach_fire(double now) {
                 g_player_x+dx*t,g_player_y+dy*t,g_player_z+dz*t))continue;
         if(t>=0 && t<best_t){best_t=t;target=m;}
     }
+    float pickup_t=best_t;int pickup=breach_gun_drop_hit(g_player_x,g_player_y,g_player_z,dx,dy,dz,best_t,&pickup_t);
+    if(pickup>=0){
+        BreachGunDrop *d=&g_breach_gun_drops[pickup];int weapon=d->weapon;d->active=0;
+        breach_spawn_bullet_visual(g_player_x,g_player_y-.08f,g_player_z,dx,dy,dz,pickup_t);
+        breach_weapon_equip(weapon);char line[96];snprintf(line,sizeof(line),"Picked up %s",breach_weapon_name(weapon));hud_add_chat(line);return;
+    }
+    breach_spawn_bullet_visual(g_player_x,g_player_y-.08f,g_player_z,dx,dy,dz,best_t);
     if(target){
         PexDamageSource s=pex_damage_source_simple(PEX_DAMAGE_ARROW);
+        s.damage_type="bullet";
+        s.breach_atomic=g_breach_equipped_weapon==BREACH_WEAPON_ATOMIC;
         s.true_kind=PEX_DAMAGE_ENTITY_PLAYER;
         s.true_x=g_player_x;s.true_y=g_player_y;s.true_z=g_player_z;
-        pex_mob_attack_entity_from(target,s,7);
+        if(pex_lan_friendly(target))return;
+        int damage=breach_weapon_damage();
+        if(!target->breach_remote_player || !pex_lan_hit_human(target->breach_remote_player-1,damage,&s))
+            pex_mob_attack_entity_from(target,s,damage);
     }
 }
 
 static void breach_spawn_zombies(void) {
+    if(pex_lan_active())return; /* team deathmatch has no zombie wave */
+    if(pex_lan_client())return;
     int zombies=0;
     for(int i=0;i<MAX_PASSIVE_MOBS;i++){
         PassiveMob *m=&g_passive_mobs[i];
@@ -184,7 +303,7 @@ static void breach_update_game(void) {
     if(!g_player_dead && !g_mp_connected)breach_spawn_zombies();
     breach_bots_update();
     if(g_breach_reload_end>=0 && now>=g_breach_reload_end){
-        g_breach_ammo=BREACH_MAG_SIZE;
+        g_breach_ammo=breach_weapon_magazine_size(g_breach_equipped_weapon);
         g_breach_reload_end=-1;
     }
     int inspecting=key_down_vk('I');
@@ -292,7 +411,7 @@ static void breach_render_bones(const BBModel *m,const BBPose *pose,const BBCube
     breach_rotate3(cube->rotation);
 }
 static void breach_draw_first_person(void){
-    if(!breach_active())return;
+    if(!breach_active()&&!g_breach_replay_render)return;
     breach_load();
     if(!g_breach_model || !g_breach_model->cube_count || !g_breach_pose || !g_breach_other || !g_breach_base)return;
     double now=now_seconds();
@@ -330,11 +449,13 @@ static void breach_draw_first_person(void){
     float ads_target=key_down_vk(VK_RBUTTON) &&
                      !g_breach_inspecting && g_breach_reload_end<0?1:0;
     float amt=fminf(1.0f,dt*10.0f);
-    g_breach_aim+=(ads_target-g_breach_aim)*amt;
-    g_breach_recoil=fmaxf(0,g_breach_recoil-dt*5.0f);
+    if(!g_breach_replay_render){
+        g_breach_aim+=(ads_target-g_breach_aim)*amt;
+        g_breach_recoil=fmaxf(0,g_breach_recoil-dt*5.0f);
+    }
 
     BBModel *m=g_breach_model;
-    int idle=bb_find_clip(m,"draw");
+    int idle=bb_find_clip(m,g_breach_equipped_weapon==BREACH_WEAPON_M16?"idle":"draw");
     float ilen=idle>=0?m->clips[idle].length:0;
     bb_sample_pose(m,idle,ilen,g_breach_base);
     memcpy(g_breach_pose,g_breach_base,sizeof(BBPose));
@@ -348,11 +469,14 @@ static void breach_draw_first_person(void){
     int which=-1;float t=0;
     if(g_breach_reload_end>=0){
         which=bb_find_clip(m,g_breach_ammo?"reload":"reload_empty");
+        if(which<0)which=bb_find_clip(m,"reload");
         t=(float)(now-g_breach_reload_start);
+        if(which>=0&&m->clips[which].length>0&&g_breach_reload_end>g_breach_reload_start)
+            t*=m->clips[which].length/(float)(g_breach_reload_end-g_breach_reload_start);
     }else if(g_breach_inspecting){
         which=bb_find_clip(m,"inspect");
         t=(float)(now-g_breach_inspect_start);
-    }else if(g_breach_auto_fire_start>=0 && key_down_vk(VK_LBUTTON)){
+    }else if(g_breach_auto_fire_start>=0 && !g_breach_replay_render && key_down_vk(VK_LBUTTON)){
         which=bb_find_clip(m,"auto_fire");
         t=(float)(now-g_breach_auto_fire_start);
     }else if(now-g_breach_last_shot<0.5){
@@ -372,8 +496,8 @@ static void breach_draw_first_person(void){
     gluPerspective(50.0-3.0*(double)g_breach_aim,aspect,0.025,60.0);
     glMatrixMode(GL_MODELVIEW);glLoadIdentity();
     glClear(GL_DEPTH_BUFFER_BIT);
-    glRotatef(4.91f,1,0,0);
-    glRotatef(1.23f,0,1,0);
+    glRotatef(4.91f*(1-g_breach_aim),1,0,0);
+    glRotatef(1.23f*(1-g_breach_aim),0,1,0);
     glTranslatef(0.112f,-0.533f,-1.035f);
     float hipfire=1.0f-g_breach_aim;
     float sprint=g_breach_sprint_amount;
@@ -394,13 +518,14 @@ static void breach_draw_first_person(void){
                      sprint*0.035f*hipfire-slide*0.035f*hipfire-g_breach_recoil*0.012f,0);
     glRotatef(sinf(walk)*1.2f*run_bob+slide*4.0f*hipfire+sprint*(1.5f*bob+2.0f)*hipfire,0,0,1);
     glRotatef(-g_breach_sway_yaw*sway_weight,0,1,0);
-    glRotatef(-g_breach_recoil*4.0f-g_breach_sway_pitch*sway_weight-sprint*1.5f*hipfire,1,0,0);
+    glRotatef(-g_breach_recoil*(4.0f-3.0f*g_breach_aim)-g_breach_sway_pitch*sway_weight-sprint*1.5f*hipfire,1,0,0);
     glEnable(GL_TEXTURE_2D);
     glEnable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
     glColor4f(1,1,1,1);
     Texture *skin=pex_java47_local_skin_texture();
+    if(g_breach_replay_render)skin=pex_lan_skin_texture(g_lan_killcam_killer_bot?-1:g_lan_killcam_killer_id);
     if(!skin || !skin->id)skin=&tex_steve;
     for(int i=0;i<m->cube_count;i++){
         const BBCube *c=&m->cubes[i];if(!c->visible)continue;

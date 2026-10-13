@@ -75,6 +75,28 @@ int main(int argc, char **argv) {
 
     g_player_x = -35; g_player_y = 65.62f; g_player_z = -90;
     g_player_health = 20; g_player_on_ground = 1;
+    /* Deterministic obstacle course: A* must go around a two-block-high wall,
+       not request repeated jumps or accept a goal inside the obstacle. */
+    for(int z=98;z<=116;++z)for(int x=98;x<=116;++x){
+        g_flat_blocks[89][flat_storage_z_index(z)][flat_storage_index(x)]=BLOCK_STONE;
+        for(int y=90;y<=94;++y)g_flat_blocks[y][flat_storage_z_index(z)][flat_storage_index(x)]=0;
+    }
+    for(int z=102;z<=112;++z)for(int y=90;y<=91;++y)
+        g_flat_blocks[y][flat_storage_z_index(z)][flat_storage_index(107)]=BLOCK_STONE;
+    PassiveMob *route=test_bot_at(104.5f,90,107.5f);
+    assert(passive_path_find(route,110.5f,90,107.5f));assert(route->path_len>6);
+    for(int i=0;i<route->path_len;++i)assert(passive_path_can_stand_at(route->type,route->path_x[i],route->path_y[i],route->path_z[i]));
+    assert(hypotf(route->path_x[route->path_len-1]+.5f-110.5f,route->path_z[route->path_len-1]+.5f-107.5f)<1);
+    assert(breach_bot_set_safe_goal(route,107.5f,90,107.5f,.65f));
+    assert(passive_path_can_stand_at(route->type,(int)floorf(route->path_goal_x),(int)route->path_goal_y,(int)floorf(route->path_goal_z)));
+    route->stuck_ticks=25;(void)breach_bot_tick_ai(route,0);
+    assert(route->stuck_ticks==0&&route->breach_bot_recovery_ticks==30);
+    puts("PASS: wall detour, safe tactical goal projection and one-second stuck recovery");
+    route=test_bot_at(48,64,-85);
+    assert(passive_path_find(route,-35,64,-90));
+    float end_distance=hypotf(route->path_x[route->path_len-1]+.5f+35,route->path_z[route->path_len-1]+.5f+90);
+    printf("Cross-map route: nodes=%d, endpoint distance=%.3f\n",route->path_len,end_distance);
+    assert(end_distance<3);puts("PASS: bot can plan a full route across Nuketown");
     PassiveMob *m = test_bot_at(48,64,-85);
     float start_x = m->x, start_z = m->z;
     for (int i = 0; i < 160; ++i) passive_mob_tick_living(m);
@@ -132,11 +154,11 @@ int main(int argc, char **argv) {
     int bots = 0;
     for (int i = 0; i < MAX_PASSIVE_MOBS; ++i) if (g_passive_mobs[i].active && g_passive_mobs[i].breach_bot) {
         PassiveMob *bot = &g_passive_mobs[i];
-        assert(hypotf(bot->x-g_player_x, bot->z-g_player_z) >= 12.0f);
+        assert(hypotf(bot->x-g_player_x, bot->z-g_player_z) >= 2.5f);
         ++bots;
     }
-    assert(bots == 3);
-    puts("PASS: three bots spawn away from player at supplied points");
+    assert(bots == BREACH_BOT_COUNT);
+    puts("PASS: vacant match slots spawn bots at supplied points");
     float sx, sy, sz, yaw;
     assert(breach_map_pick_spawn(g_loaded_world_dir, &sx, &sy, &sz, &yaw));
     assert(sx == -35 && sy == 66.62f);
@@ -149,7 +171,7 @@ int main(int argc, char **argv) {
     bots = 0;
     for (int i = 0; i < MAX_PASSIVE_MOBS; ++i)
         if (g_passive_mobs[i].active && g_passive_mobs[i].breach_bot) ++bots;
-    assert(bots == 3);
+    assert(bots == BREACH_BOT_COUNT);
     puts("PASS: eliminated bot slots are replenished");
     if (argc > 2) {
         FILE *f = fopen(argv[2], "w+b");

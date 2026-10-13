@@ -1196,6 +1196,17 @@ static void rebuild_screen(void) {
         add_button_full(0, g_gui_w / 2 - 155 + 0, g_gui_h / 6 + 96, 150, 20, tr_key_default("gui.yes", "Yes"), BUTTON_NORMAL);
         add_button_full(1, g_gui_w / 2 - 155 + 160, g_gui_h / 6 + 96, 150, 20, tr_key_default("gui.no", "No"), BUTTON_NORMAL);
     } else if (g_screen == SCREEN_MULTIPLAYER) {
+        if(PEX_LAN_SUPPORTED && pex_mp_server_mode_get()==0){
+            int rows=(g_gui_h-100)/36;if(rows>8)rows=8;
+            for(int i=0;i<g_lan_game_count&&i<rows;++i){
+                char label[160];snprintf(label,sizeof(label),"%.24s - %d/6 humans",g_lan_games[i].name,g_lan_games[i].humans);
+                Button *join=add_button_full(7000+i,g_gui_w/2-152,44+i*36,305,30,label,BUTTON_NORMAL);
+                join->enabled=g_lan_games[i].humans<6;
+            }
+            add_button_full(8,g_gui_w/2-154,g_gui_h-28,98,20,"Refresh LAN",BUTTON_NORMAL);
+            add_button_full(4,g_gui_w/2-50,g_gui_h-28,98,20,"Direct LAN IP",BUTTON_NORMAL);
+            add_button_full(1,g_gui_w/2+54,g_gui_h-28,98,20,"Back",BUTTON_NORMAL);
+        }else{
         pex_mp_server_list_ensure();
         if (pex_mp_server_mode_get() == 0) {
             int visible_rows = pex_mp_server_visible_rows();
@@ -1245,6 +1256,7 @@ static void rebuild_screen(void) {
             add_button_full(1, g_gui_w / 2 - 100, g_gui_h / 4 + 120, 200, 20,
                             tr_key_default("gui.cancel", "Cancel"), BUTTON_NORMAL);
         }
+        }
     } else if (g_screen == SCREEN_CONNECTING) {
         add_button(0, g_gui_w / 2 - 100, g_gui_h / 4 + 120 + 12, tr_key_default("gui.cancel", "Cancel"));
     } else if (g_screen == SCREEN_TEXPACK_INSTALL) {
@@ -1259,12 +1271,28 @@ static void rebuild_screen(void) {
 #endif
         add_button_full(6, g_gui_w / 2 + 4, g_gui_h - 48, 150, 20, tr_key_default("gui.done", "Done"), BUTTON_NORMAL);
     } else if (g_screen == SCREEN_PAUSE) {
+        if(pex_lan_waiting()){
+            Button *red=add_button_full(7100,g_gui_w/2-154,g_gui_h-100,150,20,"Join Red",BUTTON_NORMAL);
+            Button *blue=add_button_full(7101,g_gui_w/2+4,g_gui_h-100,150,20,"Join Blue",BUTTON_NORMAL);
+            red->enabled=g_lan_phase==0&&pex_lan_team_count(0)<3;
+            blue->enabled=g_lan_phase==0&&pex_lan_team_count(1)<3;
+            if(pex_lan_host())add_button_full(7103,g_gui_w/2-100,g_gui_h-76,200,20,g_lan_bots_enabled?"Bots: ON (click to disable)":"Bots: OFF (click to enable)",BUTTON_NORMAL);
+            Button *start=add_button_full(7102,g_gui_w/2-100,g_gui_h-52,200,20,pex_lan_host()?"Start match":"Waiting for host",BUTTON_NORMAL);
+            start->enabled=pex_lan_host()&&g_lan_phase==0;
+            add_button_full(1,g_gui_w/2-100,g_gui_h-28,200,20,"Leave room",BUTTON_NORMAL);
+            return;
+        }
         /* Exact GuiIngameMenu 1.2.5 placement (the original var1 offset is -16). */
         add_button(4, g_gui_w / 2 - 100, g_gui_h / 4 + 8, tr_key_default("menu.returnToGame", "Back to game"));
         add_button_full(5, g_gui_w / 2 - 100, g_gui_h / 4 + 32, 98, 20, tr_key_default("gui.achievements", "Achievements"), BUTTON_NORMAL);
         add_button_full(6, g_gui_w / 2 + 2, g_gui_h / 4 + 32, 98, 20, tr_key_default("gui.stats", "Statistics"), BUTTON_NORMAL);
+        if(PEX_LAN_SUPPORTED){
+            Button *lan=add_button_full(7,g_gui_w/2-100,g_gui_h/4+56,200,20,
+                pex_lan_host()?"Close LAN":pex_lan_client()?"Connected to LAN":"Open to LAN",BUTTON_NORMAL);
+            lan->enabled=!pex_lan_client()&&!g_mp_connected&&breach_map_read_spawn(g_loaded_world_dir,NULL,NULL,NULL,NULL);
+        }
         add_button(0, g_gui_w / 2 - 100, g_gui_h / 4 + 80, tr_key_default("menu.options", "Options..."));
-        add_button(1, g_gui_w / 2 - 100, g_gui_h / 4 + 104, g_mp_connected ? tr_key_default("menu.disconnect", "Disconnect") : tr_key_default("menu.returnToMenu", "Save and quit to title"));
+        add_button(1, g_gui_w / 2 - 100, g_gui_h / 4 + 104, (g_mp_connected||pex_lan_client()) ? tr_key_default("menu.disconnect", "Disconnect") : tr_key_default("menu.returnToMenu", "Save and quit to title"));
     } else if (g_screen == SCREEN_ACHIEVEMENTS) {
         add_button_full(1, g_gui_w / 2 + 24, g_gui_h / 2 + 74, 80, 20, tr_key_default("gui.done", "Done"), BUTTON_NORMAL);
     } else if (g_screen == SCREEN_STATISTICS) {
@@ -1276,8 +1304,12 @@ static void rebuild_screen(void) {
     } else if (g_screen == SCREEN_CREATIVE) {
         /* Java 1.2.5 GuiContainerCreative has no Prev/Next/Done buttons. */
     } else if (g_screen == SCREEN_DEATH) {
-        add_button(1, g_gui_w / 2 - 100, g_gui_h / 4 + 72, tr_key_default("deathScreen.respawn", "Respawn"));
-        add_button(2, g_gui_w / 2 - 100, g_gui_h / 4 + 96, tr_key_default("deathScreen.titleScreen", "Title menu"));
+        if(pex_lan_active()&&g_lan_killcam_active){
+            if(g_lan_killcam_skip_allowed)add_button_full(3,g_gui_w-104,g_gui_h-32,96,20,"Skip",BUTTON_NORMAL);
+        }else{
+            add_button(1, g_gui_w / 2 - 100, g_gui_h / 4 + 72, tr_key_default("deathScreen.respawn", "Respawn"));
+            add_button(2, g_gui_w / 2 - 100, g_gui_h / 4 + 96, tr_key_default("deathScreen.titleScreen", "Title menu"));
+        }
     } else if (g_screen == SCREEN_NOTICE) {
         add_button(0, g_gui_w / 2 - 100, g_gui_h / 4 + 120 + 12, tr_key_default("menu.returnToMenu", "Back to title screen"));
     } else if (g_screen == SCREEN_RENDERER_RESTART_PROMPT) {
@@ -1577,6 +1609,17 @@ static void on_button(Button *b) {
         g_pending_world_name[0] = 0;
         set_screen(SCREEN_WORLD_SELECT);
     } else if (g_screen == SCREEN_MULTIPLAYER) {
+        if(PEX_LAN_SUPPORTED && pex_mp_server_mode_get()==0){
+            if(b->id>=7000&&b->id<7008){if(!pex_lan_join(b->id-7000))open_notice("LAN connection failed","Could not join this LAN host.","");}
+            else if(b->id==1)set_screen(g_parent_screen);
+            else if(b->id==8){g_lan_game_count=0;snprintf(g_lan_status,sizeof(g_lan_status),"Searching for PexOfDuty LAN games...");rebuild_screen();}
+            else if(b->id==4){pex_mp_server_begin_direct();rebuild_screen();}
+            return;
+        }
+        if(PEX_LAN_SUPPORTED && pex_mp_server_mode_get()==1 && b->id==10){
+            if(!pex_lan_join_address(pex_mp_server_edit_address_get()))open_notice("LAN connection failed","Use an IPv4 address and the host's port, e.g. 192.168.1.5:51000.","");
+            return;
+        }
         if (b->id >= PEX_MP_SERVER_ROW_BASE && b->id < PEX_MP_SERVER_ROW_BASE + PEX_MP_SERVER_LIST_MAX) {
             int idx = b->id - PEX_MP_SERVER_ROW_BASE;
             int activate = pex_mp_server_select_or_double_click(idx);
@@ -1646,6 +1689,7 @@ static void on_button(Button *b) {
             }
         }
     } else if (g_screen == SCREEN_CONNECTING) {
+        if(pex_lan_client()){pex_lan_stop();set_screen(SCREEN_MULTIPLAYER);return;}
         pex_net_disconnect();
         pex_net_set_status("Canceled.");
         set_screen(SCREEN_MULTIPLAYER);
@@ -1660,11 +1704,23 @@ static void on_button(Button *b) {
 #endif
         } else if (b->id == 6) set_screen(g_parent_screen);
     } else if (g_screen == SCREEN_PAUSE) {
+        if(pex_lan_waiting()){
+            if(b->id==7100||b->id==7101)pex_lan_choose_team(b->id-7100);
+            else if(b->id==7102)pex_lan_start_match();
+            else if(b->id==7103)pex_lan_toggle_bots();
+            else if(b->id==1)leave_world_to_title();
+            return;
+        }
         if (b->id == 4) set_screen(SCREEN_INGAME);
         else if (b->id == 0) { g_parent_screen = SCREEN_PAUSE; set_screen(SCREEN_OPTIONS); }
         else if (b->id == 1) leave_world_to_title();
         else if (b->id == 5) set_screen(SCREEN_ACHIEVEMENTS);
         else if (b->id == 6) set_screen(SCREEN_STATISTICS);
+        else if (b->id == 7) {
+            if(pex_lan_host()){pex_lan_stop();set_screen(SCREEN_INGAME);}
+            else if(pex_lan_open())set_screen(SCREEN_PAUSE);
+            else {hud_add_chat(g_lan_status);set_screen(SCREEN_PAUSE);}
+        }
     } else if (g_screen == SCREEN_ACHIEVEMENTS) {
         if (b->id == 1) set_screen(SCREEN_INGAME);
     } else if (g_screen == SCREEN_STATISTICS) {
@@ -1673,7 +1729,8 @@ static void on_button(Button *b) {
     } else if (g_screen == SCREEN_CREATIVE) {
         (void)b;
     } else if (g_screen == SCREEN_DEATH) {
-        if (b->id == 1) player_respawn();
+        if (b->id == 3) pex_lan_killcam_skip();
+        else if (b->id == 1) player_respawn();
         else if (b->id == 2) leave_world_to_title();
     } else if (g_screen == SCREEN_NOTICE) {
         set_screen(SCREEN_TITLE);
@@ -1886,6 +1943,13 @@ static void mouse_down(int mx, int my) {
         }
     }
     if (g_screen == SCREEN_CREATIVE) { creative_mouse_click(mx, my, 0); return; }
+    if(g_screen==SCREEN_INVENTORY&&breach_weapon_menu_available()){
+        int x=(g_gui_w-176)/2,y=(g_gui_h-166)/2,gx=x+180;if(gx+64>g_gui_w-2)gx=g_gui_w-66;
+        if(mx>=gx&&mx<gx+60){
+            if(my>=y+36&&my<y+52){(void)breach_weapon_select(0);return;}
+            if(my>=y+54&&my<y+70){(void)breach_weapon_select(1);return;}
+        }
+    }
     if (g_screen == SCREEN_INVENTORY || g_screen == SCREEN_WORKBENCH || g_screen == SCREEN_FURNACE || g_screen == SCREEN_CHEST) { inventory_mouse_click(mx, my, 0); return; }
     if (g_screen == SCREEN_INGAME) {
         set_mouse_grabbed(1);
@@ -2474,7 +2538,7 @@ static void handle_keydown(WPARAM vk) {
 
     if (vk == VK_ESCAPE) {
         if (g_screen == SCREEN_TITLE || g_screen == SCREEN_GENERATING || g_screen == SCREEN_SAVING_QUIT || g_screen == SCREEN_TEXPACK_INSTALL) { if (g_screen == SCREEN_TEXPACK_INSTALL) pack_install_request_cancel(); return; }
-        if (g_screen == SCREEN_PAUSE) set_screen(SCREEN_INGAME);
+        if (g_screen == SCREEN_PAUSE) { if(!pex_lan_waiting())set_screen(SCREEN_INGAME); }
         else if (g_screen == SCREEN_ACHIEVEMENTS) set_screen(SCREEN_INGAME);
         else if (g_screen == SCREEN_STATISTICS) set_screen(SCREEN_PAUSE);
         else if (g_screen == SCREEN_OPTIONS) set_screen(g_parent_screen);
@@ -2498,7 +2562,7 @@ static void handle_keydown(WPARAM vk) {
             if (pex_mp_server_mode_get() != 0) { pex_mp_server_cancel_edit(); rebuild_screen(); }
             else set_screen(g_parent_screen);
         }
-        else if (g_screen == SCREEN_CONNECTING) { pex_net_disconnect(); set_screen(SCREEN_MULTIPLAYER); }
+        else if (g_screen == SCREEN_CONNECTING) { pex_lan_stop(); pex_net_disconnect(); set_screen(SCREEN_MULTIPLAYER); }
         else if (g_screen == SCREEN_TEXPACK) set_screen(g_parent_screen);
         else if (g_screen == SCREEN_NOTICE) set_screen(SCREEN_TITLE);
         else if (g_screen == SCREEN_CLASSIC_PACK_DOWNLOAD_PROMPT) {
@@ -2534,6 +2598,13 @@ static void handle_keydown(WPARAM vk) {
     }
     if (g_screen == SCREEN_MULTIPLAYER) {
         int mp_mode = pex_mp_server_mode_get();
+        if(PEX_LAN_SUPPORTED && mp_mode==0){
+            if(vk==VK_UP&&g_gamepad_menu_index>0)--g_gamepad_menu_index;
+            else if(vk==VK_DOWN&&g_gamepad_menu_index+1<g_button_count)++g_gamepad_menu_index;
+            else if(vk==VK_RETURN&&g_gamepad_menu_index>=0&&g_gamepad_menu_index<g_button_count&&g_buttons[g_gamepad_menu_index].enabled)
+                on_button(&g_buttons[g_gamepad_menu_index]);
+            return;
+        }
         if (mp_mode == 0) {
             int sel = pex_mp_server_selected_get();
             if (vk == VK_UP) { pex_mp_server_select(sel > 0 ? sel - 1 : 0); rebuild_screen(); }

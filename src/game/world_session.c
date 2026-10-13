@@ -1289,6 +1289,7 @@ static void save_world_state_sync(void) {
 }
 
 static void save_current_world_state(void) {
+    if(pex_lan_client())return; /* downloaded LAN cache is not a personal save */
 #if defined(PEX_PLATFORM_PSP) && defined(PEX_PSP_MEMORY_ONLY) && PEX_PSP_MEMORY_ONLY
     g_save_dirty = 0;
     g_last_autosave_tick = g_ingame_ticks;
@@ -2031,10 +2032,12 @@ static void world_quit_shutdown_for_app_exit(void) {
 }
 
 static void leave_world_to_title(void) {
+    memset(g_breach_gun_drops,0,sizeof(g_breach_gun_drops));
     if (world_quit_is_active()) return;
     pex_stats_world_left();
 
-    g_world_quit_was_multiplayer = (g_mp_connected || pex_net_is_connecting()) ? 1 : 0;
+    g_world_quit_was_multiplayer = (g_mp_connected || pex_lan_client() || pex_net_is_connecting()) ? 1 : 0;
+    pex_lan_stop();
     g_world_quit_had_local_world = (!g_world_quit_was_multiplayer && g_loaded_world_dir[0]) ? 1 : 0;
     g_world_quit_finalize_step = 0;
     g_world_quit_started_at = now_seconds();

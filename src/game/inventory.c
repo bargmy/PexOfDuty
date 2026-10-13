@@ -2237,6 +2237,7 @@ static void mark_flat_chunk_modified_at(int x, int z) {
     int lcz = flat_z_index(z) / FLAT_RENDER_CHUNK;
     if (lcx >= 0 && lcx < FLAT_RENDER_CHUNKS && lcz >= 0 && lcz < FLAT_RENDER_CHUNKS) {
         g_flat_world_chunk_modified[lcz][lcx] = 1;
+        pex_lan_mark_chunk(floor_div16(x),floor_div16(z));
     }
 }
 
@@ -10103,6 +10104,7 @@ static void reset_flat_player_spawn(void) {
     g_suffocation_damage_timer = 0;
     g_player_yaw = g_player_prev_yaw = spawn_yaw;
     g_player_pitch = g_player_prev_pitch = 0.0f;
+    breach_weapon_on_spawn();
 #if defined(PEX_PLATFORM_PSP) || defined(PEX_PLATFORM_WII)
     psp_ensure_spawn_surface(&g_player_x, &g_player_y, &g_player_z, 0);
     g_player_prev_x = g_player_x;

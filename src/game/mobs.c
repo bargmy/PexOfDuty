@@ -2308,6 +2308,7 @@ static void passive_mob_start_death(PassiveMob *m, const PexDamageSource *source
                              (pex_rand_float01() - pex_rand_float01()) * 0.2f + 1.0f);
     m->health = 0;
     m->death_time = 1;
+    if(m->breach_bot&&!m->breach_remote_player)breach_drop_gun(m->x,m->y,m->z,BREACH_WEAPON_MAC10);
     m->has_path_target = 0;
     m->wander_cooldown = 0;
     if (g_player_riding_passive_mob >= 0 && g_player_riding_passive_mob < MAX_PASSIVE_MOBS &&
@@ -2368,8 +2369,9 @@ static int pex_mob_attack_entity_from(PassiveMob *m, PexDamageSource source, int
     if (source.fire_damage && (passive_mob_is_fire_immune_125(m->type) || pex_passive_has_potion(m, PEX_POTION_FIRE_RESISTANCE))) return 0;
     m->age = 0;
     int incoming = damage;
+    m->breach_atomic_hurt=source.breach_atomic!=0;
     int play_hurt = 1;
-    if (m->damage_cooldown > PEX_HEARTS_HALVES_LIFE / 2) {
+    if ((!source.damage_type||strcmp(source.damage_type,"bullet")) && m->damage_cooldown > PEX_HEARTS_HALVES_LIFE / 2) {
         if (incoming <= m->prev_health) return 0;
         incoming -= m->prev_health;
         m->prev_health = damage;
@@ -3621,13 +3623,16 @@ static int passive_path_find(PassiveMob *m, float txf, float tyf, float tzf) {
     int result = 0;
     if (start < 0 || goal < 0) goto done;
     float search_range = 32.0f;
+    if(m->breach_bot)search_range=112.0f; /* cross-map routes, not animal-sized searches */
     if (m->type == PASSIVE_MOB_IRON_GOLEM || m->type == PASSIVE_MOB_VILLAGER) search_range = 48.0f;
     ctx.points[start].total_path_distance = 0.0f;
     ctx.points[start].distance_to_next = passive_path_point_distance_125(&ctx.points[start], &ctx.points[goal]);
     ctx.points[start].distance_to_target = ctx.points[start].distance_to_next;
     if (!passive_path_heap_add_125(&ctx, start)) goto done;
     int closest = start;
+    int bot_node_budget=4096;
     while (ctx.heap_count > 0) {
+        if(m->breach_bot&&--bot_node_budget<=0)break; /* return closest partial path */
         ++g_prof_mob_path_nodes_last;
         int cur = passive_path_heap_dequeue_125(&ctx);
         if (cur < 0) break;
@@ -7780,6 +7785,7 @@ static void passive_mob_check_bounds(PassiveMob *m) {
 }
 
 static void passive_mob_tick_living(PassiveMob *m) {
+    if(m->breach_remote_player)return; /* LAN transport owns human proxy state */
     passive_mob_tick_timers(m);
     passive_mob_tick_potions(m);
     if (passive_mob_tick_death(m)) return;
@@ -7964,6 +7970,8 @@ static Texture *passive_mob_texture_for_type(int type) {
 
 typedef struct PassiveMobRenderEntry {
     int breach_bot, breach_bot_flash;
+    int breach_team;
+    int breach_remote_player;
     int active;
     int type;
     int sheared;
@@ -7977,6 +7985,7 @@ typedef struct PassiveMobRenderEntry {
     int love_time;
     int attack_time;
     int hurt;
+    int atomic_hurt;
     int burn_time;
     int detail;
     int random_mob_id;
@@ -8061,6 +8070,8 @@ static void passive_mobs_build_render_list(const PassiveMob *src, float partial,
         e->type = m->type;
         e->breach_bot = m->breach_bot;
         e->breach_bot_flash = m->breach_bot_flash;
+        e->breach_team = m->breach_team;
+        e->breach_remote_player = m->breach_remote_player;
         e->sheared = m->sheared;
         e->fleece_color = m->fleece_color & 15;
         e->rideable = m->rideable;
@@ -8080,6 +8091,7 @@ static void passive_mobs_build_render_list(const PassiveMob *src, float partial,
         e->love_time = m->love_time;
         e->attack_time = m->attack_time;
         e->hurt = (m->hurt_time > 0 || m->death_time > 0);
+        e->atomic_hurt=m->breach_atomic_hurt;
         e->burn_time = m->burn_time;
         e->width = m->width; e->height = m->height;
         e->detail = (dx*dx + dy*dy + dz*dz) < (18.0f * 18.0f) ? 1 : 0;
@@ -8797,6 +8809,7 @@ static void passive_biped_pose_125(int type, float limb, float move, float age, 
     (void)skinny;
 }
 
+static int g_passive_human_skin_modern=0;
 static void passive_render_p125_biped(int type, int riding, float limb, float move, float age, float head_yaw, float head_pitch, int carrying) {
     PexBipedPose pose;
     passive_biped_pose_125(type, limb, move, age, head_yaw, head_pitch, carrying, riding, &pose);
@@ -8826,9 +8839,16 @@ static void passive_render_p125_biped(int type, int riding, float limb, float mo
     p125_part_rad(headwear_tx,headwear_ty, 0, yoff + (enderman ? 1.0f : 0.0f), 0, -4,-8,-4, 8,8,8, headwear_inflate,0, pose.hp,pose.hy,0);
     p125_part_rad(body_tx,body_ty, 0,yoff,0, -4,0,-2, 8,12,4, 0,0, 0,0,0);
     p125_part_rad(limb_tx,limb_ty, pose.arm_px[0],pose.arm_py[0],pose.arm_pz[0], arm_box_x_r,-2,arm_box_z, arm_w,limb_h,arm_w, 0,0, pose.arm_rx[0],pose.arm_ry[0],pose.arm_rz[0]);
-    p125_part_rad(limb_tx,limb_ty, pose.arm_px[1],pose.arm_py[1],pose.arm_pz[1], arm_box_x_l,-2,arm_box_z, arm_w,limb_h,arm_w, 0,1, pose.arm_rx[1],pose.arm_ry[1],pose.arm_rz[1]);
+    p125_part_rad(g_passive_human_skin_modern?32:limb_tx,g_passive_human_skin_modern?48:limb_ty, pose.arm_px[1],pose.arm_py[1],pose.arm_pz[1], arm_box_x_l,-2,arm_box_z, arm_w,limb_h,arm_w, 0,!g_passive_human_skin_modern, pose.arm_rx[1],pose.arm_ry[1],pose.arm_rz[1]);
     p125_part_rad(leg_tx,leg_ty, pose.leg_px[0],pose.leg_py[0],pose.leg_pz[0], leg_box_x,0,leg_box_z, leg_w,limb_h,leg_w, 0,0, pose.leg_rx[0],pose.leg_ry[0],pose.leg_rz[0]);
-    p125_part_rad(leg_tx,leg_ty, pose.leg_px[1],pose.leg_py[1],pose.leg_pz[1], leg_box_x,0,leg_box_z, leg_w,limb_h,leg_w, 0,1, pose.leg_rx[1],pose.leg_ry[1],pose.leg_rz[1]);
+    p125_part_rad(g_passive_human_skin_modern?16:leg_tx,g_passive_human_skin_modern?48:leg_ty, pose.leg_px[1],pose.leg_py[1],pose.leg_pz[1], leg_box_x,0,leg_box_z, leg_w,limb_h,leg_w, 0,!g_passive_human_skin_modern, pose.leg_rx[1],pose.leg_ry[1],pose.leg_rz[1]);
+    if(g_passive_human_skin_modern){
+        p125_part_rad(16,32,0,yoff,0,-4,0,-2,8,12,4,.25f,0,0,0,0);
+        for(int i=0;i<2;++i){
+            p125_part_rad(i?48:40,i?48:32,pose.arm_px[i],pose.arm_py[i],pose.arm_pz[i],i?arm_box_x_l:arm_box_x_r,-2,arm_box_z,arm_w,limb_h,arm_w,.25f,0,pose.arm_rx[i],pose.arm_ry[i],pose.arm_rz[i]);
+            p125_part_rad(0,i?48:32,pose.leg_px[i],pose.leg_py[i],pose.leg_pz[i],leg_box_x,0,leg_box_z,leg_w,limb_h,leg_w,.25f,0,pose.leg_rx[i],pose.leg_ry[i],pose.leg_rz[i]);
+        }
+    }
 }
 
 static void passive_render_p125_spider(float limb, float move, float head_yaw, float head_pitch) {
@@ -9436,9 +9456,16 @@ static void draw_passive_mobs(float partial) {
        now supplies authoritative spawn/move/despawn state in g_passive_mobs.
        The old render guard made every Java mob—including villagers—exist in
        the protocol table while remaining completely invisible. */
-    passive_mobs_submit_render_job(partial);
     PassiveMobRenderEntry entries[PEX_PASSIVE_RENDER_LIMIT];
-    int entry_count = passive_mobs_fetch_render_list(entries, PEX_PASSIVE_RENDER_LIMIT);
+    int entry_count=0;
+    if(g_lan_killcam_active){
+        float x=g_player_x,y=g_player_y,z=g_player_z,yaw=g_player_yaw,pitch=g_player_pitch;
+        (void)pex_lan_killcam_camera(&x,&y,&z,&yaw,&pitch);
+        passive_mobs_build_render_list(g_passive_mobs,partial,x,y,z,yaw,pitch,entries,&entry_count);
+    }else{
+        passive_mobs_submit_render_job(partial);
+        entry_count=passive_mobs_fetch_render_list(entries,PEX_PASSIVE_RENDER_LIMIT);
+    }
     if (g_loggy_enabled) g_loggy_entity_passive_entries = entry_count;
     if (entry_count <= 0) return;
 
@@ -9455,7 +9482,7 @@ static void draw_passive_mobs(float partial) {
     for (int i = 0; i < entry_count; ++i) {
         PassiveMobRenderEntry *e = &entries[i];
         if (!e->active || !passive_mob_type_valid(e->type)) continue;
-        Texture *t = e->breach_bot ? &tex_steve : passive_mob_texture_for_type(e->type);
+        Texture *t = e->breach_bot ? pex_lan_skin_texture(e->breach_remote_player-1) : passive_mob_texture_for_type(e->type);
         if (e->type == PASSIVE_MOB_WOLF) {
             if (e->rideable && e->owner_id != PEX_MOB_OWNER_SINGLEPLAYER && tex_mob_wolf_angry.id) t = &tex_mob_wolf_angry;
             else if (e->sheared && tex_mob_wolf_tame.id) t = &tex_mob_wolf_tame;
@@ -9475,6 +9502,7 @@ static void draw_passive_mobs(float partial) {
         }
         t = stivufine_random_mob_texture_for_base(t, e->random_mob_id);
         if (!t || !t->id) continue;
+        g_passive_human_skin_modern=e->breach_bot&&t->w==64&&t->h==64;
 
         float shadow_size = passive_mob_shadow_size_125(e->type);
         if (e->baby_age < 0) shadow_size *= 0.5f;
@@ -9490,6 +9518,10 @@ static void draw_passive_mobs(float partial) {
         /* RenderLiving draws the normal textured model first. Hurt/death and
            Creeper flashing are separate untextured depth-equal overlays. */
         passive_fast_set_tint(entity_br, entity_br, entity_br);
+        if(pex_lan_active()&&e->breach_bot&&!e->breach_remote_player){
+            if(e->breach_team==0)passive_fast_set_tint(entity_br,entity_br*0.45f,entity_br*0.45f);
+            else passive_fast_set_tint(entity_br*0.45f,entity_br*0.65f,entity_br);
+        }
         glTranslatef(e->x, e->y, e->z);
         if (e->type == PASSIVE_MOB_SQUID) {
             /* RenderSquid.rotateCorpse: pitch and body rotation are independent
@@ -9641,7 +9673,7 @@ static void draw_passive_mobs(float partial) {
                 glEnd();
             }
         }
-        if (e->hurt) passive_render_entry_overlay_125(e, partial, entity_br, 0.0f, 0.0f, 0.40f);
+        if (e->hurt) passive_render_entry_overlay_125(e, partial, entity_br, e->atomic_hurt?.15f:0.0f, e->atomic_hurt?.75f:0.0f, 0.40f);
         if (e->type == PASSIVE_MOB_CREEPER && ((int)(e->creeper_flash * 10.0f) & 1)) {
             float flash_alpha = pex_clamp_float(e->creeper_flash * 0.20f, 0.0f, 1.0f);
             passive_render_entry_overlay_125(e, partial, 1.0f, 1.0f, 1.0f, flash_alpha);
@@ -9651,6 +9683,7 @@ static void draw_passive_mobs(float partial) {
     }
 
     passive_dragon_crystals_draw_125(partial);
+    g_passive_human_skin_modern=0;
 
     glDisable(GL_ALPHA_TEST);
     passive_fast_set_tint(1.0f, 1.0f, 1.0f);

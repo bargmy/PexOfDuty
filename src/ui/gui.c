@@ -795,6 +795,23 @@ static void draw_ingame_screen(void) {
 }
 
 static void draw_pause_screen(void) {
+    if(pex_lan_waiting()){
+        draw_default_bg();
+        draw_centered_text("PexOfDuty - 3 vs 3 LAN Lobby",g_gui_w/2,12,0xFFFFFF);
+        for(int team=0;team<2;++team){
+            int x=g_gui_w/2+(team?80:-80),row=0;
+            draw_centered_text(team?"BLUE TEAM":"RED TEAM",x,38,team?0x6699FF:0xFF6666);
+            for(int i=0;i<6;++i)if(g_lan_present[i]&&g_lan_teams[i]==team){
+                char name[64];snprintf(name,sizeof(name),"%.24s%s",g_lan_names[i],i==0?" (host)":"");
+                draw_centered_text(name,x,58+row++*18,0xFFFFFF);
+            }
+            while(row<3)draw_centered_text("Bot (on start)",x,58+row++*18,0xAAAAAA);
+        }
+        char text[64];
+        if(g_lan_phase==1)snprintf(text,sizeof(text),"Match starts in %d",g_lan_countdown);
+        else snprintf(text,sizeof(text),"Choose your team. Host starts the match.");
+        draw_centered_text(text,g_gui_w/2,122,0xFFFF55);draw_all_buttons();return;
+    }
     draw_ingame_world_view(1);
     double prof_gui = profile_begin();
     draw_gradient(0, 0, g_gui_w, g_gui_h, -1072689136, -804253680);
@@ -1171,6 +1188,21 @@ static void draw_inventory_screen(void) {
     int y = (g_gui_h - 166) / 2;
     draw_textured_rect_tex(&tex_inventory, x, y, 0, 0, 176, 166, 0xFFFFFF);
     draw_inventory_steve(x, y);
+    if(breach_weapon_menu_available()){
+        int gx=x+180;if(gx+64>g_gui_w-2)gx=g_gui_w-66;
+        draw_rect(gx-2,y+22,gx+64,y+72,0xC0000000);
+        draw_text_no_shadow("WEAPON",gx,y+24,0xFFFFFF);
+        const char *names[2]={"MAC-10","M16"};
+        for(int i=0;i<2;++i){
+            int gy=y+36+i*18,selected=breach_weapon_selected()==i,current=breach_weapon_current()==i;
+            draw_rect(gx,gy,gx+60,gy+16,selected?0xFF707070:0xFF404040);
+            draw_rect(gx+1,gy+1,gx+59,gy+15,selected?0xFFB09040:0xFF909090);
+            draw_text_no_shadow(names[i],gx+3,gy+4,0xFFFFFF);
+            if(current)draw_text_no_shadow("*",gx+52,gy+4,0xFFFF55);
+        }
+        if(!breach_weapon_switch_available())
+            draw_text_no_shadow("* next spawn",gx,y+74,0xFFFF55);
+    }
 
     GuiItemBatchEntry items[48];
     int item_count = 0;
@@ -1411,9 +1443,21 @@ static void draw_furnace_screen(void) {
 
 static void draw_death_screen(void) {
     draw_ingame_world_view(0);
-    draw_gradient(0, 0, g_gui_w, g_gui_h, 1615855616, -1602211792);
-    draw_centered_text(tr_key_default("deathScreen.title", "Game over!"), g_gui_w / 2, 30, 16777215);
-    { char score_line[96]; snprintf(score_line, sizeof(score_line), "%s: &e0", tr_key_default("deathScreen.score", "Score")); draw_centered_text(score_line, g_gui_w / 2, 100, 16777215); }
+    if(pex_lan_active()&&g_lan_killcam_active){
+        char line[128];
+        snprintf(line,sizeof(line),"You got killed by %s",g_lan_killcam_killer_name[0]?g_lan_killcam_killer_name:"Unknown");
+        int y=g_gui_h-36;
+        draw_rect(0,y,g_gui_w,g_gui_h,(int)0xC0000000u);
+        draw_text_no_shadow(line,10,y+7,0xFFFFFF);
+        int remain=(100-g_lan_killcam_ticks+19)/20;
+        if(remain<0)remain=0;
+        char timer[32];snprintf(timer,sizeof(timer),"Respawning in %d",remain);
+        int tw=text_width(timer);draw_text_no_shadow(timer,g_gui_w-116-tw,y+7,0xD0D0D0);
+    }else{
+        draw_gradient(0, 0, g_gui_w, g_gui_h, 1615855616, -1602211792);
+        draw_centered_text(tr_key_default("deathScreen.title", "Game over!"), g_gui_w / 2, 30, 16777215);
+        { char score_line[96]; snprintf(score_line, sizeof(score_line), "%s: &e0", tr_key_default("deathScreen.score", "Score")); draw_centered_text(score_line, g_gui_w / 2, 100, 16777215); }
+    }
     draw_all_buttons();
     draw_save_message();
 }

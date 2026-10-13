@@ -1039,6 +1039,7 @@ static float third_person_camera_distance(float x, float y, float z,
     return dist;
 }
 
+static float g_lan_view_x,g_lan_view_y,g_lan_view_z,g_lan_view_yaw,g_lan_view_pitch;
 static void apply_player_camera(float partial) {
     const PexPlayerRenderState *pr = &g_player_render_frame;
     float x = pr->prev_x + (pr->x - pr->prev_x) * partial;
@@ -1046,15 +1047,18 @@ static void apply_player_camera(float partial) {
     float z = pr->prev_z + (pr->z - pr->prev_z) * partial;
     float yaw = lerp_angle(pr->prev_yaw, pr->yaw, partial);
     float pitch = pr->prev_pitch + (pr->pitch - pr->prev_pitch) * partial;
+    int killcam=pex_lan_killcam_camera(&x,&y,&z,&yaw,&pitch);
 
     /* Sneaking lowers the player camera/eye a bit, like the earlier patch. */
     if (g_screen == SCREEN_INGAME && key_down_vk(g_opts.keys[5])) y -= 0.18f;
 
-    apply_hurt_camera_effect(partial);
-    apply_view_bobbing(partial);
-    apply_portal_camera_effect(partial);
+    if(!killcam){
+        apply_hurt_camera_effect(partial);
+        apply_view_bobbing(partial);
+        apply_portal_camera_effect(partial);
+    }
 
-    if (g_third_person_view) {
+    if (g_third_person_view&&!killcam) {
         /* Java 1.2.5 EntityRenderer.orientCamera semantics:
            0 = first person, 1 = camera behind player, 2 = camera in front
            facing back at the player.  Both third-person modes use a 4 block
@@ -1075,11 +1079,15 @@ static void apply_player_camera(float partial) {
         float cam_z = front_view ? (z + look_z * dist) : (z - look_z * dist);
         float view_yaw = front_view ? (yaw + 180.0f) : yaw;
         float view_pitch = front_view ? -pitch : pitch;
+        g_lan_view_x=cam_x;g_lan_view_y=cam_y;g_lan_view_z=cam_z;
+        g_lan_view_yaw=view_yaw;g_lan_view_pitch=view_pitch;
 
         glRotatef(view_pitch, 1.0f, 0.0f, 0.0f);
         glRotatef(view_yaw + 180.0f, 0.0f, 1.0f, 0.0f);
         glTranslatef(-cam_x, -cam_y, -cam_z);
     } else {
+        g_lan_view_x=x;g_lan_view_y=y;g_lan_view_z=z;
+        g_lan_view_yaw=yaw;g_lan_view_pitch=pitch;
         glTranslatef(0.0f, 0.0f, -0.1f); /* first-person camera nudge from kq.java */
         glRotatef(pitch, 1.0f, 0.0f, 0.0f);
         glRotatef(yaw + 180.0f, 0.0f, 1.0f, 0.0f);
@@ -9946,7 +9954,7 @@ static void draw_multiplayer_remote_players(const FlatFrustum *fr, int remote_pl
         left_arm_pitch += arm_extra_pitch;
 
         glPushMatrix();
-        Texture *skin_tex = (r->has_skin && r->skin.id) ? &r->skin : &tex_steve;
+        Texture *skin_tex = (r->has_skin && r->skin.id) ? &r->skin : (tex_steve_default.id?&tex_steve_default:&tex_steve);
         glBindTexture(GL_TEXTURE_2D, skin_tex->id);
         steve_set_texture_dims(skin_tex);
         {
@@ -10095,6 +10103,66 @@ static void draw_multiplayer_name_tags(const FlatFrustum *fr, int remote_player_
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_FOG);
     glColor4f(1, 1, 1, 1);
+}
+
+/* LAN labels never use the vanilla see-through text pass. Test the body in
+ * the view frustum and actual camera-to-body visibility, then keep depth test
+ * enabled while drawing the label itself (even if it sits above a low wall). */
+static int lan_name_tag_visible(const FlatFrustum *fr,float x,float y,float z,int health) {
+    if(health<=0||!isfinite(x)||!isfinite(y)||!isfinite(z))return 0;
+    float dx=x-g_lan_view_x,dy=y+1.4f-g_lan_view_y,dz=z-g_lan_view_z;
+    float distance=dx*dx+dy*dy+dz*dz;if(distance>64*64||distance<.01f)return 0;
+    float yaw=g_lan_view_yaw*(float)M_PI/180,pitch=g_lan_view_pitch*(float)M_PI/180;
+    if(dx*-sinf(yaw)*cosf(pitch)+dy*-sinf(pitch)+dz*cosf(yaw)*cosf(pitch)<=0)return 0;
+    if(fr&&!flat_aabb_in_frustum(fr,x-.3f,y,z-.3f,x+.3f,y+1.8f,z+.3f))return 0;
+    return passive_ray_clear_blocks_125(g_lan_view_x,g_lan_view_y,g_lan_view_z,x,y+1.65f,z)||
+           passive_ray_clear_blocks_125(g_lan_view_x,g_lan_view_y,g_lan_view_z,x,y+.9f,z);
+}
+static void draw_lan_name_tags(const FlatFrustum *fr) {
+    if(!pex_lan_active()||pex_lan_waiting()||!tex_font.id)return;
+    glDisable(GL_FOG);glDisable(GL_CULL_FACE);glDisable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LEQUAL);glDepthMask(GL_FALSE);
+    for(int i=0;i<MAX_PASSIVE_MOBS;++i){PassiveMob *m=&g_passive_mobs[i];
+        if(!m->active||!m->breach_bot||m->death_time>0)continue;
+        float x=m->prev_x+(m->x-m->prev_x)*g_frame_partial,y=m->prev_y+(m->y-m->prev_y)*g_frame_partial,z=m->prev_z+(m->z-m->prev_z)*g_frame_partial;
+        if(!lan_name_tag_visible(fr,x,y,z,m->health))continue;
+        char label[64];int team=m->breach_team;
+        if(m->breach_remote_player){int id=m->breach_remote_player-1;team=g_lan_teams[id];
+            snprintf(label,sizeof(label),"%.31s",g_lan_names[id][0]?g_lan_names[id]:"Player");}
+        else snprintf(label,sizeof(label),"%s Bot %d",team?"Blue":"Red",i+1);
+        int width=text_width(label);if(width<=0)continue;
+        glPushMatrix();glTranslatef(x,y+2.25f,z);
+        glRotatef(-g_lan_view_yaw,0,1,0);glRotatef(g_lan_view_pitch,1,0,0);glScalef(-.026f,-.026f,.026f);
+        glDisable(GL_TEXTURE_2D);draw_rect(-width/2-2,-2,width/2+2,10,(int)0x80000000u);
+        glEnable(GL_TEXTURE_2D);draw_text_no_shadow(label,-width/2,0,team?0x66AAFF:0xFF6666);glPopMatrix();
+    }
+    glEnable(GL_TEXTURE_2D);glEnable(GL_ALPHA_TEST);glAlphaFunc(GL_GREATER,.1f);
+    glDepthMask(GL_TRUE);glEnable(GL_DEPTH_TEST);glEnable(GL_FOG);glColor4f(1,1,1,1);
+}
+static void draw_breach_gun_drops(void) {
+    if(g_mp_connected||g_lan_killcam_active||!tex_font.id)return;
+    glDisable(GL_FOG);glDisable(GL_CULL_FACE);glDisable(GL_ALPHA_TEST);
+    glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LEQUAL);glDepthMask(GL_FALSE);
+    for(int i=0;i<BREACH_MAX_GUN_DROPS;++i){const BreachGunDrop *d=&g_breach_gun_drops[i];if(!d->active)continue;
+        float dx=d->x-g_lan_view_x,dy=d->y-g_lan_view_y,dz=d->z-g_lan_view_z;
+        if(dx*dx+dy*dy+dz*dz>48*48)continue;
+        const char *name=breach_weapon_name(d->weapon);int width=text_width(name);
+        glPushMatrix();glTranslatef(d->x,d->y,d->z);
+        glRotatef(-g_lan_view_yaw,0,1,0);glRotatef(g_lan_view_pitch,1,0,0);glScalef(-.025f,-.025f,.025f);
+        glDisable(GL_TEXTURE_2D);
+        draw_rect(-14,-14,14,14,d->weapon==BREACH_WEAPON_ATOMIC?(int)0xFFFF55BBu:(int)0xFFAAAAAAu);
+        draw_rect(-12,-12,12,12,(int)0xE0202030u);
+        draw_rect(-width/2-3,-29,width/2+3,-17,(int)0xC0000000u);
+        glEnable(GL_TEXTURE_2D);
+        draw_text_no_shadow(name,-width/2,-27,d->weapon==BREACH_WEAPON_ATOMIC?0xFF77CC:0xFFFFFF);
+        const char *icon=d->weapon==BREACH_WEAPON_M16?"M16":"MAC";
+        draw_text_no_shadow(icon,-text_width(icon)/2,-4,0xFFFFFF);
+        glPopMatrix();
+    }
+    glEnable(GL_TEXTURE_2D);glEnable(GL_ALPHA_TEST);glAlphaFunc(GL_GREATER,.1f);
+    glDepthMask(GL_TRUE);glEnable(GL_FOG);glColor4f(1,1,1,1);
 }
 
 static int overlay_tile_for_block(int id) {
@@ -10714,9 +10782,12 @@ static void draw_flat_test_world(void) {
 
     entity_part = profile_begin();
     draw_passive_mobs(g_frame_partial);
+    draw_lan_name_tags(&fr);
+    draw_breach_gun_drops();
     pex_java47_draw_special_entities(g_frame_partial);
     draw_vehicles(g_frame_partial);
     draw_projectiles(g_frame_partial);
+    if(!g_lan_killcam_active)breach_draw_bullets();
     draw_xp_orbs(g_frame_partial);
     profile_add_time(PROF_ENTITY_PASSIVE_MOBS, entity_part);
 
@@ -11019,6 +11090,10 @@ static int android_world_backdrop_can_cache(void) {
 
 static void draw_ingame_world_view(int with_hand) {
     int shader_frame = 0;
+#if PEX_LAN_SUPPORTED
+    int replay_scene=g_lan_killcam_active&&g_lan_replay_length>0;
+    if(replay_scene)lan_replay_scene_begin();
+#endif
 #if (defined(_WIN32) && !defined(PEX_PLATFORM_XBOX_UWP)) || defined(PEX_PLATFORM_LINUX_SDL2)
     if (g_opts.shaders) {
         float sr=0.0f, sg=0.0f, sb=0.0f;
@@ -11046,6 +11121,9 @@ static void draw_ingame_world_view(int with_hand) {
         if (shader_frame) { pex_shaders_copy_depth(2); pex_shaders_bind_hand(); }
 #endif
         if (with_hand && !g_third_person_view) draw_first_person_hand();
+#if PEX_LAN_SUPPORTED
+        if(replay_scene)lan_replay_draw_weapon();
+#endif
         if (!g_third_person_view) {
             draw_player_fire_overlay_125();
             draw_in_block_overlay();
@@ -11059,4 +11137,7 @@ static void draw_ingame_world_view(int with_hand) {
     if (target_mode == 1) pex_android_tv_world_target_end(g_render_w, g_render_h);
 #endif
     setup_gui_projection();
+#if PEX_LAN_SUPPORTED
+    if(replay_scene)lan_replay_scene_end();
+#endif
 }

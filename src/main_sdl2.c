@@ -105,6 +105,7 @@ static void steve_set_tint(float r, float g, float b);
 #include "game/breach_shooter.c"
 #include "game/breach_bots.c"
 #include "game/ingame_logic.c"
+#include "platform/pex_lan.c"
 #include "render/world_view.c"
 #include "render/item_render.c"
 #include "ui/achievements_ui.c"

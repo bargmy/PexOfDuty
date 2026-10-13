@@ -310,6 +310,7 @@ static const char *pex_damage_source_death_reason(const PexDamageSource *source)
 
 static void player_die(const char *reason) {
     if (g_player_dead) return;
+    breach_drop_gun(g_player_x,g_player_y-1.62f,g_player_z,breach_weapon_current());
     cancel_bow_use();
     cancel_sword_item_use();
     g_right_use_button_down = 0;
@@ -326,7 +327,7 @@ static void player_die(const char *reason) {
     g_sprint_toggle_timer = 0;
     g_prev_sprint_forward = 0;
     passive_mobs_on_player_death_125();
-    if (!g_mp_connected) inventory_drop_death_items();
+    if (!g_mp_connected && !pex_lan_client()) inventory_drop_death_items();
     if (g_mp_connected) {
         pex_net_send_player_state();
         pex_net_send_player_action(PEX_ACTION_DIED, 0, 0, 0, 0, death_reason_code_from_text(reason));
@@ -340,6 +341,7 @@ static void player_die(const char *reason) {
 }
 
 static void player_die_from_source(const PexDamageSource *source) {
+    if(pex_lan_active())pex_lan_killcam_from_source(source);
     player_die(pex_damage_source_death_reason(source));
 }
 
@@ -356,6 +358,10 @@ static int player_apply_potion_damage_reduction(int amount, int *carryover) {
 }
 
 static int player_attack_entity_from(PexDamageSource source, int amount) {
+    if(pex_lan_waiting())return 0;
+    if(pex_lan_host()&&source.true_kind==PEX_DAMAGE_ENTITY_MOB&&source.true_mob_index>=0&&source.true_mob_index<MAX_PASSIVE_MOBS&&
+       pex_lan_friendly(&g_passive_mobs[source.true_mob_index]))return 0;
+    if(pex_lan_client())return 0; /* host snapshots own client health */
     /* The server owns multiplayer health and death.  Local collision, fire,
        projectiles, potion ticks and mob AI may still run for visuals/prediction,
        but none of them may alter health while connected. */
@@ -369,8 +375,9 @@ static int player_attack_entity_from(PexDamageSource source, int amount) {
     if (source.fire_damage && player_has_potion(PEX_POTION_FIRE_RESISTANCE)) return 0;
 
     int incoming = amount;
+    g_player_atomic_hurt=source.breach_atomic!=0;
     int play_hurt = 1;
-    if (g_hearts_life > PEX_HEARTS_HALVES_LIFE / 2) {
+    if ((!source.damage_type||strcmp(source.damage_type,"bullet")) && g_hearts_life > PEX_HEARTS_HALVES_LIFE / 2) {
         if (amount <= g_player_natural_armor_rating) return 0;
         incoming = amount - g_player_natural_armor_rating;
         g_player_natural_armor_rating = amount;
@@ -480,6 +487,8 @@ static void update_equipped_item(void) {
 }
 
 static void player_respawn(void) {
+    g_lan_killcam_active=0;g_lan_killcam_ticks=0;g_lan_killcam_respawn_sent=0;
+    if(pex_lan_client()){pex_lan_respawn();return;}
     cancel_bow_use();
     cancel_sword_item_use();
     g_right_use_button_down = 0;
@@ -503,6 +512,12 @@ static void player_respawn(void) {
     g_player_hurt_time = 0;
     g_player_attacked_at_yaw = 0.0f;
     reset_flat_player_spawn();
+    if(pex_lan_host()){
+        lan_team_spawn(g_lan_teams[0],&g_player_x,&g_player_y,&g_player_z,&g_player_yaw);
+        g_player_prev_x=g_player_x;g_player_prev_y=g_player_y;g_player_prev_z=g_player_z;g_player_prev_yaw=g_player_yaw;
+        g_breach_ammo=32;g_breach_reload_start=g_breach_reload_end=-1;
+        breach_weapon_on_spawn();
+    }
     g_chat_input[0] = 0;
     hud_add_chat("Respawned.");
     g_save_dirty = 1;
@@ -881,7 +896,7 @@ static void player_render_begin_frame(void) {
         return;
     }
     if (g_ingame_tick_async_initialized && g_ingame_tick_async_thread &&
-        !g_ingame_tick_async_failed && !g_mp_connected && !pex_net_is_connecting()) {
+        !g_ingame_tick_async_failed && !g_mp_connected && !pex_lan_active() && !pex_net_is_connecting()) {
         int valid = 0;
         EnterCriticalSection(&g_ingame_tick_async_cs);
         valid = g_player_render_published_valid;
@@ -953,9 +968,10 @@ static void ingame_tick(void) {
     player_capabilities_apply_game_mode();
     double prof_ingame_start = profile_begin();
     double prof_part = 0.0;
-    int input_active = (g_screen == SCREEN_INGAME && !g_player_dead);
+    int input_active = (g_screen == SCREEN_INGAME && !g_player_dead && !pex_lan_waiting());
 
     g_ingame_ticks++;
+    breach_gun_drops_tick();
     if (!(g_mp_connected && pex_java47_is_playing() && !pex_java47_daylight_cycle_enabled())) g_world_time++;
     pex_stats_tick();
     prof_part = profile_begin();
@@ -980,7 +996,7 @@ static void ingame_tick(void) {
     update_xp_orbs();
     profile_add_time(PROF_DROPS, prof_part);
     prof_part = profile_begin();
-    update_passive_mobs();
+    if(!pex_lan_client()&&!pex_lan_waiting())update_passive_mobs();
     profile_add_time(PROF_ENTITY_PASSIVE_MOBS, prof_part);
     prof_part = profile_begin();
     update_dig_particles();
@@ -999,22 +1015,24 @@ static void ingame_tick(void) {
 #endif
         profile_add_time(PROF_WORLD_STREAM, prof_part);
         prof_part = profile_begin();
-        update_liquids();
+        if(!pex_lan_client())update_liquids();
         profile_add_time(PROF_LIQUIDS, prof_part);
-        dimension_tick_portal_collision();
+        if(!pex_lan_active())dimension_tick_portal_collision();
     }
     prof_part = profile_begin();
-    update_buttons_and_plates();
+    if(!pex_lan_client())update_buttons_and_plates();
     profile_add_time(PROF_BUTTONS, prof_part);
     double prof_player_logic_start = profile_begin();
 
     if (g_player_dead) {
         g_player_death_time++;
+        if(pex_lan_active())pex_lan_killcam_tick();
         if (g_loaded_world_dir[0] && g_save_dirty &&
             (g_ingame_ticks - g_last_autosave_tick) >= AUTOSAVE_INTERVAL_TICKS) {
             if (!g_mp_connected) save_current_world_state();
         }
         if (g_mp_connected) pex_net_send_player_state();
+        pex_lan_tick_end();
         player_render_publish_after_tick();
         profile_add_time(PROF_PLAYER_LOGIC, prof_player_logic_start);
         profile_add_time(PROF_INGAME_TOTAL, prof_ingame_start);
@@ -1720,13 +1738,14 @@ static void ingame_tick(void) {
 
     g_prev_sprint_forward = (input_active && !sneaking && !using_item && forward_for_sprint) ? 1 : 0;
 
-    if (!g_player_dead && !g_mp_connected && !player_is_creative()) player_foodstats_update();
+    if (!g_player_dead && !g_mp_connected && !pex_lan_client() && !player_is_creative()) player_foodstats_update();
 
     if (g_loaded_world_dir[0] && g_save_dirty &&
         (g_ingame_ticks - g_last_autosave_tick) >= AUTOSAVE_INTERVAL_TICKS) {
         if (!g_mp_connected) save_current_world_state();
     }
     if (g_mp_connected) pex_net_send_player_state();
+    pex_lan_tick_end();
     player_render_publish_after_tick();
     profile_add_time(PROF_PLAYER_LOGIC, prof_player_logic_start);
     profile_add_time(PROF_INGAME_TOTAL, prof_ingame_start);
@@ -1750,7 +1769,7 @@ static int ingame_screen_allows_tick(void) {
     return g_screen == SCREEN_INGAME || g_screen == SCREEN_CHAT ||
            g_screen == SCREEN_INVENTORY || g_screen == SCREEN_CREATIVE || g_screen == SCREEN_WORKBENCH ||
            g_screen == SCREEN_FURNACE || g_screen == SCREEN_CHEST ||
-           g_screen == SCREEN_DEATH || (g_mp_connected && g_screen == SCREEN_PAUSE);
+           g_screen == SCREEN_DEATH || pex_lan_world_screen() || (g_mp_connected && g_screen == SCREEN_PAUSE);
 }
 
 #if PEX_ASYNC_INGAME_TICK
@@ -1803,7 +1822,7 @@ static DWORD WINAPI ingame_tick_async_worker_proc(LPVOID unused) {
         if (now - tick_boundary_time > 0.25) tick_boundary_time = now;
         next_tick_time = tick_boundary_time + tick_dt;
 
-        if (!ingame_screen_allows_tick() || g_mp_connected || pex_net_is_connecting()) {
+        if (!ingame_screen_allows_tick() || g_mp_connected || pex_lan_active() || pex_net_is_connecting()) {
             Sleep(1);
             continue;
         }
@@ -1864,7 +1883,7 @@ static void ingame_tick_async_queue(void) {
        frame path until that path is explicitly double-buffered.  Single-player
        desktop simulation is owned by the worker and this call only ensures the
        worker exists; it does not enqueue or execute gameplay on the main thread. */
-    if (g_mp_connected || pex_net_is_connecting()) { ingame_tick(); return; }
+    if (g_mp_connected || pex_lan_active() || pex_net_is_connecting()) { ingame_tick(); return; }
     ingame_tick_async_init();
     if (g_ingame_tick_async_failed || !g_ingame_tick_async_thread) {
         ingame_tick();
@@ -1879,7 +1898,7 @@ static float ingame_tick_async_render_partial(float fallback_partial) {
 #if PEX_ASYNC_INGAME_TICK
     if (world_quit_is_active() || g_screen == SCREEN_SAVING_QUIT) return fallback_partial;
     if (!g_ingame_tick_async_initialized || g_ingame_tick_async_failed ||
-        !g_ingame_tick_async_thread || g_mp_connected || pex_net_is_connecting()) {
+        !g_ingame_tick_async_thread || g_mp_connected || pex_lan_active() || pex_net_is_connecting()) {
         g_player_render_frame_from_async_partial = 0;
         return fallback_partial;
     }

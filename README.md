@@ -6,14 +6,61 @@ Blockbench MAC-10, Nuketown map, zombies, and armed AI opponents.
 ## Shooter features
 
 - First-person MAC-10 model with ADS, firing, reload and inspect animations.
+- Select the MAC-10 or M16 from the inventory. Selections made in the first
+  20 seconds after spawning equip immediately; later selections are queued for
+  the next respawn.
+- The MAC-10 fires faster with lower per-shot damage; the M16 fires more slowly
+  with higher damage and a 30-round magazine.
+- LAN deaths respawn after five seconds. Human kills can be skipped; bot kills
+  keep the full timer. The death view replays recorded actor positions and the
+  killer's pre-death POV, weapon and ADS state; terrain remains live.
+- The LAN host can turn bots off in the lobby for player-versus-player matches.
+- Players and bots drop a floating, labeled gun square on death. Get within
+  3.5 blocks and shoot it to equip the gun immediately; walking over it alone
+  does not collect it. Drops expire after 90 seconds and are shared over LAN.
+- Each drop has a 50% chance to become **MAC-10 - Atomic Star**, using
+  `mac10_legend.bbmodel`. It deals twice normal MAC-10 damage and gives victims
+  a pink hit overlay. It is pickup-only and is lost when its holder respawns;
+  the selected ordinary loadout is retained.
 - Mouse-speed-dependent weapon sway, movement bob, and per-bullet shot audio.
 - Nuketown template for newly created local desktop worlds; existing saves are not replaced.
-- Six configurable spawn points and three armed humanoid bots that patrol, navigate
+- Six configurable spawn points and armed humanoid bots that patrol, navigate
   the map, pursue the last seen player position, fire bursts, reload and respawn.
 - Daytime zombie encounters without sunlight ignition.
 
 Controls: left mouse shoots, right mouse aims, **R** reloads, **I** inspects.
 Player movement uses the ordinary PexCraft control bindings.
+
+### Windows LAN team matches
+
+1. Host a local Nuketown world, pause, and choose **Open to LAN**.
+2. Other players open **Multiplayer** and select the discovered room on the same LAN.
+3. The lobby lists **Red** and **Blue** teams. Anyone can choose a team, with a
+   maximum of three humans per team. Empty slots show bots that will join on start.
+4. Only the host can choose **Start match**. A five-second countdown appears in
+   the lobby before gameplay unlocks. Team changes lock when the countdown starts.
+5. Bots fill each team to three members, target opponents, and cannot damage their
+   own teammates. Disconnecting humans are replaced by bots during the match.
+   Bot models use red or blue team tinting; humans retain their own skin colors.
+   Red/blue nametags identify humans and bots only when they are in view and
+   visible, never through a wall. Dead players have no nametag.
+
+LAN broadcasts each human's own 64x32 or 64x64 skin, including skin changes and
+skins for late joiners. Bots and players whose skin has not arrived use a separate
+default texture, not your custom skin. Modern 64x64 skins use separate left-arm
+and left-leg UVs and outer clothing layers (classic-width arms).
+Bot routing uses longer cross-map A* searches, safe tactical destinations,
+steadier repositioning, and earlier blocked-path recovery. Gunshots have reduced
+gain for both your weapon and distant players/bots; the sound slider still applies.
+
+Use the same updated build on every computer. Allow it on your **private network**
+if Windows Firewall asks. LAN discovery uses UDP port 27566; the host's TCP game
+port is shown in chat. **Direct LAN IP** accepts `IPv4:port` if discovery is blocked.
+Joining is restricted to the lobby, not an already-started match. This is a custom
+Windows PexOfDuty protocol, not a Minecraft server, and has no internet matchmaking.
+Downloaded maps use a separate LAN cache, not personal single-player saves.
+Headless tests cover networking/team logic; on-screen lobby layout and play feel
+still require interactive verification on real LAN computers.
 
 ## Build and run on Windows
 
@@ -23,7 +70,7 @@ Set `MINGW64_BIN` to its `bin` folder and run `build_x64.bat`.
 The result is `pexcraft_x64.exe`.
 
 Launch from the project root, then create a new local world for Nuketown.
-Keep `src/assets/bbench` and `src/assets/maps/nuketown` available at runtime.
+Keep `src/assets/bbench` (including `m16.bbmodel`) and `src/assets/maps/nuketown` available at runtime.
 For a shareable build, place copies at `assets/bbench` and `assets/maps/nuketown`
 beside the executable. These assets are **not embedded in the EXE**.
 Base Minecraft textures and legacy sounds are obtained separately through the game.

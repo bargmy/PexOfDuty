@@ -372,6 +372,7 @@ static void main_loop(void) {
             DispatchMessageA(&msg);
         }
         profile_add_time(PROF_PUMP, prof_start);
+        pex_lan_frame();
 
         prof_start = profile_begin();
         pex_gamepad_update();
@@ -425,7 +426,7 @@ static void main_loop(void) {
             if (g_screen == SCREEN_INGAME || g_screen == SCREEN_CHAT ||
                 g_screen == SCREEN_INVENTORY || g_screen == SCREEN_CREATIVE || g_screen == SCREEN_WORKBENCH ||
                 g_screen == SCREEN_FURNACE || g_screen == SCREEN_CHEST ||
-                g_screen == SCREEN_DEATH || (g_mp_connected && g_screen == SCREEN_PAUSE)) {
+                g_screen == SCREEN_DEATH || pex_lan_world_screen() || (g_mp_connected && g_screen == SCREEN_PAUSE)) {
                 double t_ingame_enqueue = profile_begin();
                 ingame_tick_async_queue();
                 profile_add_time(PROF_TICK_INGAME_ENQUEUE, t_ingame_enqueue);
@@ -836,6 +837,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
     /* Stop world-state producers before consumers, then destroy shared locks. */
     world_quit_shutdown_for_app_exit();
     ingame_tick_async_shutdown();
+    pex_lan_stop();
     world_stream_service_shutdown();
     async_section_mesh_shutdown();
     passive_render_worker_shutdown();
@@ -852,7 +854,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmdLine, int nC
     free_texture(&tex_icons); free_texture(&tex_xinput);
     free_texture(&tex_inventory);
     free_texture(&tex_items);
-    free_texture(&tex_steve); free_texture(&tex_mob_pig); free_texture(&tex_mob_sheep); free_texture(&tex_mob_sheep_fur); free_texture(&tex_mob_cow); free_texture(&tex_mob_chicken); free_texture(&tex_mob_saddle);
+    free_texture(&tex_steve); free_texture(&tex_steve_default); free_texture(&tex_mob_pig); free_texture(&tex_mob_sheep); free_texture(&tex_mob_sheep_fur); free_texture(&tex_mob_cow); free_texture(&tex_mob_chicken); free_texture(&tex_mob_saddle);
     free_texture(&tex_chest_entity);
     free_texture(&tex_large_chest_entity);
     free_texture(&tex_title_logo);

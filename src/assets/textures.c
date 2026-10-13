@@ -1191,6 +1191,14 @@ static int load_png_asset(Texture *t, const char *rel, int repeat) {
     return load_png_texture(t, path, repeat);
 }
 
+static void preserve_default_player_skin(void) {
+    if(!tex_steve.rgba||tex_steve.w!=64||(tex_steve.h!=32&&tex_steve.h!=64))return;
+    size_t bytes=(size_t)tex_steve.w*tex_steve.h*4;
+    unsigned char *copy=(unsigned char*)malloc(bytes);if(!copy)return;
+    memcpy(copy,tex_steve.rgba,bytes);
+    (void)upload_rgba_texture(&tex_steve_default,tex_steve.w,tex_steve.h,copy,0);
+}
+
 static int load_custom_skin_path(const char *path, int persist) {
     if (!path || !path[0]) return 0;
     Texture tmp = {0};
@@ -1200,6 +1208,7 @@ static int load_custom_skin_path(const char *path, int persist) {
         open_notice("Skins", "Skin PNG must be 64x32 or 64x64.", "Classic 64x32 skins work best.");
         return 0;
     }
+    if(!tex_steve_default.id)preserve_default_player_skin();
     free_texture(&tex_steve);
     tex_steve = tmp;
     if (persist) {
@@ -1207,6 +1216,7 @@ static int load_custom_skin_path(const char *path, int persist) {
         save_options();
     }
     if (g_mp_connected) pex_net_send_skin();
+    pex_lan_send_skin();
     return 1;
 }
 
@@ -2265,7 +2275,9 @@ static void apply_texture_pack_index(int index) {
     }
     stivufine_update_quality_textures(&g_texpacks[index]);
     stivufine_load_random_mob_variants(&g_texpacks[index]);
+    preserve_default_player_skin();
     if (g_opts.skin_path[0]) load_custom_skin_path(g_opts.skin_path, 0);
+    else pex_lan_send_skin();
     init_font_widths();
     log_msg("Applied texture pack: %s", g_current_texpack);
 }
